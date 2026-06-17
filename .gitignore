@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# aitracki lokaalsed artefaktid (elavad ~/.config/aitrack/-s, aga kindluse mõttes)
+config.json
+projects.json
+state.json
+*.log
+aitrack-log.csv
+apps-script-ready.gs
