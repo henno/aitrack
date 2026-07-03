@@ -42,6 +42,7 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
 NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
+DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 
 # AI-tööriistade logiasukohad — samad kõigil OS-idel (~ = kasutaja kodukaust)
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -110,8 +111,9 @@ DEFAULT_CONFIG = {
     # rea tase: "project" = üks rida iga (tund × projekt) kohta (vaikimisi, jagatav);
     #           "hour"    = üks rida tunni kohta, KÕIK kaustad koos (Projekt-veerus loetelu)
     "group_by": "project",
-    # type: "google_sheets" (Apps Script) või "local" (CSV-fail, ilma Google'ita)
-    "sink": {"type": "google_sheets", "webapp_url": "", "token": "", "path": ""},
+    # type: "local" (CSV-fail, ilma Google'ita — VAIKIMISI) või "google_sheets" (Apps Script)
+    # path tühi + type "local" → _local_path annab DEFAULT_CSV_PATH (~/aitrack-log.csv)
+    "sink": {"type": "local", "webapp_url": "", "token": "", "path": ""},
     # exe = paigaldusajal lahendatud absoluuttee (kindlustab ajasti vastu, kus PATH puudub)
     "summarizer": {"engine": "auto", "model": "", "timeout": 120, "exe": ""},
     "max_catchup_hours": 48,
@@ -594,8 +596,12 @@ def _cell_safe(v) -> str:
 
 
 def _local_path(cfg: dict) -> Path | None:
-    p = (cfg.get("sink", {}).get("path") or "").strip()
-    return Path(p).expanduser() if p else None
+    sink = cfg.get("sink", {})
+    p = (sink.get("path") or "").strip()
+    if p:
+        return Path(p).expanduser()
+    # tee seadmata: lokaalse sink'i puhul vaikimisi ~/aitrack-log.csv (nii töötab ka ilma setup'ita)
+    return DEFAULT_CSV_PATH if sink.get("type") == "local" else None
 
 
 def _local_keys(path: Path) -> set[str]:
@@ -883,7 +889,8 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
 
     if rows:
         if append_rows(rows, keys, cfg):
-            log(f"run: {len(rows)} rida saadetud Google Sheetsi")
+            dest = str(_local_path(cfg)) if cfg.get("sink", {}).get("type") == "local" else "Google Sheetsi"
+            log(f"run: {len(rows)} rida saadetud → {dest}")
         else:
             log(f"run: {len(rows)} rida EI saadud kirjutada — state'i ei uuendata, proovin uuesti")
             return  # ära uuenda state'i, et read ei kaoks
@@ -1465,7 +1472,7 @@ def _setup_flow() -> None:
             url = input("5) Kleebi Web app URL (.../exec): ").strip()
         cfg["sink"] = {"type": "google_sheets", "webapp_url": url, "token": token, "path": ""}
     else:
-        default_path = str(HOME / "aitrack-log.csv")
+        default_path = str(DEFAULT_CSV_PATH)
         path = input(f"CSV-faili tee [{default_path}]: ").strip() or default_path
         cfg["sink"] = {"type": "local", "path": path, "webapp_url": "", "token": ""}
         print(f"→ tulemused lähevad faili: {path}")

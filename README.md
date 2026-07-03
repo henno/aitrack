@@ -11,7 +11,8 @@ oma Google Sheeti ja jälgitavad projektid ise.
 - **Python 3.9+** (muud sõltuvused puuduvad — ainult standardteek)
 - Vähemalt üks AI-CLI kokkuvõtete tegemiseks: **`claude`**, **`codex`** või **`gemini`**
   (automaattuvastus selles järjekorras; saab configis fikseerida)
-- Väljund: **Google'i konto** (jagatav Sheet) VÕI **lokaalne CSV-fail** (ilma Google'ita)
+- Väljund: **lokaalne CSV-fail** (vaikimisi — `~/aitrack-log.csv`, kohe, ilma Google'ita)
+  VÕI **Google'i konto** (jagatav Sheet). Vaikeväljund töötab ilma seadistuseta.
 
 Logide asukohad on kõigil OS-idel samad (`~/.claude`, `~/.codex`, `~/.gemini`);
 Windowsis vastab `~` kaustale `C:\Users\<nimi>`.
@@ -152,9 +153,11 @@ täisülevaate jaoks ava oma Google Sheet / CSV-fail.
   kohta. `"hour"` → **üks rida tunni kohta, kõik kaustad koos** (Projekt-veerus loetelu, nt
   `aitracker, praktika`; kokkuvõte katab kogu tunni tegevuse). Muuda:
   `python3 -c "import aitrack as A; c=A.load_config(); c['group_by']='hour'; A.save_config(c)"`.
-- **Config on masinapõhine.** `config.json` ja `projects.json` sisaldavad selle masina teid
-  ja tokenit — neid EI jagata; jagatakse ainult kood (`aitrack.py` jne) ning iga inimene jooksutab
-  `init`-i ise. `config.json` kirjutatakse õigustega `0o600`.
+- **Config ja andmed on masinapõhised.** `config.json`, `projects.json`, `notes.jsonl` ja
+  **CSV-logi ise** (`~/aitrack-log.csv`) sisaldavad selle inimese isiklikke andmeid — neid **EI
+  commitita** (kõik `.gitignore`-s); jagatakse ainult kood (`aitrack.py` jne). Iga kasutaja saab
+  sama süsteemi (vaikimisi lokaalne CSV `~/aitrack-log.csv`), aga **oma** privaatse logifaili.
+  `config.json` ja CSV kirjutatakse õigustega `0o600`.
 - Harv: kui AI-tööriist kirjutab logirea >5 min pärast tunnipiiri, võib see kirje ühest
   tunnist välja jääda (tööriistad kirjutavad tavaliselt kohe). Lisaveerud (failid, git-haru,
   promptide arv, kategooria) on lihtne lisada — küsi.

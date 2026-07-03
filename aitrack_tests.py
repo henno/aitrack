@@ -417,5 +417,15 @@ A.append_note(other_tz, "teine")
 notes = A.load_notes()
 check("mõlemad märkmed sama UTC-tunni all", notes.get(HFL(14).isoformat()) == ["esimene", "teine"])
 
+# ============ TEST 32: vaikeväljund on lokaalne CSV + vaiketee fallback ============
+print("TEST 32: vaikimisi sink=local ja _local_path annab vaiketee (sama süsteem kõigile)")
+check("DEFAULT_CONFIG sink tüüp on local", A.DEFAULT_CONFIG["sink"]["type"] == "local")
+check("_local_path → vaiketee kui path tühi + local",
+      A._local_path({"sink": {"type": "local", "path": ""}}) == A.DEFAULT_CSV_PATH)
+check("_local_path austab seatud teed",
+      A._local_path({"sink": {"type": "local", "path": "/x/y.csv"}}) == Path("/x/y.csv"))
+check("_local_path → None kui sheets ja path tühi",
+      A._local_path({"sink": {"type": "google_sheets", "path": ""}}) is None)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
