@@ -1392,7 +1392,9 @@ def cmd_status(args, cfg):
     print(f"Config:          {CONFIG_FILE} ({'olemas' if CONFIG_FILE.exists() else 'PUUDUB'})")
     sink = cfg.get("sink", {})
     if sink.get("type") == "local":
-        print(f"Väljund:         lokaalne fail → {sink.get('path') or 'PUUDUB'}")
+        path = _local_path(cfg)  # lahendab ka vaiketee (~/aitrack-log.csv), kui path on tühi
+        exists = "olemas" if path and path.exists() else "puudub veel"
+        print(f"Väljund:         lokaalne CSV → {path} ({exists})")
     else:
         print(f"Väljund:         Google Sheets ({'seadistatud' if sink.get('webapp_url') else 'URL PUUDUB'})")
     print(f"Kokkuvõtja:      {eng}" + (f" ({exe})" if exe else " — AI-CLI puudub"))
