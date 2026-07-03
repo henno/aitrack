@@ -41,6 +41,7 @@ PROJECTS_FILE = CONFIG_DIR / "projects.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
+NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
 
 # AI-tööriistade logiasukohad — samad kõigil OS-idel (~ = kasutaja kodukaust)
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -106,6 +107,9 @@ DEFAULT_CONFIG = {
     "timezone": "auto",
     "language": "et",
     "max_prompts_per_bucket": 40,
+    # rea tase: "project" = üks rida iga (tund × projekt) kohta (vaikimisi, jagatav);
+    #           "hour"    = üks rida tunni kohta, KÕIK kaustad koos (Projekt-veerus loetelu)
+    "group_by": "project",
     # type: "google_sheets" (Apps Script) või "local" (CSV-fail, ilma Google'ita)
     "sink": {"type": "google_sheets", "webapp_url": "", "token": "", "path": ""},
     # exe = paigaldusajal lahendatud absoluuttee (kindlustab ajasti vastu, kus PATH puudub)
@@ -278,13 +282,17 @@ def release_lock(lock: Path | None) -> None:
             pass
 
 
-def bucket_key(hstart_utc: dt.datetime, project_path: str) -> str:
+def bucket_key(hstart_utc: dt.datetime, project_path: str | None) -> str:
     """Stabiilne dedup-võti UTC-tunnist + TÄISTEE hashist.
 
     - UTC-tund → ei sõltu kuvasildist/ajavööndist.
     - Täistee hash → kaks samanimelist projekti (nt /a/web ja /b/web) EI põrku.
+    - project_path=None → tunni-tasandi võti ('hour'-režiim): sõltub AINULT tunnist,
+      nii et kõik kaustad koonduvad ühte ritta ega tekita duplikaate.
     - 'k:' prefiks → võti pole kuupäeva-kujuline, nii et Google Sheets ei coerci seda."""
     iso = hstart_utc.astimezone(dt.timezone.utc).isoformat()
+    if project_path is None:
+        return f"k:{iso}|__hour__"
     h = hashlib.sha1(str(project_path).encode("utf-8")).hexdigest()[:8]
     return f"k:{iso}|{Path(project_path).name}|{h}"
 
@@ -526,7 +534,7 @@ def resolve_engine(cfg: dict) -> tuple[str, str | None]:
     return "none", None
 
 
-def summarize(prompts: list[str], project: str, hour_label: str, cfg: dict) -> str:
+def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict) -> str:
     engine, exe = resolve_engine(cfg)
     if engine == "none" or exe is None:
         return _fallback_summary(prompts)
@@ -534,10 +542,14 @@ def summarize(prompts: list[str], project: str, hour_label: str, cfg: dict) -> s
     joined = "\n".join(f"- {p[:300]}" for p in prompts)
     if len(joined) > 8000:  # piira koondprompti suurust
         joined = joined[:8000] + "\n…(kärbitud)"
+    # 'hour'-režiimis on silt mitu kausta ("web, api") → õige kääne ja katab kõik kaustad
+    multi = "," in project_label
+    where = (f"projektides {project_label} (kata kõik)" if multi
+             else f"projektis {project_label}")
     prompt = (
         "Sa teed lühikesi eestikeelseid kokkuvõtteid arendustööst. "
         f"Allpool on kasutaja AI-promptid ühe tunni ({hour_label}) jooksul "
-        f"projektis {Path(project).name}. "
+        f"{where}. "
         "Vasta TÄPSELT ühe lühikese eestikeelse lausega (kuni ~18 sõna), "
         "mis võtab kokku mida selle tunni jooksul tehti. "
         "Ära lisa midagi muud peale selle lause.\n\n"
@@ -700,6 +712,44 @@ def _now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+# --- käsitsi tunnimärkmed (aitrack note) ------------------------------------
+def _hour_iso(d: dt.datetime) -> str:
+    """Kanooniline UTC-tunni võti — normaliseeri ENNE floorimist UTC-sse,
+    et märkme salvestus ja väljundi-lugemine viitaks alati samale füüsilisele tunnile."""
+    return hour_floor(d.astimezone(dt.timezone.utc)).isoformat()
+
+
+def append_note(hour_utc: dt.datetime, text: str) -> None:
+    """Lisa käsitsi-märge ühe tunni juurde (append-only JSONL, kraşi-kindel)."""
+    _mkconfdir()
+    rec = {"hour": _hour_iso(hour_utc), "text": text, "added": _now_utc().isoformat()}
+    with NOTES_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def load_notes() -> dict[str, list[str]]:
+    """Loe kõik märkmed → {UTC-tunni-iso: [tekst, …]}. Rikutud rida jäetakse vahele."""
+    out: dict[str, list[str]] = {}
+    if not NOTES_FILE.exists():
+        return out
+    try:
+        lines = NOTES_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        h, t = rec.get("hour"), (rec.get("text") or "").strip()
+        if h and t:
+            out.setdefault(h, []).append(t)
+    return out
+
+
 def run_once(cfg: dict, allow: list[str], backfill_hours: int | None = None) -> None:
     if not allow:
         log("run: ühtegi lubatud projekti pole (lisa: aitrack add <tee>). Ei tee midagi.")
@@ -755,7 +805,10 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
     records = collect_records(last_hour - dt.timedelta(seconds=1))
     log(f"run: kogutud {len(records)} kirjet alates {last_hour.strftime('%Y-%m-%d %H:%M')} UTC")
 
-    buckets: dict[tuple, list[Record]] = {}
+    # group_by="hour" → kõik kaustad koonduvad ühte ämbrisse tunni kohta (üks rida/tund);
+    # group_by="project" (vaikimisi) → eraldi ämber iga (tund × projekt) kohta.
+    group_by = cfg.get("group_by", "project")
+    buckets: dict[tuple, list[tuple]] = {}
     for r in records:
         hstart = hour_floor(r.ts)  # UTC tunni-piir
         # Pool-avatud vahemik [last_hour, process_until): iga lõpetatud tund täpselt korra.
@@ -764,7 +817,8 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
         proj = match_project(r.project, allow)
         if proj is None:
             continue
-        buckets.setdefault((hstart, proj), []).append(r)
+        bkey = (hstart, None) if group_by == "hour" else (hstart, proj)
+        buckets.setdefault(bkey, []).append((r, proj))
 
     # Backfill: küsi lehelt olemasolevad võtmed ja jäta need tunnid kokku VÕTMATA
     # (väldib raisatud LLM-kõnesid). Tavakäivitus seda ei tee — uued tunnid pole veel lehel.
@@ -775,28 +829,54 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
             log(f"backfill: {len(existing_keys)} võtit juba lehel — neid ei summeerita uuesti")
 
     max_p = int(cfg.get("max_prompts_per_bucket", 40))
+    notes_by_hour = load_notes()  # käsitsi lisatud tunnimärkmed → liidetakse kokkuvõttesse
     rows: list[list] = []
     keys: list[str] = []
     skipped = 0
-    for (hstart, proj), recs in sorted(buckets.items()):
-        recs.sort(key=lambda r: r.ts)
+    for (hstart, proj_key), items in sorted(buckets.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        recs = sorted((it[0] for it in items), key=lambda r: r.ts)
         tools = sorted({r.tool for r in recs})
         prompts = [r.text for r in recs][:max_p]
+        # 'hour'-režiimis võib ämbris olla mitu kausta → Projekt-veergu loetelu (nt "api, web")
+        proj_label = ", ".join(sorted({Path(it[1]).name for it in items}))
         local = hstart.astimezone(tz)            # kuvamine kohalikus ajas
         local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
         hour_label = f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}"
         date_str = local.strftime("%Y-%m-%d")
-        proj_name = Path(proj).name
-        key = bucket_key(hstart, proj)           # võti UTC-tunnist + täistee hashist
+        key = bucket_key(hstart, proj_key)       # proj_key=None ('hour') → tunni-tasandi võti
         if existing_keys is not None and key in existing_keys:
             skipped += 1
             continue                             # juba lehel → ära kuluta LLM-kõnet
         heartbeat_lock(lock)  # pikk run ei tohi teisele protsessile aegunud näida
-        summary = summarize(prompts, proj, hour_label, cfg)
+        summary = summarize(prompts, proj_label, hour_label, cfg)
+        notes = notes_by_hour.get(_hour_iso(hstart), [])  # käsitsi-märkmed selle tunni kohta
+        if notes:
+            summary = f"{summary} · Märge: {' · '.join(notes)}"
         # _cell_safe kasutajast tuletatud lahtritel → ei käivitu valemina (CSV/Sheets injection)
-        rows.append([date_str, hour_label, _cell_safe(proj_name), ", ".join(tools), _cell_safe(summary)])
+        rows.append([date_str, hour_label, _cell_safe(proj_label), ", ".join(tools), _cell_safe(summary)])
         keys.append(key)
-        log(f"  → {date_str} {hour_label} | {proj_name} | {', '.join(tools)} | {summary[:80]}")
+        log(f"  → {date_str} {hour_label} | {proj_label} | {', '.join(tools)} | {summary[:80]}")
+
+    # Märkmed tundidel ILMA jälgitava AI-tegevuseta → eraldi "(märge)"-rida (ei kao kaotsi)
+    activity_hours = {_hour_iso(hstart) for (hstart, _) in buckets}
+    for hiso, texts in sorted(notes_by_hour.items()):
+        if hiso in activity_hours:
+            continue                             # juba tegevuse-kokkuvõttesse liidetud
+        hstart = parse_iso(hiso)
+        if hstart is None or not (last_hour <= hstart < process_until):
+            continue                             # väljaspool töödeldavat vahemikku
+        key = f"k:{hiso}|__note__"
+        if existing_keys is not None and key in existing_keys:
+            skipped += 1
+            continue
+        local = hstart.astimezone(tz)
+        local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
+        hour_label = f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}"
+        date_str = local.strftime("%Y-%m-%d")
+        summary = "Märge: " + " · ".join(texts)
+        rows.append([date_str, hour_label, _cell_safe("(märge)"), "", _cell_safe(summary)])
+        keys.append(key)
+        log(f"  → {date_str} {hour_label} | (märge) | — | {summary[:80]}")
 
     if skipped:
         log(f"backfill: {skipped} juba-olemas tundi jäeti vahele (LLM-kõnet ei tehtud)")
@@ -1179,23 +1259,63 @@ def cmd_preview(args, cfg):
         print("Lisa kõigepealt projekt: aitrack add <tee>")
         return
     tz = get_tz(cfg)
+    group_by = cfg.get("group_by", "project")  # peegelda run_once grupeerimist
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)
     records = collect_records(since)
-    buckets: dict[tuple, list[Record]] = {}
+    buckets: dict[tuple, list[tuple]] = {}
     for r in records:
         proj = match_project(r.project, allow)
         if proj is None:
             continue
         hstart = hour_floor(r.ts)  # UTC, nagu run_once-is
-        buckets.setdefault((hstart, proj), []).append(r)
-    print(f"Viimase {args.hours}h jooksul {len(buckets)} (tund × projekt) bucketit:\n")
-    for (hstart, proj), recs in sorted(buckets.items()):
+        bkey = (hstart, None) if group_by == "hour" else (hstart, proj)
+        buckets.setdefault(bkey, []).append((r, proj))
+    notes_by_hour = load_notes()  # käsitsi-märkmed → kuva vastava tunni all
+    unit = "tund" if group_by == "hour" else "tund × projekt"
+    print(f"Viimase {args.hours}h jooksul {len(buckets)} ({unit}) bucketit:\n")
+    for (hstart, _), items in sorted(buckets.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        recs = [it[0] for it in items]
         local = hstart.astimezone(tz)
         tools = sorted({r.tool for r in recs})
-        print(f"  {local.strftime('%Y-%m-%d %H:%M')} | {Path(proj).name} | "
+        proj_label = ", ".join(sorted({Path(it[1]).name for it in items}))
+        print(f"  {local.strftime('%Y-%m-%d %H:%M')} | {proj_label} | "
               f"{', '.join(tools)} | {len(recs)} prompti")
         for r in recs[:3]:
             print(f"      - [{r.tool}] {r.text[:80]}")
+        for note in notes_by_hour.get(_hour_iso(hstart), []):
+            print(f"      · Märge: {note}")
+    # Märkmed tundidel ILMA tegevuseta (vaatevahemikus) — et ükski märge ei jääks nähtamatuks
+    shown = {_hour_iso(hstart) for (hstart, _) in buckets}
+    orphans = [(h, txts) for h, txts in sorted(notes_by_hour.items())
+               if h not in shown and (parse_iso(h) or since) >= hour_floor(since)]
+    if orphans:
+        print("\n  Märkmed (tundidel ilma jälgitava tegevuseta):")
+        for h, txts in orphans:
+            local = parse_iso(h).astimezone(tz)
+            print(f"      {local.strftime('%Y-%m-%d %H:%M')} · Märge: {' · '.join(txts)}")
+
+
+def cmd_note(args, cfg):
+    """Lisa käsitsi-märge praegusele tunnile; ilma tekstita → kuva olemasolevad märkmed."""
+    text = " ".join(args.text).strip()
+    tz = get_tz(cfg)
+    if not text:
+        notes = load_notes()
+        if not notes:
+            print('Märkmeid pole. Lisa: aitrack note "mida õppisid või tegid"')
+            return
+        print("Märkmed:")
+        for hiso in sorted(notes):
+            local = (parse_iso(hiso) or _now_utc()).astimezone(tz)
+            for t in notes[hiso]:
+                print(f"  {local.strftime('%Y-%m-%d %H:%M')} · {t}")
+        return
+    now = _now_utc()
+    append_note(now, text)
+    start = hour_floor(now).astimezone(tz)
+    end = (hour_floor(now) + dt.timedelta(hours=1)).astimezone(tz)
+    log(f"note: lisatud tundi {start.strftime('%Y-%m-%d %H:%M')} — {text[:80]}")
+    print(f"Lisatud tundi {start.strftime('%Y-%m-%d %H:%M')}–{end.strftime('%H:%M')}: {text}")
 
 
 def cmd_init(args, cfg):
@@ -1420,6 +1540,10 @@ def main():
 
     sub.add_parser("list", help="näita jälgitavaid projekte").set_defaults(fn=cmd_list)
     sub.add_parser("test-sink", help="saada testrida Google Sheetsi").set_defaults(fn=cmd_test_sink)
+
+    nt = sub.add_parser("note", help='lisa käsitsi-märge praegusele tunnile (nt: aitrack note "õppisin X")')
+    nt.add_argument("text", nargs="*", help="märkme tekst; tühjalt = kuva olemasolevad märkmed")
+    nt.set_defaults(fn=cmd_note)
 
     args = p.parse_args()
     args.fn(args, cfg)

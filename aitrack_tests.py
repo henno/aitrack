@@ -55,6 +55,7 @@ def setup(records, state=None, allow=None):
     A.append_rows = fake_append
     A.fetch_existing_keys = lambda cfg: None  # vaikimisi: ei küsi (tavakäitumine)
     (CFG / "aitrack.lock").unlink(missing_ok=True)
+    (CFG / "notes.jsonl").unlink(missing_ok=True)  # käsitsi-märkmed: puhas leht iga testi eel
 
 def cur_state():
     try:
@@ -340,6 +341,81 @@ except Exception as e:  # noqa: BLE001
 finally:
     A.sys.stdin = _orig_stdin
 check("non-TTY setup ei viska erindit", ok25)
+
+# ============ TEST 26: group_by="hour" → üks rida tunni kohta, kõik kaustad koos ============
+print("TEST 26: group_by='hour' — mitu kausta samal tunnil → ÜKS rida, Projekt-veerus loetelu")
+reset_sink()
+recs = [A.Record("Claude", "/a/web", D(11), "töö web"),
+        A.Record("Codex",  "/b/api", D(11), "töö api"),
+        A.Record("Claude", "/a/web", D(12), "töö web hiljem")]
+setup(recs, allow=["/a/web", "/b/api"], state=json.dumps({"last_processed_hour": HFL(11).isoformat()}))
+cfg = A.load_config(); cfg["group_by"] = "hour"; allow = A.load_projects()
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 13, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+check("2 rida (tunnid 11 ja 12), MITTE 3", len(ADDED) == 2)
+row11 = [r for r in ADDED if r[1].startswith("11:00")][0]
+check("tund 11 Projekt-veerus mõlemad kaustad", row11[2] == "api, web")
+check("tund 11 Tööriist-veerus mõlemad tööriistad", row11[3] == "Claude, Codex")
+check("tunni-tasandi võti (ei sõltu kaustast)", A.bucket_key(HFL(11), None) in SINK_KEYS)
+check("kaks eri tunni võtit", A.bucket_key(HFL(11), None) != A.bucket_key(HFL(12), None))
+
+# ============ TEST 27: group_by="hour" idempotentne — kordustöötlus ei dubleeri ============
+print("TEST 27: group_by='hour' — sama tunni kordus ei tekita duplikaati")
+reset_sink()
+setup([A.Record("Claude", "/a/web", D(11), "w"), A.Record("Codex", "/b/api", D(11), "a")],
+      allow=["/a/web", "/b/api"])
+cfg = A.load_config(); cfg["group_by"] = "hour"; allow = A.load_projects()
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+(CFG / "state.json").write_text(json.dumps({"last_processed_hour": HFL(11).isoformat()}))
+A.run_once(cfg, allow)
+check("hour-režiim: 1 rida kokku (kordus dedupitud)", len(ADDED) == 1)
+
+# ============ TEST 28: käsitsi-märge liidetakse aktiivse tunni ritta ============
+print("TEST 28: aitrack note — märge liidetakse selle tunni kokkuvõttesse")
+reset_sink(); setup([REC(11)])
+cfg = A.load_config(); allow = A.load_projects()
+A.append_note(HFL(11), "õppisin claude --resume käsu")
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+check("1 rida (tund 11)", len(ADDED) == 1)
+check("kokkuvõttes on märge", "õppisin claude --resume käsu" in ADDED[0][4])
+check("märge eristub 'Märge:' sildiga", "Märge:" in ADDED[0][4])
+
+# ============ TEST 29: märge tunnil ILMA tegevuseta → eraldi '(märge)'-rida ============
+print("TEST 29: märge tühjal tunnil → '(märge)'-rida (ei kao kaotsi)")
+reset_sink()  # AI-tegevus AINULT tunnil 11; state alates 11 → töötle tunnid 11 ja 12
+setup([REC(11)], state=json.dumps({"last_processed_hour": HFL(11).isoformat()}))
+cfg = A.load_config(); allow = A.load_projects()
+A.append_note(HFL(12), "koosolek kliendiga")  # märge tunnil 12, kus AI-tegevust POLE
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 13, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+proj_col = {r[2] for r in ADDED}
+check("kaks rida (tund 11 tegevus + tund 12 märge)", len(ADDED) == 2)
+check("üks rida on '(märge)'", "(märge)" in proj_col)
+note_row = [r for r in ADDED if r[2] == "(märge)"][0]
+check("märkme-real õige tekst", "koosolek kliendiga" in note_row[4])
+check("märkme-rea Tund on 12:00", note_row[1].startswith("12:00"))
+
+# ============ TEST 30: märge dedup — kordustöötlus ei tekita duplikaati ============
+print("TEST 30: '(märge)'-rida idempotentne (kordus ei dubleeri)")
+reset_sink(); setup([REC(11)])
+cfg = A.load_config(); allow = A.load_projects()
+A.append_note(HFL(12), "koosolek")
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 13, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+(CFG / "state.json").write_text(json.dumps({"last_processed_hour": HFL(11).isoformat()}))
+A.run_once(cfg, allow)
+check("märkme-rida ei dubleeru", len([r for r in ADDED if r[2] == "(märge)"]) == 1)
+
+# ============ TEST 31: load_notes round-trip + UTC-normaliseeritud võti ============
+print("TEST 31: append_note/load_notes — UTC-tunni võti, mitu märget koondub")
+reset_sink(); setup([REC(11)])
+A.append_note(HFL(14), "esimene")
+other_tz = HFL(14).astimezone(dt.timezone(dt.timedelta(hours=5)))  # sama hetk, teine tsoon
+A.append_note(other_tz, "teine")
+notes = A.load_notes()
+check("mõlemad märkmed sama UTC-tunni all", notes.get(HFL(14).isoformat()) == ["esimene", "teine"])
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

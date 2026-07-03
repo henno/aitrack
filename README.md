@@ -71,6 +71,7 @@ kõik ühe vooluga:
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
+| `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Tühjalt = kuva märkmed. |
 | `aitrack digest [--days N] [--notify]` | Päeva/nädala kokkuvõte (valikuliselt töölaua-teavitus). |
 | `aitrack status` | Näita platvormi, mootorit, väljundit ja logiallikaid. |
 | `aitrack preview --hours N` | Kuiv vaade — mida kirjutataks, väljundisse saatmata. |
@@ -143,6 +144,14 @@ täisülevaate jaoks ava oma Google Sheet / CSV-fail.
   (`/home/sina`) mitte projektikaustast, ei saa tööd projektidesse jagada.
   **Käivita AI projektikaustast** (`cd projekt && claude`), et filtreerimine töötaks.
 - Tabeli veerud: `Kuupäev | Tund | Projekt | Tööriist | Töö kokkuvõte` (+ peidetav `_key`).
+- **Käsitsi-märkmed (`aitrack note`):** iga kasutaja saab lisada praegusele tunnile märkme
+  (nt õpitu, koosolek, otsus): `aitrack note "õppisin X"`. Märge liidetakse selle tunni rea
+  kokkuvõttesse; kui sel tunnil AI-tegevust polnud, tekib eraldi `(märge)`-rida (ei kao kaotsi).
+  Märkmed hoitakse masinapõhiselt failis `~/.config/aitrack/notes.jsonl` (UTC-tunni võtmega).
+- **Rea tase (`group_by` config'is):** `"project"` (vaikimisi) → üks rida iga (tund × projekt)
+  kohta. `"hour"` → **üks rida tunni kohta, kõik kaustad koos** (Projekt-veerus loetelu, nt
+  `aitracker, praktika`; kokkuvõte katab kogu tunni tegevuse). Muuda:
+  `python3 -c "import aitrack as A; c=A.load_config(); c['group_by']='hour'; A.save_config(c)"`.
 - **Config on masinapõhine.** `config.json` ja `projects.json` sisaldavad selle masina teid
   ja tokenit — neid EI jagata; jagatakse ainult kood (`aitrack.py` jne) ning iga inimene jooksutab
   `init`-i ise. `config.json` kirjutatakse õigustega `0o600`.
