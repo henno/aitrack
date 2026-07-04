@@ -43,6 +43,7 @@ LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
 NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
+HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
 # AI-tööriistade logiasukohad — samad kõigil OS-idel (~ = kasutaja kodukaust)
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -108,12 +109,14 @@ DEFAULT_CONFIG = {
     "timezone": "auto",
     "language": "et",
     "max_prompts_per_bucket": 40,
-    # rea tase: "project" = üks rida iga (tund × projekt) kohta (vaikimisi, jagatav);
-    #           "hour"    = üks rida tunni kohta, KÕIK kaustad koos (Projekt-veerus loetelu)
-    "group_by": "project",
+    # rea tase: "hour" = üks tunnipunkt, KÕIK kaustad koos (vaikimisi, sobib päevavaatega);
+    #           "project" = eraldi tunnipunkt iga (tund × projekt) kohta
+    "group_by": "hour",
     # type: "local" (CSV-fail, ilma Google'ita — VAIKIMISI) või "google_sheets" (Apps Script)
     # path tühi + type "local" → _local_path annab DEFAULT_CSV_PATH (~/aitrack-log.csv)
     "sink": {"type": "local", "webapp_url": "", "token": "", "path": ""},
+    # kaust → ärinimi päevavaates (nt "pp-finar": "Puhastusproff – Finar"), et väljundis poleks kaustanime
+    "object_names": {},
     # exe = paigaldusajal lahendatud absoluuttee (kindlustab ajasti vastu, kus PATH puudub)
     "summarizer": {"engine": "auto", "model": "", "timeout": 120, "exe": ""},
     "max_catchup_hours": 48,
@@ -536,25 +539,67 @@ def resolve_engine(cfg: dict) -> tuple[str, str | None]:
     return "none", None
 
 
-def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict) -> str:
+# Päevavaate 4 analüütilist välja (praktikapäeviku vorm). Järjekord = veergude järjekord.
+ITEM_FIELDS = ("objekt", "saavutus", "takistus", "teadmine")
+_NA = "Ei olnud"  # tühja Takistus/Teadmine vaikeväärtus (hoiab numbrid veergudes kohakuti)
+
+
+def _object_context(project_label: str, cfg: dict) -> str:
+    """Ehita LLM-ile objekti-vihje ärinimede kaardist. Kaardistamata kausta EI lekita
+    (kasutaja ei taha kaustanimesid väljundis) — siis tugineb LLM promptide sisule."""
+    names = cfg.get("object_names") or {}
+    mapped = []
+    for name in [p.strip() for p in project_label.split(",") if p.strip()]:
+        disp = names.get(name)
+        if disp and disp not in mapped:
+            mapped.append(disp)
+    return f" Seotud objekt(id): {', '.join(mapped)}." if mapped else ""
+
+
+def _parse_item(text: str, prompts: list[str]) -> dict:
+    """Parsi LLM-i 4-realine vastus (OBJEKT:/SAAVUTUS:/TAKISTUS:/TEADMINE:) dict-iks.
+    Robustne: võtmed suur/väiketäht ükskõik, järjekord vaba, puuduvad väljad täidetakse."""
+    got = {k: "" for k in ITEM_FIELDS}
+    aliases = {"objekt": "objekt", "saavutus": "saavutus", "saavutused": "saavutus",
+               "takistus": "takistus", "takistused": "takistus",
+               "teadmine": "teadmine", "teadmised": "teadmine", "uued teadmised": "teadmine"}
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("-•* ").strip()
+        if ":" not in line:
+            continue
+        head, _, rest = line.partition(":")
+        key = aliases.get(head.strip().lower())
+        if key and not got[key]:
+            got[key] = rest.strip()
+    if not got["objekt"]:  # LLM ei pidanud vormist kinni → pane kogu tekst objekti
+        got["objekt"] = text.replace("\n", " ").strip()[:400] or _fallback_item(prompts)["objekt"]
+    if not got["saavutus"]:
+        got["saavutus"] = got["objekt"]
+    got["takistus"] = got["takistus"] or _NA
+    got["teadmine"] = got["teadmine"] or _NA
+    return {k: v[:400] for k, v in got.items()}
+
+
+def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict) -> dict:
+    """Tagasta ühe tunni kohta 4-väljaline dict (objekt/saavutus/takistus/teadmine)."""
     engine, exe = resolve_engine(cfg)
     if engine == "none" or exe is None:
-        return _fallback_summary(prompts)
+        return _fallback_item(prompts)
 
     joined = "\n".join(f"- {p[:300]}" for p in prompts)
     if len(joined) > 8000:  # piira koondprompti suurust
         joined = joined[:8000] + "\n…(kärbitud)"
-    # 'hour'-režiimis on silt mitu kausta ("web, api") → õige kääne ja katab kõik kaustad
-    multi = "," in project_label
-    where = (f"projektides {project_label} (kata kõik)" if multi
-             else f"projektis {project_label}")
     prompt = (
-        "Sa teed lühikesi eestikeelseid kokkuvõtteid arendustööst. "
-        f"Allpool on kasutaja AI-promptid ühe tunni ({hour_label}) jooksul "
-        f"{where}. "
-        "Vasta TÄPSELT ühe lühikese eestikeelse lausega (kuni ~18 sõna), "
-        "mis võtab kokku mida selle tunni jooksul tehti. "
-        "Ära lisa midagi muud peale selle lause.\n\n"
+        "Sa teed eestikeelseid kokkuvõtteid arendustööst praktikapäeviku jaoks. "
+        f"Allpool on kasutaja AI-promptid ühe tunni ({hour_label}) jooksul."
+        f"{_object_context(project_label, cfg)} "
+        "Kirjelda TÖÖ SISU põhjal (ÄRA maini kaustanimesid ega failiteid). "
+        "Vasta TÄPSELT neljal real, iga rida algab märksõnaga:\n"
+        "OBJEKT: <objekt/klient ja ülesanne, üks lause, kuni ~15 sõna>\n"
+        "SAAVUTUS: <mis sai tehtud või valmis, üks lause>\n"
+        "TAKISTUS: <mis takistas; kui takistust polnud, kirjuta täpselt: Ei olnud>\n"
+        "TEADMINE: <mida uut õpiti; kui uut polnud, kirjuta täpselt: Ei olnud>\n"
+        "Ära lisa midagi peale nende nelja rea.\n\n"
         f"Promptid:\n{joined}"
     )
     model = cfg.get("summarizer", {}).get("model", "")
@@ -567,23 +612,37 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
         )
         text = (res.stdout or "").strip()
         if res.returncode == 0 and text:
-            line = text.replace("\n", " ").strip()
-            return line if len(line) <= 400 else line[:397] + "..."
+            return _parse_item(text, prompts)
         log(f"summarize: {engine} rc={res.returncode} err={(res.stderr or '')[:200]}")
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         log(f"summarize: {engine} ebaõnnestus ({e}) — kasutan varvarianti")
-    return _fallback_summary(prompts)
+    return _fallback_item(prompts)
 
 
-def _fallback_summary(prompts: list[str]) -> str:
+def _fallback_item(prompts: list[str]) -> dict:
     """Geneeriline — EI pane toorest promptisisu lehele (privaatsus)."""
     n = len(prompts)
-    return f"({n} prompti, automaatkokkuvõte puudub)" if n else "(tegevus tuvastatud)"
+    objekt = f"({n} prompti, automaatkokkuvõte puudub)" if n else "(tegevus tuvastatud)"
+    return {"objekt": objekt, "saavutus": objekt, "takistus": _NA, "teadmine": _NA}
 
 
 # --- sink: Google Sheets VÕI lokaalne CSV -----------------------------------
-CSV_HEADER = ["Kuupäev", "Tund", "Projekt", "Tööriist", "Töö kokkuvõte", "_key"]
+# Sisemine tunnipõhine algandmestik (allikas dedup'iks ja päevavaate renderdamiseks).
+RAW_HEADER = ["Kuupäev", "Tund", "Objekt ja ülesanne", "Saavutused",
+              "Takistused", "Uued teadmised", "Tööriist", "_key"]
+# Kasutaja kleebitav päevavaade (üks rida päevas). Veergude järjekord = Google Sheeti A–G.
+DAY_HEADER = ["Kuupäev", "Punkte", "Nädalapäev", "Objekt ja ülesanne",
+              "Saavutused", "Takistused", "Uued teadmised"]
+WEEKDAY_ET = ["E", "T", "K", "N", "R", "L", "P"]  # weekday() 0=E(smaspäev) … 6=P(ühapäev)
 _FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _weekday_letter(date_str: str) -> str:
+    """YYYY-MM-DD → eesti nädalapäeva algustäht (E/T/K/N/R/L/P)."""
+    try:
+        return WEEKDAY_ET[dt.date.fromisoformat(date_str).weekday()]
+    except ValueError:
+        return "?"
 
 
 def _cell_safe(v) -> str:
@@ -613,31 +672,34 @@ def _local_keys(path: Path) -> set[str]:
     try:
         with path.open(newline="", encoding="utf-8") as f:
             for row in csv.reader(f):
-                if len(row) >= len(CSV_HEADER) and row[-1].startswith("k:"):
+                if len(row) >= len(RAW_HEADER) and row[-1].startswith("k:"):
                     out.add(row[-1])
     except OSError:
         pass
     return out
 
 
-def _local_append(rows: list[list], keys: list[str], cfg: dict) -> bool:
-    path = _local_path(cfg)
-    if path is None:
-        log("sink: lokaalse faili tee puudub configis")
-        return False
+def _create_private(path: Path) -> None:
+    """Loo fail 0o600-ga (sisaldab tundlikke kokkuvõtteid), kui puudub."""
+    try:
+        os.close(os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600))
+    except OSError:
+        pass
+
+
+def _raw_append(rows: list[list], keys: list[str]) -> bool:
+    """Lisa tunnipõhised read sisemisse algandmestikku (HOURS_CSV), dedup võtme järgi."""
+    path = HOURS_CSV
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = _local_keys(path)
         is_new = not path.exists() or path.stat().st_size == 0
-        if is_new:  # loo fail 0o600-ga (sisaldab tundlikke kokkuvõtteid)
-            try:
-                os.close(os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600))
-            except OSError:
-                pass
+        if is_new:
+            _create_private(path)
         with path.open("a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if is_new:
-                w.writerow(CSV_HEADER)
+                w.writerow(RAW_HEADER)
             for row, k in zip(rows, keys):
                 if k in existing:
                     continue  # dedup, nagu Apps Scriptis
@@ -645,7 +707,110 @@ def _local_append(rows: list[list], keys: list[str], cfg: dict) -> bool:
                 existing.add(k)
         return True
     except OSError as e:
-        log(f"sink: lokaalse faili kirjutus ebaõnnestus: {e}")
+        log(f"sink: algandmestiku kirjutus ebaõnnestus: {e}")
+        return False
+
+
+def _read_raw_days() -> "dict[str, list[list]]":
+    """Loe HOURS_CSV → {kuupäev: [tunnirida, …]} tunni järgi sorteeritult.
+    Tunnirida = [Kuupäev, Tund, Objekt, Saavutused, Takistused, Uued teadmised, Tööriist, _key]."""
+    days: dict[str, list[list]] = {}
+    if not HOURS_CSV.exists():
+        return days
+    try:
+        with HOURS_CSV.open(newline="", encoding="utf-8") as f:
+            rdr = csv.reader(f)
+            header = next(rdr, None)  # jäta päis vahele
+            for row in rdr:
+                if len(row) < len(RAW_HEADER) or row == header:
+                    continue
+                days.setdefault(row[0], []).append(row)
+    except OSError as e:
+        log(f"render: algandmestiku lugemine ebaõnnestus: {e}")
+    for date in days:
+        days[date].sort(key=lambda r: r[1])  # Tund (nt "10:00–11:00") stringina → kronoloogiline
+    return days
+
+
+def _day_row(date: str, hour_rows: list[list]) -> list:
+    """Kokku üks päevarida: iga tund = nummerdatud punkt, numbrid kõigis 4 veerus kohakuti."""
+    # eemalda välja SEEST reavahetused → ainsad reavahetused on punktide vahel (join),
+    # nii ei teki kleepimisel valeridu ega peitunud valemisüsti (=… uue rea alguses)
+    clean = lambda s: str(s).replace("\r", " ").replace("\n", " ").strip()  # noqa: E731
+    cols = {k: [] for k in ("objekt", "saavutus", "takistus", "teadmine")}
+    for i, r in enumerate(hour_rows, 1):
+        cols["objekt"].append(f"{i}. {clean(r[2])}")
+        cols["saavutus"].append(f"{i}. {clean(r[3])}")
+        cols["takistus"].append(f"{i}. {clean(r[4])}")
+        cols["teadmine"].append(f"{i}. {clean(r[5])}")
+    join = lambda xs: "\n".join(xs)  # noqa: E731
+    return [date, len(hour_rows), _weekday_letter(date),
+            join(cols["objekt"]), join(cols["saavutus"]),
+            join(cols["takistus"]), join(cols["teadmine"])]
+
+
+def _migrate_old_log(cfg: dict) -> None:
+    """Ühekordne: teisenda vana 5-veeru päevalog (~/aitrack-log.csv) uude tunnipõhisesse
+    algandmestikku, et vana andmestik ei kaoks päevavaate ümberrenderdamisel.
+    Käivitub AINULT kui HOURS_CSV veel puudub JA sink-fail on vanas formaadis."""
+    if HOURS_CSV.exists():
+        return  # juba migreeritud / uus paigaldus
+    path = _local_path(cfg)
+    if path is None or not path.exists():
+        return
+    rows: list[list] = []
+    keys: list[str] = []
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            rdr = csv.reader(f)
+            header = next(rdr, None)
+            if not header or "Töö kokkuvõte" not in header:
+                return  # pole vana formaat (võib juba olla päevavaade) — ära puutu
+            for row in rdr:
+                if len(row) < 6 or not row[-1].startswith("k:"):
+                    continue
+                date, hour, proj, tool, summary, key = (
+                    row[0], row[1], row[2], row[3], row[4], row[-1])
+                objekt, teadmine = summary, _NA
+                if proj == "(märge)":       # vana märkme-rida → objekt "(märge)", tekst teadmisse
+                    objekt, teadmine = "(märge)", summary
+                elif "· Märge:" in summary:  # tegevus + märge → tõsta märge teadmiste veergu
+                    objekt, _, note = summary.partition("· Märge:")
+                    objekt, teadmine = objekt.strip(), "Märge: " + note.strip()
+                rows.append([date, hour, _cell_safe(objekt), _cell_safe(_NA),
+                             _cell_safe(_NA), _cell_safe(teadmine), tool])
+                keys.append(key)
+    except OSError as e:
+        log(f"migrate: vana logi lugemine ebaõnnestus: {e}")
+        return
+    if rows and _raw_append(rows, keys):
+        log(f"migrate: {len(rows)} vana tunnirida → {HOURS_CSV} (Objekt-veergu; täpsusta käsitsi)")
+
+
+def _render_day_view(cfg: dict) -> bool:
+    """Renderda kogu päevavaade (üks rida päevas) HOURS_CSV põhjal sink-faili. Idempotentne."""
+    path = _local_path(cfg)
+    if path is None:
+        log("sink: lokaalse faili tee puudub configis")
+        return False
+    days = _read_raw_days()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _create_private(tmp)
+        with tmp.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(DAY_HEADER)
+            for date in sorted(days):
+                w.writerow(_day_row(date, days[date]))
+        os.replace(str(tmp), str(path))  # aatomiline vahetus → pooleli fail ei jää
+        return True
+    except OSError as e:
+        log(f"sink: päevavaate kirjutus ebaõnnestus: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
 
 
@@ -671,7 +836,10 @@ def _post(payload: dict, cfg: dict) -> str | None:
 
 def append_rows(rows: list[list], keys: list[str], cfg: dict) -> bool:
     if cfg.get("sink", {}).get("type") == "local":
-        return _local_append(rows, keys, cfg)
+        # 1) lisa tunnid sisemisse algandmestikku (dedup), 2) renderda päevavaade ümber
+        if not _raw_append(rows, keys):
+            return False
+        return _render_day_view(cfg)
     # 'keys' = deterministlikud rea-võtmed; Apps Script jätab juba olemasolevad vahele
     # (idempotentsus → katkestus/kordussaatmine ei tekita duplikaate)
     body = _post({"rows": rows, "keys": keys}, cfg)
@@ -694,8 +862,7 @@ def fetch_existing_keys(cfg: dict) -> set[str] | None:
     Tagastab None, kui päring ebaõnnestub või Apps Script on vana (ilma 'keys' režiimita)
     → kutsuja summeerib siis kõik (dedup hoiab duplikaadid niikuinii ära)."""
     if cfg.get("sink", {}).get("type") == "local":
-        path = _local_path(cfg)
-        return _local_keys(path) if path else set()
+        return _local_keys(HOURS_CSV)  # dedup-võtmed sisemisest algandmestikust
     body = _post({"op": "keys"}, cfg)
     if body is None:
         return None
@@ -782,6 +949,9 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
     if state is None:  # rikutud state — ära nulli watermarki
         return
 
+    if cfg.get("sink", {}).get("type") == "local":
+        _migrate_old_log(cfg)  # ühekordne: vana 5-veeru log → uus algandmestik (ei kao andmed)
+
     if backfill_hours is not None:
         last_hour = current_hour - dt.timedelta(hours=backfill_hours)
     elif "last_processed_hour" in state:
@@ -854,14 +1024,19 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
             skipped += 1
             continue                             # juba lehel → ära kuluta LLM-kõnet
         heartbeat_lock(lock)  # pikk run ei tohi teisele protsessile aegunud näida
-        summary = summarize(prompts, proj_label, hour_label, cfg)
+        item = summarize(prompts, proj_label, hour_label, cfg)  # 4-väljaline dict
         notes = notes_by_hour.get(_hour_iso(hstart), [])  # käsitsi-märkmed selle tunni kohta
-        if notes:
-            summary = f"{summary} · Märge: {' · '.join(notes)}"
+        if notes:  # käsitsi-märge → "Uued teadmised" veergu (sinna kuuluvad õpitud asjad)
+            note_txt = "Märge: " + " · ".join(notes)
+            item["teadmine"] = (note_txt if item["teadmine"] == _NA
+                                else f"{item['teadmine']} · {note_txt}")
         # _cell_safe kasutajast tuletatud lahtritel → ei käivitu valemina (CSV/Sheets injection)
-        rows.append([date_str, hour_label, _cell_safe(proj_label), ", ".join(tools), _cell_safe(summary)])
+        rows.append([date_str, hour_label,
+                     _cell_safe(item["objekt"]), _cell_safe(item["saavutus"]),
+                     _cell_safe(item["takistus"]), _cell_safe(item["teadmine"]),
+                     ", ".join(tools)])
         keys.append(key)
-        log(f"  → {date_str} {hour_label} | {proj_label} | {', '.join(tools)} | {summary[:80]}")
+        log(f"  → {date_str} {hour_label} | {', '.join(tools)} | {item['objekt'][:70]}")
 
     # Märkmed tundidel ILMA jälgitava AI-tegevuseta → eraldi "(märge)"-rida (ei kao kaotsi)
     activity_hours = {_hour_iso(hstart) for (hstart, _) in buckets}
@@ -879,10 +1054,11 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
         local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
         hour_label = f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}"
         date_str = local.strftime("%Y-%m-%d")
-        summary = "Märge: " + " · ".join(texts)
-        rows.append([date_str, hour_label, _cell_safe("(märge)"), "", _cell_safe(summary)])
+        note_txt = " · ".join(texts)
+        rows.append([date_str, hour_label, _cell_safe("(märge)"), _cell_safe(_NA),
+                     _cell_safe(_NA), _cell_safe("Märge: " + note_txt), ""])
         keys.append(key)
-        log(f"  → {date_str} {hour_label} | (märge) | — | {summary[:80]}")
+        log(f"  → {date_str} {hour_label} | (märge) | {note_txt[:70]}")
 
     if skipped:
         log(f"backfill: {skipped} juba-olemas tundi jäeti vahele (LLM-kõnet ei tehtud)")
@@ -1325,6 +1501,34 @@ def cmd_note(args, cfg):
     print(f"Lisatud tundi {start.strftime('%Y-%m-%d %H:%M')}–{end.strftime('%H:%M')}: {text}")
 
 
+def cmd_day(args, cfg):
+    """Prindi päevarida (üks rida päevas) tab-eraldusega — valmis Google Sheetsi kleepimiseks."""
+    if cfg.get("sink", {}).get("type") == "local":
+        _migrate_old_log(cfg)  # taga, et vana log oleks nähtav ka enne järgmist run'i
+    days = _read_raw_days()
+    if not days:
+        print("Andmeid pole veel. Käivita: aitrack run (või oota tunniajastit).")
+        return
+    if args.all:
+        targets = sorted(days)
+    elif args.date:
+        if args.date not in days:
+            print(f"Kuupäeval {args.date} andmeid pole. Olemas: {', '.join(sorted(days))}")
+            return
+        targets = [args.date]
+    else:
+        targets = [sorted(days)[-1]]  # vaikimisi viimane päev, mille kohta on andmeid
+    # Vaikimisi ainult sisuveerud D–G (Objekt/Saavutused/Takistused/Uued teadmised) — kasutaja
+    # täidab A/B/C (Kuupäev/Punkte/Nädalapäev) ise; --full annab kõik 7 veergu.
+    cols = slice(None) if args.full else slice(3, 7)
+    # csv.writer tabiga → mitmerealised lahtrid lähevad jutumärkidesse (nagu Sheetsi ootab)
+    w = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    if args.header or args.all:
+        w.writerow(DAY_HEADER[cols])
+    for d in targets:
+        w.writerow(_day_row(d, days[d])[cols])
+
+
 def cmd_init(args, cfg):
     """Loob config.json ja küsib Sheetsi seaded."""
     existing = load_config()
@@ -1394,7 +1598,9 @@ def cmd_status(args, cfg):
     if sink.get("type") == "local":
         path = _local_path(cfg)  # lahendab ka vaiketee (~/aitrack-log.csv), kui path on tühi
         exists = "olemas" if path and path.exists() else "puudub veel"
-        print(f"Väljund:         lokaalne CSV → {path} ({exists})")
+        print(f"Väljund:         päevavaade → {path} ({exists})")
+        print(f"Algandmestik:    {HOURS_CSV} ({'olemas' if HOURS_CSV.exists() else 'puudub veel'})")
+        print("Kleebi Sheetsi:  aitrack day   (viimane päev, tab-eraldus)")
     else:
         print(f"Väljund:         Google Sheets ({'seadistatud' if sink.get('webapp_url') else 'URL PUUDUB'})")
     print(f"Kokkuvõtja:      {eng}" + (f" ({exe})" if exe else " — AI-CLI puudub"))
@@ -1553,6 +1759,13 @@ def main():
     nt = sub.add_parser("note", help='lisa käsitsi-märge praegusele tunnile (nt: aitrack note "õppisin X")')
     nt.add_argument("text", nargs="*", help="märkme tekst; tühjalt = kuva olemasolevad märkmed")
     nt.set_defaults(fn=cmd_note)
+
+    dy = sub.add_parser("day", help="prindi päeva sisuveerud D–G (tab-eraldus) Sheetsi kleepimiseks")
+    dy.add_argument("date", nargs="?", help="kuupäev YYYY-MM-DD (vaikimisi viimane päev)")
+    dy.add_argument("--all", action="store_true", help="prindi kõik päevad")
+    dy.add_argument("--header", action="store_true", help="lisa ka päiserida")
+    dy.add_argument("--full", action="store_true", help="kõik 7 veergu (ka Kuupäev/Punkte/Nädalapäev)")
+    dy.set_defaults(fn=cmd_day)
 
     args = p.parse_args()
     args.fn(args, cfg)

@@ -31,7 +31,9 @@ def reset_sink():
 
 def fake_summarize(prompts, proj, label, cfg):
     SUMMARIZE_CALLS.append(label)
-    return f"STUB({len(prompts)})"
+    # 4-väljaline dict (nagu päris summarize); objekt kannab proj-silti, et testid saaks kontrollida
+    return {"objekt": f"OBJ[{proj}]", "saavutus": f"STUB({len(prompts)})",
+            "takistus": A._NA, "teadmine": A._NA}
 
 def fake_append(rows, keys, cfg):
     SENT.append((rows, keys))
@@ -56,6 +58,7 @@ def setup(records, state=None, allow=None):
     A.fetch_existing_keys = lambda cfg: None  # vaikimisi: ei küsi (tavakäitumine)
     (CFG / "aitrack.lock").unlink(missing_ok=True)
     (CFG / "notes.jsonl").unlink(missing_ok=True)  # käsitsi-märkmed: puhas leht iga testi eel
+    A.HOURS_CSV.unlink(missing_ok=True)  # sisemine algandmestik: isoleeri iga test (real-append testid)
 
 def cur_state():
     try:
@@ -156,10 +159,11 @@ check("config.json režiim 0600", mode == "600")
 check("config loetav tagasi", A.load_config()["sink"]["token"] == "salajane")
 
 # ============ TEST 10: varukokkuvõte ei leki toorest prompti ============
-print("TEST 10: _fallback_summary on geneeriline (ei leki promptisisu)")
-fb = A._fallback_summary(["SALAJANE API VÕTI sk-12345", "veel üks"])
+print("TEST 10: _fallback_item on geneeriline (ei leki promptisisu)")
+fbi = A._fallback_item(["SALAJANE API VÕTI sk-12345", "veel üks"])
+fb = " ".join(fbi.values())
 check("ei sisalda toorest prompti", "SALAJANE" not in fb and "sk-12345" not in fb)
-check("näitab promptide arvu", "2" in fb)
+check("näitab promptide arvu", "2" in fbi["objekt"])
 
 # ============ TEST 11: match_project — subpath jah, sibling ei ============
 print("TEST 11: match_project tabab subpath'i, mitte sibling'it")
@@ -170,7 +174,7 @@ check("sibling EI sobi", A.match_project("/home/x/proj2", allow) is None)
 # ============ TEST 12: backfill jätab juba-olemas tunni summeerimata (kuluvõit) ============
 print("TEST 12: backfill ei summeeri tunde, mis on juba lehel")
 reset_sink(); setup([REC(10), REC(11), REC(12)], state=json.dumps({"last_processed_hour": HFL(13).isoformat()}))
-cfg = A.load_config(); allow = A.load_projects()
+cfg = A.load_config(); cfg["group_by"] = "project"; allow = A.load_projects()  # test projekti-tasandi võtit
 A._now_utc = lambda: dt.datetime(2026, 6, 16, 13, 15, tzinfo=UTC)
 A.fetch_existing_keys = lambda cfg: {A.bucket_key(HFL(11), "/proj")}  # tund 11 juba lehel
 A.run_once(cfg, allow, backfill_hours=3)
@@ -183,7 +187,7 @@ print("TEST 13: kaks samanimelist projekti (/a/web, /b/web) → mõlemad read, e
 reset_sink()
 recs = [A.Record("Claude", "/a/web", D(11), "töö a"), A.Record("Claude", "/b/web", D(11), "töö b")]
 setup(recs, allow=["/a/web", "/b/web"])
-cfg = A.load_config(); allow = A.load_projects()
+cfg = A.load_config(); cfg["group_by"] = "project"; allow = A.load_projects()  # projekti-tasandi read
 A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
 A.run_once(cfg, allow)
 check("mõlemad read kirjutatud (2)", len(ADDED) == 2)
@@ -232,20 +236,23 @@ except Exception as e:  # noqa: BLE001
     ok = False; print("    erind:", e)
 check("vale-tüübiga sink → jääb dict-iks, ei lõhu", ok)
 
-# ============ TEST 17: lokaalne CSV-sink — kirjutab + dedupib ============
-print("TEST 17: lokaalne CSV-sink kirjutab ridu ja dedupib võtme järgi")
+# ============ TEST 17: lokaalne sink — algandmestik dedupib, päevavaade renderdub ============
+print("TEST 17: lokaalne sink kirjutab algandmestikku + renderdab päevavaate, dedup võtme järgi")
+A.HOURS_CSV.unlink(missing_ok=True)  # isoleeri: puhas algandmestik
 csvpath = CFG / "log.csv"
 csvpath.unlink(missing_ok=True)
 lcfg = {"sink": {"type": "local", "path": str(csvpath)}}
-r1 = [["2026-06-16", "11:00–12:00", "proj", "Claude", "tegi asja"]]
+# raw-rida: [Kuupäev, Tund, Objekt, Saavutused, Takistused, Uued teadmised, Tööriist]
+r1 = [["2026-06-16", "11:00–12:00", "objekt", "saavutus", "takistus", "teadmine", "Claude"]]
 k1 = ["k:2026-06-16T11:00:00+00:00|proj|abc123"]
-ok1 = _REAL["append_rows"](r1, k1, lcfg)        # päris dispatch → lokaalne kirjutaja
+ok1 = _REAL["append_rows"](r1, k1, lcfg)        # päris dispatch → algandmestik + render
 ok2 = _REAL["append_rows"](r1, k1, lcfg)         # sama võti uuesti → ei tohi dubleerida
 import csv as _csv
 with csvpath.open(newline="", encoding="utf-8") as f:
     data_rows = [row for row in _csv.reader(f)]
 check("kirjutamine õnnestus", ok1 and ok2)
-check("päis + 1 andmerida (dedup töötab)", len(data_rows) == 2)
+check("päevavaade: päis + 1 päevarida (dedup töötab)", len(data_rows) == 2)
+check("päevarida: 1 punkt, nädalapäev T", data_rows[1][1] == "1" and data_rows[1][2] == "T")
 check("fetch_existing_keys leiab võtme", _REAL["fetch_existing_keys"](lcfg) == set(k1))
 
 # ============ TEST 18: suggest_projects loeb logidest projektid ============
@@ -284,16 +291,19 @@ check("_cell_safe prefiksib @+-", all(A._cell_safe(c + "x")[0] == "'" for c in "
 check("_cell_safe ei muuda tavalist", A._cell_safe("tavaline") == "tavaline")
 reset_sink()
 csv2 = CFG / "inj.csv"; csv2.unlink(missing_ok=True)
-setup([REC(11)])
+setup([REC(11)])  # setup nullib ka HOURS_CSV → puhas algandmestik
 A.append_rows = _REAL["append_rows"]          # päris lokaalne kirjutaja
 A.fetch_existing_keys = _REAL["fetch_existing_keys"]
-A.summarize = lambda *a, **k: '=HYPERLINK("http://evil")'   # pahatahtlik kokkuvõte
+A.summarize = lambda *a, **k: {"objekt": '=HYPERLINK("http://evil")', "saavutus": "x",
+                               "takistus": A._NA, "teadmine": A._NA}  # pahatahtlik objekt
 A.save_config({"timezone": "UTC", "sink": {"type": "local", "path": str(csv2)}})
 A.save_projects(["/proj"])
 A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
 A.run_once(A.load_config(), A.load_projects())
 content = csv2.read_text(encoding="utf-8")
-check("kokkuvõte CSV-s ' prefiksiga", "'=HYPERLINK" in content)
+raw_content = A.HOURS_CSV.read_text(encoding="utf-8")
+check("algandmestikus objekt ' prefiksiga", "'=HYPERLINK" in raw_content)
+check("päevavaates objekt ' prefiksiga", "'=HYPERLINK" in content)
 check("kaitsmata =HYPERLINK rea/välja algust pole", "\n=HYPERLINK" not in content)
 
 # ============ TEST 22: lokaalne CSV luuakse 0o600-ga ============
@@ -305,8 +315,8 @@ check("CSV režiim 0600", mode == "600")
 print("TEST 23: _local_keys ei lange fantoomvõtmesse")
 csv3 = CFG / "edited.csv"
 csv3.write_text(
-    "Kuupäev,Tund,Projekt,Tööriist,Töö kokkuvõte,_key\n"
-    "2026-06-16,11:00–12:00,proj,Claude,tegi,k:2026-06-16T11:00:00+00:00|proj|aaa\n"
+    "Kuupäev,Tund,Objekt ja ülesanne,Saavutused,Takistused,Uued teadmised,Tööriist,_key\n"
+    "2026-06-16,11:00–12:00,objekt,saav,tak,teadm,Claude,k:2026-06-16T11:00:00+00:00|proj|aaa\n"
     "käsitsi lisatud rida ilma võtmeta\n", encoding="utf-8")
 ks = A._local_keys(csv3)
 check("ainult kehtiv k: võti, mitte fantoom", ks == {"k:2026-06-16T11:00:00+00:00|proj|aaa"})
@@ -354,8 +364,8 @@ A._now_utc = lambda: dt.datetime(2026, 6, 16, 13, 15, tzinfo=UTC)
 A.run_once(cfg, allow)
 check("2 rida (tunnid 11 ja 12), MITTE 3", len(ADDED) == 2)
 row11 = [r for r in ADDED if r[1].startswith("11:00")][0]
-check("tund 11 Projekt-veerus mõlemad kaustad", row11[2] == "api, web")
-check("tund 11 Tööriist-veerus mõlemad tööriistad", row11[3] == "Claude, Codex")
+check("tund 11 objekt katab mõlemad kaustad", "api" in row11[2] and "web" in row11[2])
+check("tund 11 Tööriist-veerus (viimane) mõlemad tööriistad", row11[6] == "Claude, Codex")
 check("tunni-tasandi võti (ei sõltu kaustast)", A.bucket_key(HFL(11), None) in SINK_KEYS)
 check("kaks eri tunni võtit", A.bucket_key(HFL(11), None) != A.bucket_key(HFL(12), None))
 
@@ -379,8 +389,8 @@ A.append_note(HFL(11), "õppisin claude --resume käsu")
 A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
 A.run_once(cfg, allow)
 check("1 rida (tund 11)", len(ADDED) == 1)
-check("kokkuvõttes on märge", "õppisin claude --resume käsu" in ADDED[0][4])
-check("märge eristub 'Märge:' sildiga", "Märge:" in ADDED[0][4])
+check("märge 'Uued teadmised' veerus", "õppisin claude --resume käsu" in ADDED[0][5])
+check("märge eristub 'Märge:' sildiga", "Märge:" in ADDED[0][5])
 
 # ============ TEST 29: märge tunnil ILMA tegevuseta → eraldi '(märge)'-rida ============
 print("TEST 29: märge tühjal tunnil → '(märge)'-rida (ei kao kaotsi)")
@@ -390,11 +400,11 @@ cfg = A.load_config(); allow = A.load_projects()
 A.append_note(HFL(12), "koosolek kliendiga")  # märge tunnil 12, kus AI-tegevust POLE
 A._now_utc = lambda: dt.datetime(2026, 6, 16, 13, 15, tzinfo=UTC)
 A.run_once(cfg, allow)
-proj_col = {r[2] for r in ADDED}
+obj_col = {r[2] for r in ADDED}
 check("kaks rida (tund 11 tegevus + tund 12 märge)", len(ADDED) == 2)
-check("üks rida on '(märge)'", "(märge)" in proj_col)
+check("üks rida on '(märge)'", "(märge)" in obj_col)
 note_row = [r for r in ADDED if r[2] == "(märge)"][0]
-check("märkme-real õige tekst", "koosolek kliendiga" in note_row[4])
+check("märkme-real õige tekst", "koosolek kliendiga" in note_row[5])
 check("märkme-rea Tund on 12:00", note_row[1].startswith("12:00"))
 
 # ============ TEST 30: märge dedup — kordustöötlus ei tekita duplikaati ============

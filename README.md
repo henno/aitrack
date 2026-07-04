@@ -28,9 +28,10 @@ OS-i tunniajasti (iga tund):  Linux→systemd · macOS→launchd · Windows→Ta
    ├─ loeb state-failist viimati töödeldud tunni → jätkab katkenud kohast
    ├─ parsib kolme tööriista lokaalsed logid (Claude jsonl / Codex+agy history.jsonl)
    ├─ FILTREERIB ainult lubatud projektid (projects.json)
-   ├─ grupeerib LÕPETATUD tunnid (tund × projekt) — arvestus UTC-s (DST-kindel)
-   ├─ iga ämbri kohta → AI-CLI teeb 1-lauselise eestikeelse kokkuvõtte
-   └─ lisab read Google Sheetsi (dedup-võtmega → kordussaatmine ei tekita duplikaate)
+   ├─ grupeerib LÕPETATUD tunnid (vaikimisi kõik kaustad koos) — arvestus UTC-s (DST-kindel)
+   ├─ iga tunni kohta → AI-CLI jagab 4 välja: Objekt/Saavutused/Takistused/Uued teadmised
+   ├─ lisab tunnipunkti algandmestikku (dedup-võtmega → kordus ei dubleeri)
+   └─ renderdab päevavaate (üks rida päevas, punktid nummerdatult) → ~/aitrack-log.csv
 ```
 
 Töökindlus (kontrollitud automaattestidega — `python3 aitrack_tests.py`):
@@ -72,7 +73,8 @@ kõik ühe vooluga:
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
-| `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Tühjalt = kuva märkmed. |
+| `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Läheb "Uued teadmised" veergu. Tühjalt = kuva märkmed. |
+| `aitrack day [KUUPÄEV]` | **Prindi päeva sisuveerud D–G** (Objekt/Saavutused/Takistused/Uued teadmised, tab-eraldus) — vali Sheetsis lahter `D<rida>` ja Ctrl+V. Vaikimisi viimane päev; `--all` = kõik; `--header` = päiserida; `--full` = kõik 7 veergu (ka Kuupäev/Punkte/Nädalapäev). |
 | `aitrack digest [--days N] [--notify]` | Päeva/nädala kokkuvõte (valikuliselt töölaua-teavitus). |
 | `aitrack status` | Näita platvormi, mootorit, väljundit ja logiallikaid. |
 | `aitrack preview --hours N` | Kuiv vaade — mida kirjutataks, väljundisse saatmata. |
@@ -84,7 +86,7 @@ kõik ühe vooluga:
 ## Tööpäeva näide
 
 **Põhimõte:** sina lihtsalt töötad nagu tavaliselt. Tööriist jookseb taustal iga tund (:05)
-ja kirjutab ühe rea iga (tund × projekt) kohta. Ainus reegel — **käivita AI projektikaustast**:
+ja lisab päevaritta ühe nummerdatud punkti tunni kohta. Ainus reegel — **käivita AI projektikaustast**:
 
 ```bash
 cd ~/kalaradar-mono && claude     # ✓ töö läheb 'kalaradar-mono' alla
@@ -102,17 +104,21 @@ cd ~ && claude                    # ✗ kodukaustast → ei eristu projektiks
 | 13:15 | `cd ~/parkproduction && claude` → müügipakkumine, PageSpeed | — |
 | 18:00 | Pakid asju | 🔔 **Päeva-digest:** *"AI-töö 1p: 4 aktiivset tundi, 47 prompti — kalaradar-mono 2h, parkproduction 2h"* |
 
-**Tulemus väljundis** (rida tekib ~5 min pärast tunni lõppu):
-```
-| Kuupäev    | Tund        | Projekt        | Tööriist      | Töö kokkuvõte                                  |
-| 2026-06-17 | 09:00–10:00 | kalaradar-mono | Claude        | Lisas PWA norra tõlked, parandas locale-bugi   |
-| 2026-06-17 | 10:00–11:00 | kalaradar-mono | Claude, Codex | Kirjutas ekspordi testid, debugis API 500-vea  |
-| 2026-06-17 | 13:00–14:00 | parkproduction | Claude        | Koostas müügipakkumise ja PageSpeed-paranduse  |
-```
+**Väljund on üks rida PÄEVA kohta** (praktikapäeviku vorm). Iga tund lisab sellesse päevaritta
+ühe **nummerdatud punkti** ja numbrid on kõigis neljas sisuveerus kohakuti. LLM jagab iga tunni
+nelja välja: *Objekt ja ülesanne / Saavutused / Takistused / Uued teadmised*.
+
+| Kuupäev | Punkte | Nädalapäev | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised |
+|---|---|---|---|---|---|---|
+| 2026-06-17 | 3 | K | 1. …<br>2. …<br>3. … | 1. …<br>2. …<br>3. … | 1. Ei olnud<br>… | 1. …<br>… |
+
+**Kleepimine Google Sheetsi:** jooksuta `aitrack day` — see prindib viimase päeva **sisuveerud
+D–G** tab-eraldusega (mitmerealised lahtrid jutumärkides). Vali lehel lahter `D<rida>` ja
+Ctrl+V (A/B/C = Kuupäev/Punkte/Nädalapäev täidad ise; `--full` annab ka need). Kogu ajalugu on
+failis `~/aitrack-log.csv` (renderdatakse iga tund ümber).
 
 **Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status`.
-**Tööpäeva lõpp:** automaatne 18:00 teavitus (kui lubasid), või käsitsi `aitrack digest --days 1`;
-täisülevaate jaoks ava oma Google Sheet / CSV-fail.
+**Tööpäeva lõpp:** `aitrack day` → kleebi lehele. (Digest/teavitus töötab nagu enne.)
 
 | Olukord | Käsk |
 |---|---|
@@ -144,15 +150,22 @@ täisülevaate jaoks ava oma Google Sheet / CSV-fail.
 - **Projekti tuvastus käib `cwd`/`workspace` järgi.** Kui käivitad AI-d kodukaustast
   (`/home/sina`) mitte projektikaustast, ei saa tööd projektidesse jagada.
   **Käivita AI projektikaustast** (`cd projekt && claude`), et filtreerimine töötaks.
-- Tabeli veerud: `Kuupäev | Tund | Projekt | Tööriist | Töö kokkuvõte` (+ peidetav `_key`).
-- **Käsitsi-märkmed (`aitrack note`):** iga kasutaja saab lisada praegusele tunnile märkme
-  (nt õpitu, koosolek, otsus): `aitrack note "õppisin X"`. Märge liidetakse selle tunni rea
-  kokkuvõttesse; kui sel tunnil AI-tegevust polnud, tekib eraldi `(märge)`-rida (ei kao kaotsi).
-  Märkmed hoitakse masinapõhiselt failis `~/.config/aitrack/notes.jsonl` (UTC-tunni võtmega).
-- **Rea tase (`group_by` config'is):** `"project"` (vaikimisi) → üks rida iga (tund × projekt)
-  kohta. `"hour"` → **üks rida tunni kohta, kõik kaustad koos** (Projekt-veerus loetelu, nt
-  `aitracker, praktika`; kokkuvõte katab kogu tunni tegevuse). Muuda:
-  `python3 -c "import aitrack as A; c=A.load_config(); c['group_by']='hour'; A.save_config(c)"`.
+- **Kaks faili.** Sisemine tunnipõhine algandmestik `~/.config/aitrack/hours.csv`
+  (veerud `Kuupäev | Tund | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised | Tööriist | _key`)
+  on **allikas** — dedup ja päevavaate renderdamine. Kasutaja kleebitav **päevavaade**
+  `~/aitrack-log.csv` (veerud `Kuupäev | Punkte | Nädalapäev | Objekt… | Saavutused | Takistused | Uued teadmised`)
+  renderdatakse sellest ümber iga käivituse järel. Vana 5-veeru log migreeritakse esimesel
+  käivitusel automaatselt (kogu tekst läheb "Objekt"-veergu — täpsusta soovi korral käsitsi).
+- **Objekti ärinimed (`object_names` config'is):** kaardista kaust → ärinimi, et väljundis
+  poleks kaustanime, nt `{"pp-finar": "Puhastusproff – Finar"}`. Rakendub uutele tundidele
+  (LLM kirjeldab objekti selle nime järgi; kaardistamata kausta nime ei lekitata).
+- **Käsitsi-märkmed (`aitrack note`):** `aitrack note "õppisin X"` lisab praegusele tunnile
+  märkme, mis läheb **"Uued teadmised"** veergu (sildiga `Märge:`). Kui sel tunnil AI-tegevust
+  polnud, tekib eraldi `(märge)`-punkt (ei kao kaotsi).
+  Märkmed hoitakse failis `~/.config/aitrack/notes.jsonl` (UTC-tunni võtmega).
+- **Punkti tase (`group_by` config'is):** `"hour"` (vaikimisi) → **üks punkt tunni kohta, kõik
+  kaustad koos**. `"project"` → eraldi punkt iga (tund × projekt) kohta. Muuda:
+  `python3 -c "import aitrack as A; c=A.load_config(); c['group_by']='project'; A.save_config(c)"`.
 - **Config ja andmed on masinapõhised.** `config.json`, `projects.json`, `notes.jsonl` ja
   **CSV-logi ise** (`~/aitrack-log.csv`) sisaldavad selle inimese isiklikke andmeid — neid **EI
   commitita** (kõik `.gitignore`-s); jagatakse ainult kood (`aitrack.py` jne). Iga kasutaja saab
