@@ -5,7 +5,7 @@ services:
     container_name: aitrack-server
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3102:8765"
+      - "127.0.0.1:3103:8765"
     environment:
       AITRACK_CONFIG_DIR: /data
       PYTHONUNBUFFERED: "1"

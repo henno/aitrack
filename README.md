@@ -134,7 +134,7 @@ päevavaade renderdatakse uuesti.
 SQLite-põhise keskserveri. Serveris loo kasutaja `aitrack user add karl --db /data/server.db`, kliendis
 seadista `aitrack connect --url https://aitrack.example.com --token TOKEN`. Seejärel saadab kliendi
 `aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta repo juures
-`docker compose up -d --build` (vaikimisi seob `127.0.0.1:3102`).
+`docker compose up -d --build` (vaikimisi seob `127.0.0.1:3103`).
 
 **Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status` või `aitrack start`.
 **Tööpäeva lõpp:** `aitrack start` → kontrolli/muuda → “Kopeeri D–G” → kleebi lehele. (Digest/teavitus töötab nagu enne.)
