@@ -26,8 +26,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
+import webbrowser
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -43,6 +46,7 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
 NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
+SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack serve)
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -985,6 +989,242 @@ def _render_day_view(cfg: dict) -> bool:
         return False
 
 
+# --- SQLite server / client-server sink ------------------------------------
+def _server_db_path(path: str | None = None) -> Path:
+    return Path(path).expanduser() if path else SERVER_DB
+
+
+def _db_connect(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def _db_init(path: Path) -> None:
+    with _db_connect(path) as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          token TEXT NOT NULL UNIQUE,
+          role TEXT NOT NULL DEFAULT 'user',
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS hour_rows (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          hour TEXT NOT NULL,
+          objekt TEXT NOT NULL,
+          saavutus TEXT NOT NULL,
+          takistus TEXT NOT NULL,
+          teadmine TEXT NOT NULL,
+          tool TEXT NOT NULL,
+          row_key TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, row_key)
+        );
+        CREATE INDEX IF NOT EXISTS hour_rows_user_date_idx ON hour_rows(user_id, date, hour);
+        CREATE TABLE IF NOT EXISTS prompt_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          event_key TEXT NOT NULL,
+          tool TEXT NOT NULL,
+          project TEXT NOT NULL,
+          prompt_text TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          ended_at TEXT NOT NULL,
+          duration_seconds INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(user_id, event_key)
+        );
+        CREATE INDEX IF NOT EXISTS prompt_events_user_started_idx ON prompt_events(user_id, started_at);
+        """)
+
+
+def _db_user_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
+    if not token:
+        raise PermissionError("token puudub")
+    row = conn.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
+    if row is None:
+        raise PermissionError("vale token")
+    return row
+
+
+def _db_add_user(path: Path, name: str, role: str = "user") -> str:
+    _db_init(path)
+    token = secrets.token_urlsafe(32)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        conn.execute("INSERT INTO users(name, token, role, created_at) VALUES (?, ?, ?, ?)",
+                     (name, token, role, now))
+    return token
+
+
+def _db_rows_for_day(path: Path, token: str, date: str) -> list[list]:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        rows = conn.execute(
+            "SELECT date, hour, objekt, saavutus, takistus, teadmine, tool, row_key "
+            "FROM hour_rows WHERE user_id = ? AND date = ? ORDER BY hour, row_key",
+            (user["id"], date),
+        ).fetchall()
+    return [[r["date"], r["hour"], r["objekt"], r["saavutus"], r["takistus"],
+             r["teadmine"], r["tool"], r["row_key"]] for r in rows]
+
+
+def _db_days(path: Path, token: str) -> list[str]:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        rows = conn.execute("SELECT DISTINCT date FROM hour_rows WHERE user_id = ? ORDER BY date",
+                            (user["id"],)).fetchall()
+    return [r["date"] for r in rows]
+
+
+def _db_keys(path: Path, token: str) -> set[str]:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        rows = conn.execute("SELECT row_key FROM hour_rows WHERE user_id = ?", (user["id"],)).fetchall()
+    return {r["row_key"] for r in rows}
+
+
+def _db_ingest_rows(path: Path, token: str, rows: list[list], keys: list[str]) -> None:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        for row, key in zip(rows, keys):
+            if len(row) < 7 or not str(key).startswith("k:"):
+                continue
+            # Ingest ei kirjuta olemasolevat üle: UI-s tehtud parandused säilivad.
+            conn.execute(
+                "INSERT OR IGNORE INTO hour_rows "
+                "(user_id, date, hour, objekt, saavutus, takistus, teadmine, tool, row_key, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user["id"], row[0], row[1], row[2], row[3], row[4], row[5], row[6], key, now, now),
+            )
+
+
+def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict]) -> None:
+    if not _valid_date(date):
+        raise ValueError("vigane kuupäev")
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        conn.execute("DELETE FROM hour_rows WHERE user_id = ? AND date = ?", (user["id"], date))
+        used: set[str] = set()
+        for item in items:
+            hour = str(item.get("hour", "")).strip() or "00:00–01:00"
+            objekt = str(item.get("objekt", "")).strip()
+            saavutus = str(item.get("saavutus", "")).strip()
+            takistus = str(item.get("takistus", "")).strip()
+            teadmine = str(item.get("teadmine", "")).strip()
+            tool = str(item.get("tool", "")).strip() or "Käsitsi"
+            if not any([objekt, saavutus, takistus, teadmine]):
+                continue
+            key = str(item.get("key", "")).strip()
+            if not key.startswith("k:") or key in used:
+                key = f"k:{date}|ui|{secrets.token_hex(8)}"
+            used.add(key)
+            conn.execute(
+                "INSERT INTO hour_rows "
+                "(user_id, date, hour, objekt, saavutus, takistus, teadmine, tool, row_key, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user["id"], date, hour, _cell_safe(objekt), _cell_safe(saavutus or _NA),
+                 _cell_safe(takistus or _NA), _cell_safe(teadmine or _NA), _cell_safe(tool), key, now, now),
+            )
+
+
+def _db_ingest_events(path: Path, token: str, events: list[dict]) -> None:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        for e in events:
+            key = str(e.get("event_key", ""))
+            if not key:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO prompt_events "
+                "(user_id, event_key, tool, project, prompt_text, started_at, ended_at, duration_seconds, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user["id"], key, str(e.get("tool", "")), str(e.get("project", "")),
+                 str(e.get("prompt_text", "")), str(e.get("started_at", "")),
+                 str(e.get("ended_at", "")), int(e.get("duration_seconds") or 0), now),
+            )
+
+
+def _server_url(cfg: dict, op: str) -> str:
+    base = cfg.get("sink", {}).get("server_url", "").strip().rstrip("/")
+    if not base:
+        raise ValueError("server_url puudub configis")
+    return f"{base}/api/{op}"
+
+
+def _server_post(op: str, payload: dict, cfg: dict) -> dict | None:
+    sink = cfg.get("sink", {})
+    payload = {"token": sink.get("token", ""), **payload}
+    data = json.dumps(payload).encode("utf-8")
+    try:
+        req = urllib.request.Request(_server_url(cfg, op), data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        log(f"server sink: POST /api/{op} ebaõnnestus: {e}")
+        return None
+
+
+def _server_append_rows(rows: list[list], keys: list[str], cfg: dict) -> bool:
+    body = _server_post("ingest", {"rows": rows, "keys": keys}, cfg)
+    return bool(body and body.get("ok"))
+
+
+def _server_fetch_keys(cfg: dict) -> set[str] | None:
+    body = _server_post("keys", {}, cfg)
+    if body and body.get("ok") and isinstance(body.get("keys"), list):
+        return {str(x) for x in body["keys"]}
+    return None
+
+
+def _prompt_events_payload(records: list[Record], allow: list[str], start: dt.datetime,
+                           end: dt.datetime) -> list[dict]:
+    scoped: list[tuple[Record, str]] = []
+    for r in sorted(records, key=lambda x: x.ts):
+        if not (start <= r.ts < end):
+            continue
+        proj = match_project(r.project, allow)
+        if proj is None:
+            continue
+        scoped.append((r, proj))
+    events: list[dict] = []
+    for i, (r, proj) in enumerate(scoped):
+        next_ts = scoped[i + 1][0].ts if i + 1 < len(scoped) else r.ts + dt.timedelta(minutes=1)
+        if next_ts <= r.ts or next_ts - r.ts > dt.timedelta(minutes=30):
+            next_ts = r.ts + dt.timedelta(minutes=1)
+        duration = max(60, int((next_ts - r.ts).total_seconds()))
+        raw = f"{r.tool}|{proj}|{r.ts.isoformat()}|{r.text}"
+        ekey = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
+        events.append({
+            "event_key": ekey,
+            "tool": r.tool,
+            "project": proj,
+            "prompt_text": r.text,
+            "started_at": r.ts.isoformat(),
+            "ended_at": next_ts.isoformat(),
+            "duration_seconds": duration,
+        })
+    return events
+
+
 # --- Google Sheets sink -----------------------------------------------------
 def _post(payload: dict, cfg: dict) -> str | None:
     """POST Apps Scripti veebirakendusele; tagastab vastuse keha või None."""
@@ -1006,11 +1246,14 @@ def _post(payload: dict, cfg: dict) -> str | None:
 
 
 def append_rows(rows: list[list], keys: list[str], cfg: dict) -> bool:
-    if cfg.get("sink", {}).get("type") == "local":
+    sink_type = cfg.get("sink", {}).get("type")
+    if sink_type == "local":
         # 1) lisa tunnid sisemisse algandmestikku (dedup), 2) renderda päevavaade ümber
         if not _raw_append(rows, keys):
             return False
         return _render_day_view(cfg)
+    if sink_type == "server":
+        return _server_append_rows(rows, keys, cfg)
     # 'keys' = deterministlikud rea-võtmed; Apps Script jätab juba olemasolevad vahele
     # (idempotentsus → katkestus/kordussaatmine ei tekita duplikaate)
     body = _post({"rows": rows, "keys": keys}, cfg)
@@ -1032,8 +1275,11 @@ def fetch_existing_keys(cfg: dict) -> set[str] | None:
 
     Tagastab None, kui päring ebaõnnestub või Apps Script on vana (ilma 'keys' režiimita)
     → kutsuja summeerib siis kõik (dedup hoiab duplikaadid niikuinii ära)."""
-    if cfg.get("sink", {}).get("type") == "local":
+    sink_type = cfg.get("sink", {}).get("type")
+    if sink_type == "local":
         return _local_keys(HOURS_CSV)  # dedup-võtmed sisemisest algandmestikust
+    if sink_type == "server":
+        return _server_fetch_keys(cfg)
     body = _post({"op": "keys"}, cfg)
     if body is None:
         return None
@@ -1236,8 +1482,15 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
 
     if rows:
         if append_rows(rows, keys, cfg):
-            dest = str(_local_path(cfg)) if cfg.get("sink", {}).get("type") == "local" else "Google Sheetsi"
+            stype = cfg.get("sink", {}).get("type")
+            dest = str(_local_path(cfg)) if stype == "local" else ("aitrack server" if stype == "server" else "Google Sheetsi")
             log(f"run: {len(rows)} rida saadetud → {dest}")
+            if stype == "server":
+                events = _prompt_events_payload(records, allow, last_hour, process_until)
+                if events:
+                    body = _server_post("events", {"events": events}, cfg)
+                    if body and body.get("ok"):
+                        log(f"run: {len(events)} prompt-eventi saadetud → aitrack server")
         else:
             log(f"run: {len(rows)} rida EI saadud kirjutada — state'i ei uuendata, proovin uuesti")
             return  # ära uuenda state'i, et read ei kaoks
@@ -1729,6 +1982,550 @@ def cmd_day(args, cfg):
         w.writerow(_day_row(d, days[d])[cols])
 
 
+def _valid_date(s: str) -> bool:
+    try:
+        dt.date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _today_local_str(cfg: dict) -> str:
+    return _now_utc().astimezone(get_tz(cfg)).strftime("%Y-%m-%d")
+
+
+def _ui_day_rows(date: str) -> list[dict]:
+    rows = _read_raw_days().get(date, [])
+    return [
+        {
+            "key": r[7],
+            "hour": r[1],
+            "objekt": r[2],
+            "saavutus": r[3],
+            "takistus": r[4],
+            "teadmine": r[5],
+            "tool": r[6],
+        }
+        for r in rows if len(r) >= len(RAW_HEADER)
+    ]
+
+
+def _write_all_raw_rows(rows: list[list]) -> None:
+    _mkconfdir()
+    tmp = HOURS_CSV.with_name(f"{HOURS_CSV.name}.{os.getpid()}.tmp")
+    _create_private(tmp)
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(RAW_HEADER)
+        w.writerows(rows)
+    os.replace(tmp, HOURS_CSV)
+
+
+def _replace_day_rows(date: str, items: list[dict], cfg: dict) -> bool:
+    """Asenda ühe päeva tunniread UI-st tulnud väärtustega ja renderda päevavaade."""
+    if not _valid_date(date):
+        raise ValueError("vigane kuupäev")
+    kept: list[list] = []
+    keys: set[str] = set()
+    if HOURS_CSV.exists():
+        with HOURS_CSV.open(newline="", encoding="utf-8") as f:
+            rdr = csv.reader(f)
+            next(rdr, None)
+            for row in rdr:
+                if len(row) < len(RAW_HEADER):
+                    continue
+                if row[0] == date:
+                    continue
+                kept.append(row)
+                if row[-1].startswith("k:"):
+                    keys.add(row[-1])
+
+    new_rows: list[list] = []
+    for item in items:
+        hour = str(item.get("hour", "")).strip()
+        objekt = str(item.get("objekt", "")).strip()
+        saavutus = str(item.get("saavutus", "")).strip()
+        takistus = str(item.get("takistus", "")).strip()
+        teadmine = str(item.get("teadmine", "")).strip()
+        tool = str(item.get("tool", "")).strip() or "Käsitsi"
+        # Täiesti tühi rida visatakse ära; ainult tunni väli ei ole sisu.
+        if not any([objekt, saavutus, takistus, teadmine]):
+            continue
+        if not hour:
+            hour = "00:00–01:00"
+        key = str(item.get("key", "")).strip()
+        if not key.startswith("k:") or key in keys:
+            key = f"k:{date}|ui|{secrets.token_hex(8)}"
+        keys.add(key)
+        new_rows.append([
+            date, hour, _cell_safe(objekt), _cell_safe(saavutus or _NA),
+            _cell_safe(takistus or _NA), _cell_safe(teadmine or _NA),
+            _cell_safe(tool), key,
+        ])
+
+    all_rows = kept + new_rows
+    all_rows.sort(key=lambda r: (r[0], r[1], r[-1]))
+    _write_all_raw_rows(all_rows)
+    return _render_day_view(cfg)
+
+
+def _html_table_for_day(date: str, full: bool = False) -> tuple[str, str]:
+    """Tagasta (html, tekst-fallback) Google Sheetsi kleepimiseks."""
+    rows = _read_raw_days().get(date, [])
+    day = _day_row(date, rows) if rows else [date, 0, _weekday_letter(date), "", "", "", ""]
+    cols = slice(None) if full else slice(3, 7)
+    selected = day[cols]
+
+    import html as _html
+    def esc(c) -> str:
+        return _html.escape(str(c).replace("\r", "").strip()).replace("\n", "<br>")
+    html = "<table><tbody><tr>" + "".join(f"<td>{esc(c)}</td>" for c in selected) + "</tr></tbody></table>"
+    text = "\t".join(str(c).replace("\t", " ").replace("\r", " ").replace("\n", "\n") for c in selected)
+    return html, text
+
+
+def _start_page_html() -> str:
+    return r"""<!doctype html>
+<html lang="et">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitrack</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; } }
+* { box-sizing: border-box; }
+body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+h1 { margin:0; font-size:22px; }
+main { padding:18px 22px 40px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:16px; box-shadow:0 8px 30px rgba(0,0,0,.12); }
+.toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+button, input, select, textarea { font:inherit; }
+button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:8px 11px; cursor:pointer; }
+button.primary { background:var(--accent); color:white; border-color:var(--accent); }
+button.good { background:var(--ok); color:white; border-color:var(--ok); }
+button.warn { border-color:var(--bad); color:var(--bad); }
+button:hover { filter:brightness(1.08); }
+input, select, textarea { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
+textarea { width:100%; min-height:92px; resize:none; line-height:1.35; overflow:hidden; }
+.small { color:var(--muted); font-size:13px; }
+.status { color:var(--muted); min-height:20px; }
+table { width:100%; border-collapse:collapse; }
+th, td { border-top:1px solid var(--line); padding:8px; vertical-align:top; }
+th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
+.hour { width:120px; }
+.tool { width:110px; }
+.actions { width:74px; text-align:right; }
+.empty { text-align:center; color:var(--muted); padding:30px; }
+@media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } .hour, .tool { width:100%; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
+  <div class="toolbar"><button onclick="showHelp()">Abi</button><button onclick="refreshFromLogs()">Töötle lõpetatud tunnid</button><button onclick="backfill()">Backfill 12h</button></div>
+</header>
+<main>
+  <section class="panel toolbar">
+    <label>Kuupäev <input type="date" id="dateInput"></label>
+    <select id="daySelect" title="Olemasolevad päevad"></select>
+    <label title="Vajalik ainult aitrack serve keskserveri puhul">Server token <input id="tokenInput" type="password" placeholder="keskserveri token"></label>
+    <button onclick="loadDay()">Ava</button>
+    <button onclick="addRow()">+ Lisa rida</button>
+    <button class="primary" onclick="saveDay(true)">Salvesta</button>
+    <button class="good" onclick="copyDay(false)">Kopeeri D–G</button>
+    <button class="good" onclick="copyDay(true)">Kopeeri A–G</button>
+    <span class="status" id="status"></span>
+  </section>
+  <section class="panel">
+    <table id="rowsTable">
+      <thead><tr><th>Tund</th><th>Objekt ja ülesanne</th><th>Saavutused</th><th>Takistused</th><th>Uued teadmised</th><th>Tööriist</th><th></th></tr></thead>
+      <tbody id="rowsBody"><tr><td class="empty" colspan="7">Laen…</td></tr></tbody>
+    </table>
+  </section>
+  <section class="panel small" id="help" hidden>
+    <b>Kuidas kasutada?</b><br>
+    1. Vali kuupäev. 2. Muuda/lisa read. 3. Vajuta Salvesta. 4. Vajuta “Kopeeri D–G” ja kleebi Sheetsis D-lahtrisse.<br>
+    “Kopeeri A–G” kasuta siis, kui tahad ka kuupäeva/punktide/nädalapäeva veerud kaasa võtta ja kleebid A-lahtrisse.
+  </section>
+</main>
+<script>
+let currentDate = '';
+let days = [];
+const $ = (id) => document.getElementById(id);
+function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
+function authToken() { return $('tokenInput') ? $('tokenInput').value.trim() : ''; }
+async function api(path, opts={}) {
+  opts.headers = Object.assign({}, opts.headers || {});
+  const tok = authToken();
+  if (tok) opts.headers['X-Aitrack-Token'] = tok;
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data;
+}
+function escapeHtml(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function rowTemplate(row={}) {
+  const key = escapeHtml(row.key || '');
+  return `<tr data-key="${key}">
+    <td data-label="Tund"><input class="hour" value="${escapeHtml(row.hour || '')}" placeholder="14:00–15:00"></td>
+    <td data-label="Objekt"><textarea class="objekt">${escapeHtml(row.objekt || '')}</textarea></td>
+    <td data-label="Saavutused"><textarea class="saavutus">${escapeHtml(row.saavutus || '')}</textarea></td>
+    <td data-label="Takistused"><textarea class="takistus">${escapeHtml(row.takistus || '')}</textarea></td>
+    <td data-label="Uued teadmised"><textarea class="teadmine">${escapeHtml(row.teadmine || '')}</textarea></td>
+    <td data-label="Tööriist"><input class="tool" value="${escapeHtml(row.tool || 'Käsitsi')}"></td>
+    <td class="actions"><button class="warn" onclick="deleteRow(this)">Kustuta</button></td>
+  </tr>`;
+}
+function autoResizeTextarea(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.max(92, el.scrollHeight + 2) + 'px';
+}
+function autoResizeAll() {
+  document.querySelectorAll('textarea').forEach(autoResizeTextarea);
+}
+function wireTextareas(scope=document) {
+  scope.querySelectorAll('textarea').forEach(el => {
+    autoResizeTextarea(el);
+    el.addEventListener('input', () => autoResizeTextarea(el));
+  });
+}
+function deleteRow(button) {
+  if (!confirm('Kas kustutan selle rea? Salvestamiseks vajuta pärast ka “Salvesta”.')) return;
+  button.closest('tr').remove();
+}
+function collectRows() {
+  return Array.from(document.querySelectorAll('#rowsBody tr[data-key]')).map(tr => ({
+    key: tr.dataset.key || '',
+    hour: tr.querySelector('.hour').value,
+    objekt: tr.querySelector('.objekt').value,
+    saavutus: tr.querySelector('.saavutus').value,
+    takistus: tr.querySelector('.takistus').value,
+    teadmine: tr.querySelector('.teadmine').value,
+    tool: tr.querySelector('.tool').value
+  }));
+}
+function renderRows(rows) {
+  $('rowsBody').innerHTML = rows.length ? rows.map(rowTemplate).join('') : '<tr><td class="empty" colspan="7">Sellel päeval pole veel ridu. Vajuta “+ Lisa rida”.</td></tr>';
+  wireTextareas($('rowsBody'));
+}
+async function init() {
+  if ($('tokenInput')) {
+    $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
+    $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
+  }
+  const data = await api('/api/days');
+  days = data.days;
+  currentDate = data.today;
+  $('dateInput').value = currentDate;
+  renderDaySelect();
+  await loadDay();
+}
+function renderDaySelect() {
+  $('daySelect').innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
+  if (!days.includes(currentDate)) $('daySelect').insertAdjacentHTML('afterbegin', `<option value="${currentDate}">${currentDate}</option>`);
+  $('daySelect').value = currentDate;
+  $('daySelect').onchange = () => { $('dateInput').value = $('daySelect').value; loadDay(); };
+  $('dateInput').onchange = () => { currentDate = $('dateInput').value; $('daySelect').value = currentDate; loadDay(); };
+}
+async function loadDay() {
+  currentDate = $('dateInput').value || currentDate;
+  setStatus('Laen…');
+  const data = await api('/api/day?date=' + encodeURIComponent(currentDate));
+  renderRows(data.rows || []);
+  setStatus(`Avatud ${currentDate}`);
+}
+function addRow() {
+  const body = $('rowsBody');
+  if (!body.querySelector('tr[data-key]')) body.innerHTML = '';
+  body.insertAdjacentHTML('beforeend', rowTemplate({hour:'', tool:'Käsitsi'}));
+  wireTextareas(body.lastElementChild);
+}
+async function saveDay(show=true) {
+  currentDate = $('dateInput').value || currentDate;
+  const rows = collectRows();
+  setStatus('Salvestan…');
+  const data = await api('/api/day', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({date: currentDate, rows})});
+  renderRows(data.rows || []);
+  if (!days.includes(currentDate)) { days.push(currentDate); days.sort(); renderDaySelect(); }
+  if (show) setStatus('Salvestatud');
+}
+async function copyRich(html, text) {
+  if (navigator.clipboard && window.ClipboardItem) {
+    await navigator.clipboard.write([new ClipboardItem({
+      'text/html': new Blob([html], {type:'text/html'}),
+      'text/plain': new Blob([text], {type:'text/plain'})
+    })]);
+    return;
+  }
+  const div = document.createElement('div');
+  div.contentEditable = 'true'; div.style.position = 'fixed'; div.style.left = '-9999px'; div.innerHTML = html;
+  document.body.appendChild(div);
+  const range = document.createRange(); range.selectNodeContents(div);
+  const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  document.execCommand('copy'); sel.removeAllRanges(); div.remove();
+}
+async function copyDay(full) {
+  await saveDay(false);
+  const data = await api('/api/copy?date=' + encodeURIComponent(currentDate) + '&full=' + (full ? '1' : '0'));
+  await copyRich(data.html, data.text);
+  setStatus(full ? 'Kopeeritud A–G. Kleebi Sheetsis A-lahtrisse.' : 'Kopeeritud D–G. Kleebi Sheetsis D-lahtrisse.');
+}
+async function refreshFromLogs() {
+  if (!confirm('Käivitada aitrack run? See võib võtta aega.')) return;
+  setStatus('Töötlen logisid…');
+  await api('/api/run', {method:'POST'});
+  await init();
+  setStatus('Logid töödeldud');
+}
+async function backfill() {
+  if (!confirm('Töödelda viimased 12 tundi tagantjärele?')) return;
+  setStatus('Backfill 12h…');
+  await api('/api/backfill', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({hours:12})});
+  await init();
+  setStatus('Backfill tehtud');
+}
+function showHelp() { $('help').hidden = !$('help').hidden; }
+init().catch(e => setStatus(e.message, true));
+</script>
+</body>
+</html>"""
+
+
+class _AitrackHandler(BaseHTTPRequestHandler):
+    cfg: dict = {}
+
+    def log_message(self, fmt, *args):  # vaiksem server; olulised vead lähevad vastusesse
+        return
+
+    def _json(self, obj, status: int = 200) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _html(self, text: str) -> None:
+        data = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    def _token(self, q: dict | None = None, data: dict | None = None) -> str:
+        if data and data.get("token"):
+            return str(data.get("token"))
+        if q and q.get("token"):
+            return str(q.get("token", [""])[0])
+        return self.headers.get("X-Aitrack-Token", "")
+
+    def _server_mode(self) -> bool:
+        return bool(self.cfg.get("_server_mode"))
+
+    def _db_path(self) -> Path:
+        return _server_db_path(self.cfg.get("_db_path"))
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        try:
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if u.path in ("/", "/index.html"):
+                self._html(_start_page_html())
+                return
+            if u.path == "/api/days":
+                today = _today_local_str(self.cfg)
+                if self._server_mode():
+                    days = sorted(set(_db_days(self._db_path(), self._token(q))) | {today})
+                else:
+                    days = sorted(set(_read_raw_days().keys()) | {today})
+                self._json({"ok": True, "today": today, "days": days})
+                return
+            if u.path == "/api/day":
+                date = (q.get("date") or [_today_local_str(self.cfg)])[0]
+                if not _valid_date(date):
+                    self._json({"ok": False, "error": "vigane kuupäev"}, 400)
+                    return
+                if self._server_mode():
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date)
+                    rows = [
+                        {"key": r[7], "hour": r[1], "objekt": r[2], "saavutus": r[3],
+                         "takistus": r[4], "teadmine": r[5], "tool": r[6]}
+                        for r in db_rows
+                    ]
+                else:
+                    rows = _ui_day_rows(date)
+                self._json({"ok": True, "date": date, "rows": rows})
+                return
+            if u.path == "/api/copy":
+                date = (q.get("date") or [_today_local_str(self.cfg)])[0]
+                full = (q.get("full") or ["0"])[0] in ("1", "true", "yes")
+                if not _valid_date(date):
+                    self._json({"ok": False, "error": "vigane kuupäev"}, 400)
+                    return
+                if self._server_mode():
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date)
+                    day = _day_row(date, db_rows) if db_rows else [date, 0, _weekday_letter(date), "", "", "", ""]
+                    cols = slice(None) if full else slice(3, 7)
+                    selected = day[cols]
+                    import html as _html
+                    def esc(c):
+                        return _html.escape(str(c).replace("\r", "").strip()).replace("\n", "<br>")
+                    html = "<table><tbody><tr>" + "".join(f"<td>{esc(c)}</td>" for c in selected) + "</tr></tbody></table>"
+                    text = "\t".join(str(c).replace("\t", " ") for c in selected)
+                else:
+                    html, text = _html_table_for_day(date, full)
+                self._json({"ok": True, "html": html, "text": text})
+                return
+            self._json({"ok": False, "error": "not found"}, 404)
+        except PermissionError as e:
+            self._json({"ok": False, "error": str(e)}, 403)
+        except Exception as e:  # noqa: BLE001
+            self._json({"ok": False, "error": str(e)}, 500)
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        try:
+            u = urllib.parse.urlparse(self.path)
+            data = self._read_json()
+            if u.path == "/api/keys" and self._server_mode():
+                keys = sorted(_db_keys(self._db_path(), self._token(data=data)))
+                self._json({"ok": True, "keys": keys})
+                return
+            if u.path == "/api/ingest" and self._server_mode():
+                rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+                keys = data.get("keys") if isinstance(data.get("keys"), list) else []
+                _db_ingest_rows(self._db_path(), self._token(data=data), rows, [str(k) for k in keys])
+                self._json({"ok": True})
+                return
+            if u.path == "/api/events" and self._server_mode():
+                events = data.get("events") if isinstance(data.get("events"), list) else []
+                _db_ingest_events(self._db_path(), self._token(data=data), events)
+                self._json({"ok": True})
+                return
+            if u.path == "/api/day":
+                date = str(data.get("date") or _today_local_str(self.cfg))
+                rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+                if self._server_mode():
+                    _db_replace_day_rows(self._db_path(), self._token(data=data), date, rows)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(data=data), date)
+                    ui_rows = [
+                        {"key": r[7], "hour": r[1], "objekt": r[2], "saavutus": r[3],
+                         "takistus": r[4], "teadmine": r[5], "tool": r[6]}
+                        for r in db_rows
+                    ]
+                else:
+                    _replace_day_rows(date, rows, self.cfg)
+                    ui_rows = _ui_day_rows(date)
+                self._json({"ok": True, "date": date, "rows": ui_rows})
+                return
+            if u.path == "/api/run":
+                if self._server_mode():
+                    self._json({"ok": False, "error": "server ei loe kliendi lokaalseid logisid"}, 400)
+                    return
+                run_once(load_config(), load_projects())
+                self._json({"ok": True})
+                return
+            if u.path == "/api/backfill":
+                if self._server_mode():
+                    self._json({"ok": False, "error": "server ei loe kliendi lokaalseid logisid"}, 400)
+                    return
+                hours = int(data.get("hours") or 12)
+                hours = max(1, min(hours, 72))
+                run_once(load_config(), load_projects(), backfill_hours=hours)
+                self._json({"ok": True, "hours": hours})
+                return
+            self._json({"ok": False, "error": "not found"}, 404)
+        except PermissionError as e:
+            self._json({"ok": False, "error": str(e)}, 403)
+        except Exception as e:  # noqa: BLE001
+            self._json({"ok": False, "error": str(e)}, 500)
+
+
+def _serve_http(host: str, port: int, cfg: dict, *, no_browser: bool = False) -> None:
+    last_error = None
+    httpd = None
+    for p in range(port, port + 20):
+        try:
+            _AitrackHandler.cfg = cfg
+            httpd = ThreadingHTTPServer((host, p), _AitrackHandler)
+            port = p
+            break
+        except OSError as e:
+            last_error = e
+    if httpd is None:
+        print(f"Ei saanud serverit käivitada: {last_error}")
+        return
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    url = f"http://{display_host}:{port}/"
+    print(f"aitrack UI: {url}")
+    print("Sulgemiseks vajuta Ctrl+C")
+    if not no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+
+
+def cmd_start(args, cfg):
+    """Käivita lokaalne brauseri-UI tänaste/varasemate kirjete vaatamiseks ja muutmiseks."""
+    _serve_http(args.host, args.port, cfg, no_browser=args.no_browser)
+
+
+def cmd_serve(args, cfg):
+    """Käivita keskserver SQLite andmebaasiga."""
+    db_path = _server_db_path(args.db)
+    _db_init(db_path)
+    server_cfg = copy.deepcopy(cfg)
+    server_cfg["_server_mode"] = True
+    server_cfg["_db_path"] = str(db_path)
+    print(f"SQLite DB: {db_path}")
+    _serve_http(args.host, args.port, server_cfg, no_browser=True)
+
+
+def cmd_user(args, cfg):
+    db_path = _server_db_path(args.db)
+    _db_init(db_path)
+    if args.user_cmd == "add":
+        token = _db_add_user(db_path, args.name, args.role)
+        print(f"Kasutaja loodud: {args.name}")
+        print(f"Token: {token}")
+        print("Kliendis seadista:")
+        print(f"  aitrack connect --url http://SERVER:8765 --token {token}")
+        return
+    if args.user_cmd == "list":
+        with _db_connect(db_path) as conn:
+            rows = conn.execute("SELECT id, name, role, created_at FROM users ORDER BY id").fetchall()
+        if not rows:
+            print("Kasutajaid pole. Lisa: aitrack user add <nimi>")
+            return
+        for r in rows:
+            print(f"{r['id']:3d}  {r['name']:20s}  {r['role']:8s}  {r['created_at']}")
+
+
+def cmd_connect(args, cfg):
+    cfg2 = load_config()
+    cfg2["sink"] = {"type": "server", "server_url": args.url.rstrip("/"), "token": args.token,
+                    "webapp_url": "", "path": ""}
+    save_config(cfg2)
+    print(f"aitrack server seadistatud: {args.url.rstrip('/')}")
+    print("Edaspidi saadab 'aitrack run' tunniread ja prompt-eventid serverisse.")
+
+
 def cmd_init(args, cfg):
     """Loob config.json ja küsib Sheetsi seaded."""
     existing = load_config()
@@ -1839,6 +2636,9 @@ def _help_text(cfg: dict) -> str:
     cd_line = "" if shutil.which("aitrack") else f"cd {THIS.parent} && "
     return f"""aitrack — kiire abi
 
+Visuaalne päevavaade/editor:
+  { _cli_base_cmd() } start                  ava brauseris tänased/varasemad päevad, muuda ja lisa ridu
+
 Kõige sagedasem: kopeeri päeva väljund Google Sheetsi
   D-lahtrisse (ainult Objekt/Saavutused/Takistused/Uued teadmised):
     {cd_line}{cmd_d}
@@ -1851,6 +2651,9 @@ Kõige sagedasem: kopeeri päeva väljund Google Sheetsi
 Põhikäsud
   { _cli_base_cmd() } status                 näita seadistust ja logiallikaid
   { _cli_base_cmd() } day {date_hint}        prindi päeva D–G väljund terminali
+  { _cli_base_cmd() } start                  ava brauseris visuaalne päevavaade/editor
+  { _cli_base_cmd() } serve                  käivita keskserver SQLite andmebaasiga
+  { _cli_base_cmd() } connect --url URL --token TOKEN  ühenda klient keskserveriga
   { _cli_base_cmd() } note "tekst"           lisa käsitsi märge praegusele tunnile
   { _cli_base_cmd() } note                   näita käsitsi märkmeid
   { _cli_base_cmd() } preview --hours 8      vaata, mida tracker leiaks
@@ -1890,6 +2693,8 @@ def cmd_status(args, cfg):
         print(f"Algandmestik:    {HOURS_CSV} ({'olemas' if HOURS_CSV.exists() else 'puudub veel'})")
         copy_cmd, _ = _copy_command()
         print(f"Kleebi Sheetsi:  {copy_cmd}   (vali D-lahter)")
+    elif sink.get("type") == "server":
+        print(f"Väljund:         aitrack server ({sink.get('server_url') or 'URL PUUDUB'})")
     else:
         print(f"Väljund:         Google Sheets ({'seadistatud' if sink.get('webapp_url') else 'URL PUUDUB'})")
     print(f"Kokkuvõtja:      {eng}" + (f" ({exe})" if exe else " — AI-CLI puudub"))
@@ -2014,6 +2819,35 @@ def main():
     sub = p.add_subparsers(dest="cmd")
 
     sub.add_parser("help", help="näita praktilist abi ja OS-iga sobivaid copy-käske").set_defaults(fn=cmd_help)
+
+    st = sub.add_parser("start", help="ava brauseris visuaalne päevavaade/editor")
+    st.add_argument("--host", default="127.0.0.1", help="lokaalse UI host (vaikimisi 127.0.0.1)")
+    st.add_argument("--port", type=int, default=8765, help="lokaalse UI port (vaikimisi 8765)")
+    st.add_argument("--no-browser", action="store_true", help="ära ava brauserit automaatselt")
+    st.set_defaults(fn=cmd_start)
+
+    sv = sub.add_parser("serve", help="käivita keskserver SQLite andmebaasiga")
+    sv.add_argument("--host", default="127.0.0.1", help="serveri host (deploys tavaliselt 0.0.0.0)")
+    sv.add_argument("--port", type=int, default=8765, help="serveri port")
+    sv.add_argument("--db", default=str(SERVER_DB), help="SQLite andmebaasi tee")
+    sv.set_defaults(fn=cmd_serve)
+
+    cn = sub.add_parser("connect", help="ühenda see klient aitrack keskserveriga")
+    cn.add_argument("--url", required=True, help="serveri URL, nt https://aitrack.example.com")
+    cn.add_argument("--token", required=True, help="kasutaja token serverist")
+    cn.set_defaults(fn=cmd_connect)
+
+    up = sub.add_parser("user", help="halda keskserveri kasutajaid")
+    us = up.add_subparsers(dest="user_cmd", required=True)
+    ua = us.add_parser("add", help="lisa kasutaja ja väljasta token")
+    ua.add_argument("name")
+    ua.add_argument("--role", default="user", choices=["user", "admin"])
+    ua.add_argument("--db", default=str(SERVER_DB))
+    ua.set_defaults(fn=cmd_user)
+    ul = us.add_parser("list", help="näita kasutajaid")
+    ul.add_argument("--db", default=str(SERVER_DB))
+    ul.set_defaults(fn=cmd_user)
+
     sub.add_parser("setup", help="interaktiivne seadistus algusest lõpuni (soovitatav)").set_defaults(fn=cmd_setup)
 
     ini = sub.add_parser("init", help="seadista config (Sheetsi URL + token)")

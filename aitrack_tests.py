@@ -518,5 +518,54 @@ check("html D–G = 4 lahtrit", html_out.count("<td>") == 4)
 check("html säilitab punktid <br>-idega", "1. esimene<br>2. teine" in html_out)
 check("html ei sisalda kuupäeva A-veerust", "2026-06-16" not in html_out)
 
+# ============ TEST 38: start UI salvestus asendab ühe päeva read ============
+print("TEST 38: start UI helper _replace_day_rows asendab päeva ja renderdab päevavaate")
+A.HOURS_CSV.unlink(missing_ok=True)
+ui_csv = CFG / "ui-day.csv"; ui_csv.unlink(missing_ok=True)
+ui_cfg = {"sink": {"type": "local", "path": str(ui_csv)}}
+A._replace_day_rows("2026-06-16", [
+    {"hour": "10:00–11:00", "objekt": "obj", "saavutus": "saav", "takistus": "Ei olnud", "teadmine": "tead", "tool": "Käsitsi"},
+    {"hour": "11:00–12:00", "objekt": "obj2", "saavutus": "saav2", "takistus": "tak2", "teadmine": "tead2", "tool": "Pi"},
+], ui_cfg)
+with A.HOURS_CSV.open(newline="", encoding="utf-8") as f:
+    raw_rows_ui = list(_csv.reader(f))[1:]
+rendered = ui_csv.read_text(encoding="utf-8")
+check("UI salvestas 2 rida algandmestikku", len([r for r in raw_rows_ui if r[0] == "2026-06-16"]) == 2)
+check("UI renderdas päevavaate 2 punktiga", ",2,T," in rendered)
+A._replace_day_rows("2026-06-16", [
+    {"hour": "12:00–13:00", "objekt": "uus", "saavutus": "uus saav", "takistus": "Ei olnud", "teadmine": "uus tead", "tool": "Käsitsi"},
+], ui_cfg)
+with A.HOURS_CSV.open(newline="", encoding="utf-8") as f:
+    raw_rows_ui2 = list(_csv.reader(f))[1:]
+raw2 = "\n".join(",".join(r) for r in raw_rows_ui2)
+check("UI teine salvestus asendas sama päeva read", len([r for r in raw_rows_ui2 if r[0] == "2026-06-16"]) == 1 and "uus" in raw2 and "obj2" not in raw2)
+
+# ============ TEST 39: start UI copy payload HTML ============
+print("TEST 39: _html_table_for_day annab Sheetsile sobiva HTML-payloadi")
+html_payload, text_payload = A._html_table_for_day("2026-06-16", full=False)
+check("copy payload on tbody tabel", html_payload.startswith("<table><tbody><tr><td>"))
+check("copy payload D–G = 4 td", html_payload.count("<td>") == 4)
+check("copy text fallback sisaldab tabe", text_payload.count("\t") == 3)
+
+# ============ TEST 40: start UI kustutuskinnitus + textarea autosize ============
+print("TEST 40: start UI sisaldab kustutuskinnitust ja automaatselt kasvavaid tekstikaste")
+page = A._start_page_html()
+check("Kustuta kasutab deleteRow kinnitusega", "function deleteRow" in page and "confirm('Kas kustutan selle rea?" in page)
+check("textarea autosize olemas", "function autoResizeTextarea" in page and "scrollHeight" in page)
+check("textarea overflow hidden", "overflow:hidden" in page)
+
+# ============ TEST 41: SQLite keskserveri helperid ============
+print("TEST 41: SQLite keskserver salvestab tunniread ja prompt-eventid tokeniga")
+sdb = CFG / "server-test.db"
+sdb.unlink(missing_ok=True)
+tok = A._db_add_user(sdb, "karl")
+A._db_ingest_rows(sdb, tok, [["2026-06-16", "10:00–11:00", "obj", "saav", "tak", "tead", "Pi"]], ["k:server:1"])
+check("server keys sisaldab ingestitud võtit", A._db_keys(sdb, tok) == {"k:server:1"})
+check("server day row loetav", A._db_rows_for_day(sdb, tok, "2026-06-16")[0][2] == "obj")
+A._db_ingest_events(sdb, tok, [{"event_key": "e1", "tool": "Pi", "project": "/proj", "prompt_text": "tee", "started_at": HFL(10).isoformat(), "ended_at": HFL(10).isoformat(), "duration_seconds": 60}])
+with A._db_connect(sdb) as conn:
+    ev_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
+check("server salvestas prompt-eventi", ev_count == 1)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

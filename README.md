@@ -72,6 +72,10 @@ kõik ühe vooluga:
 | Käsk | Tähendus |
 |---|---|
 | `aitrack help` / `aitrack --help` | Näita praktilist abi ja sinu OS-iga sobivaid kopeerimiskäske Google Sheetsi jaoks. |
+| `aitrack start` | Ava lokaalne brauseri-UI, kus saad tänaseid ja varasemaid päevi vaadata, muuta, ridu lisada ning ühe nupuga Sheetsi kopeerida. |
+| `aitrack serve` | Käivita keskserver SQLite andmebaasiga mitme kasutaja jaoks. |
+| `aitrack user add/list` | Lisa/listi keskserveri kasutajaid ja token'eid. |
+| `aitrack connect --url ... --token ...` | Ühenda klient keskserveriga; `aitrack run` saadab tunniread ja prompt-eventid serverisse. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
@@ -121,8 +125,19 @@ Windows PowerShellis `aitrack day | Set-Clipboard`. Käsk prindib viimase päeva
 vali lehel lahter `D<rida>` ja Ctrl+V. A/B/C = Kuupäev/Punkte/Nädalapäev täidad ise;
 `--full` annab ka need. Kogu ajalugu on failis `~/aitrack-log.csv` (renderdatakse iga tund ümber).
 
-**Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status`.
-**Tööpäeva lõpp:** `aitrack day` → kleebi lehele. (Digest/teavitus töötab nagu enne.)
+**Visuaalne vaade/editor:** `aitrack start` avab lokaalse lehe `http://127.0.0.1:8765`, kus saad
+valida ka varasema kuupäeva, muuta olemasolevaid ridu, lisada käsitsi ridu ning kopeerida D–G või A–G
+Google Sheetsi jaoks. Kõik muudatused salvestatakse `~/.config/aitrack/hours.csv` algandmestikku ja
+päevavaade renderdatakse uuesti.
+
+**Mitme kasutaja server:** `aitrack serve --host 0.0.0.0 --port 8765 --db /data/server.db` käivitab
+SQLite-põhise keskserveri. Serveris loo kasutaja `aitrack user add karl --db /data/server.db`, kliendis
+seadista `aitrack connect --url https://aitrack.example.com --token TOKEN`. Seejärel saadab kliendi
+`aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta repo juures
+`docker compose up -d --build` (vaikimisi seob `127.0.0.1:3102`).
+
+**Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status` või `aitrack start`.
+**Tööpäeva lõpp:** `aitrack start` → kontrolli/muuda → “Kopeeri D–G” → kleebi lehele. (Digest/teavitus töötab nagu enne.)
 
 | Olukord | Käsk |
 |---|---|

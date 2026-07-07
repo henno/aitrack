@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.git/
+*.log
+*.csv
+apps-script-ready.gs
