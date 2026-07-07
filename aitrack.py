@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """aitrack — AI-tööriistade tunnipõhine tööpäevik (macOS / Windows / Linux).
 
-Vaatab iga tund läbi sinu Claude Code / Codex / Antigravity sessioonid,
+Vaatab iga tund läbi sinu Claude Code / Codex / Antigravity / Pi / OpenCode sessioonid,
 filtreerib ainult lubatud projektid ning kirjutab Google Sheetsi ühe rea iga
 (tund × projekt) kohta — lühikese eestikeelse kokkuvõttega.
 
@@ -21,6 +21,7 @@ import os
 import platform
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,8 @@ CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 CODEX_HISTORY = HOME / ".codex" / "history.jsonl"
 ANTIGRAVITY_HISTORY = HOME / ".gemini" / "antigravity-cli" / "history.jsonl"
+PI_SESSIONS = HOME / ".pi" / "agent" / "sessions"
+OPENCODE_DB = HOME / ".local" / "share" / "opencode" / "opencode.db"
 
 
 @dataclass
@@ -190,6 +193,51 @@ def get_tz(cfg: dict):
 
 
 # --- projektide allowlist ---------------------------------------------------
+_WORKTREE_MAIN_CACHE: dict[str, str | None] = {}
+
+
+def _git_worktree_main(record_project: str) -> str | None:
+    """Kui tee on git worktree, tagasta põhitööpuu juur.
+
+    See laseb lubatud projektil `/repo` katta ka sibling-worktree'd nagu
+    `/repo-662`, mille `.git` fail viitab `/repo/.git/worktrees/...` alla.
+    """
+    try:
+        start = Path(record_project).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        start = Path(record_project).expanduser()
+    cache_key = str(start)
+    if cache_key in _WORKTREE_MAIN_CACHE:
+        return _WORKTREE_MAIN_CACHE[cache_key]
+
+    result: str | None = None
+    for root in (start, *start.parents):
+        gitp = root / ".git"
+        try:
+            if gitp.is_file():
+                first = gitp.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip()
+                if not first.lower().startswith("gitdir:"):
+                    continue
+                raw = first.split(":", 1)[1].strip()
+                gitdir = Path(raw)
+                if not gitdir.is_absolute():
+                    gitdir = (root / gitdir)
+                parts = gitdir.resolve().parts
+                if ".git" in parts:
+                    idx = parts.index(".git")
+                    if idx > 0:
+                        result = str(Path(*parts[:idx]).resolve())
+                        break
+            elif gitp.is_dir():
+                result = str(root.resolve())
+                break
+        except (OSError, ValueError, RuntimeError, IndexError):
+            continue
+
+    _WORKTREE_MAIN_CACHE[cache_key] = result
+    return result
+
+
 def load_projects() -> list[str]:
     if PROJECTS_FILE.exists():
         try:
@@ -209,19 +257,31 @@ def match_project(record_project: str, allow: list[str]) -> str | None:
 
     Võrdleb tee-komponente (mitte stringi-prefiksit) ja normaliseerib tõstu
     (`normcase`) — väldib Windowsi tõstutundlikkuse ja segasseparaatorite vigu
-    ning sibling-vasteid (nt /a/proj vs /a/proj2)."""
+    ning sibling-vasteid (nt /a/proj vs /a/proj2). Git worktree puhul kontrollib
+    lisaks põhitööpuu juurt, et `/repo-662` läheks lubatud `/repo` alla.
+    """
     try:
         rp = os.path.normcase(str(Path(record_project).expanduser().resolve()))
     except (OSError, ValueError, RuntimeError):
         rp = os.path.normcase(record_project)
-    rparts = Path(rp).parts
-    best = None
-    best_len = -1
-    for p in allow:
-        pparts = Path(os.path.normcase(p)).parts
-        if rparts[: len(pparts)] == pparts and len(pparts) > best_len:
-            best, best_len = p, len(pparts)
-    return best
+
+    def _best_for(parts) -> str | None:
+        best = None
+        best_len = -1
+        for p in allow:
+            pparts = Path(os.path.normcase(p)).parts
+            if parts[: len(pparts)] == pparts and len(pparts) > best_len:
+                best, best_len = p, len(pparts)
+        return best
+
+    direct = _best_for(Path(rp).parts)
+    if direct is not None:
+        return direct
+
+    main = _git_worktree_main(record_project)
+    if main:
+        return _best_for(Path(os.path.normcase(main)).parts)
+    return None
 
 
 # --- state ------------------------------------------------------------------
@@ -332,6 +392,21 @@ def is_user_prompt(text: str) -> bool:
     return True
 
 
+def _content_text(content) -> str:
+    """Võta AI-logide erinevatest content-kujudest kokku kasutaja tekst."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(str(b.get("text", "")))
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(parts)
+    return ""
+
+
 # --- parserid ---------------------------------------------------------------
 def claude_records(since: dt.datetime) -> list[Record]:
     out: list[Record] = []
@@ -361,14 +436,7 @@ def claude_records(since: dt.datetime) -> list[Record]:
                     if ts is None or ts <= since:
                         continue
                     msg = d.get("message") or {}
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        text = " ".join(
-                            b.get("text", "") for b in content
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        )
-                    else:
-                        text = content if isinstance(content, str) else ""
+                    text = _content_text(msg.get("content"))
                     if not is_user_prompt(text):
                         continue
                     project = d.get("cwd") or ""
@@ -485,8 +553,111 @@ def antigravity_records(since: dt.datetime) -> list[Record]:
     return out
 
 
+def pi_records(since: dt.datetime) -> list[Record]:
+    """Loe Pi agenti JSONL-sessioonidest kasutaja promptid.
+
+    Pi hoiab iga sessiooni alguses `cwd`-d ning sõnumid on kujul
+    `{type:"message", message:{role:"user", content:[...]}}`.
+    """
+    out: list[Record] = []
+    if not PI_SESSIONS.is_dir():
+        return out
+    cutoff = since.timestamp()
+    for jsonl in PI_SESSIONS.rglob("*.jsonl"):
+        try:
+            if jsonl.stat().st_mtime < cutoff - 3600:
+                continue
+        except OSError:
+            continue
+        cwd = ""
+        try:
+            with jsonl.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if '"session"' not in line and '"user"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") == "session":
+                        cwd = d.get("cwd") or cwd
+                        continue
+                    if d.get("type") != "message":
+                        continue
+                    msg = d.get("message") or {}
+                    if msg.get("role") != "user":
+                        continue
+                    ts = parse_iso(d.get("timestamp", ""))
+                    if ts is None:
+                        ts_raw = msg.get("timestamp")
+                        if isinstance(ts_raw, (int, float)):
+                            ts = from_epoch(ts_raw, "ms" if ts_raw > 10_000_000_000 else "s")
+                    if ts is None or ts <= since:
+                        continue
+                    text = _content_text(msg.get("content"))
+                    if not is_user_prompt(text):
+                        continue
+                    if cwd:
+                        out.append(Record("Pi", cwd, ts, text.strip()))
+        except OSError:
+            continue
+    return out
+
+
+def opencode_records(since: dt.datetime) -> list[Record]:
+    """Loe OpenCode'i SQLite-andmebaasist kasutaja tekstiosad.
+
+    Loeme ainult `session`/`message`/`part` tabeleid; konto- ja credential-tabeleid
+    ei puudutata. Ajad on OpenCode'is millisekundites.
+    """
+    out: list[Record] = []
+    if not OPENCODE_DB.exists():
+        return out
+    since_ms = int(since.timestamp() * 1000)
+    try:
+        db = OPENCODE_DB.resolve()
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return out
+    try:
+        cur = conn.execute(
+            "SELECT p.time_created, s.directory, p.data, m.data "
+            "FROM part p "
+            "JOIN message m ON p.message_id = m.id "
+            "JOIN session s ON p.session_id = s.id "
+            "WHERE p.time_created > ? "
+            "ORDER BY p.time_created",
+            (since_ms,),
+        )
+        for ts_raw, directory, part_data, msg_data in cur:
+            try:
+                msg = json.loads(msg_data or "{}")
+                part = json.loads(part_data or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if msg.get("role") != "user" or part.get("type") != "text":
+                continue
+            ts = from_epoch(float(ts_raw), "ms")
+            if ts <= since:
+                continue
+            text = str(part.get("text", ""))
+            if not is_user_prompt(text):
+                continue
+            if directory:
+                out.append(Record("OpenCode", str(directory), ts, text.strip()))
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
 def collect_records(since: dt.datetime) -> list[Record]:
-    recs = claude_records(since) + codex_records(since) + antigravity_records(since)
+    recs = (claude_records(since) + codex_records(since) + antigravity_records(since) +
+            pi_records(since) + opencode_records(since))
     recs.sort(key=lambda r: r.ts)
     return recs
 
@@ -1521,7 +1692,36 @@ def cmd_day(args, cfg):
     # Vaikimisi ainult sisuveerud D–G (Objekt/Saavutused/Takistused/Uued teadmised) — kasutaja
     # täidab A/B/C (Kuupäev/Punkte/Nädalapäev) ise; --full annab kõik 7 veergu.
     cols = slice(None) if args.full else slice(3, 7)
-    # csv.writer tabiga → mitmerealised lahtrid lähevad jutumärkidesse (nagu Sheetsi ootab)
+    if getattr(args, "html", False):
+        # Google Sheets oskab HTML-tabelit clipboardist kindlalt lahtritesse jagada;
+        # <br> hoiab nummerdatud punktid sama lahtri sees rea alguses.
+        import html as _html
+        def cell(c):
+            txt = _html.escape(str(c).replace("\r", "").strip()).replace("\n", "<br>")
+            return f"<td>{txt}</td>"
+        trs = []
+        if args.header or args.all:
+            trs.append("<tr>" + "".join(cell(c) for c in DAY_HEADER[cols]) + "</tr>")
+        for d in targets:
+            trs.append("<tr>" + "".join(cell(c) for c in _day_row(d, days[d])[cols]) + "</tr>")
+        print("<table>" + "".join(trs) + "</table>")
+        return
+
+    if getattr(args, "flat", False):
+        # Clipboardi plain-text paste ei käitu kõigis Sheets/browser/OS kombinatsioonides
+        # CSV-jutumärkides mitmerealiste lahtritega ühtemoodi. --flat teeb ühe füüsilise
+        # TSV-rea: kindel D–G/A–G veergudesse kleepimine, ilma sisemiste reavahetusteta.
+        def flat_row(row):
+            return "\t".join(str(c).replace("\t", " ").replace("\r", " ").replace("\n", " · ").strip()
+                             for c in row)
+        if args.header or args.all:
+            print(flat_row(DAY_HEADER[cols]))
+        for d in targets:
+            print(flat_row(_day_row(d, days[d])[cols]))
+        return
+
+    # csv.writer tabiga → mitmerealised lahtrid lähevad jutumärkidesse (sobib failiks,
+    # kuid plain-text clipboardis võib Sheetsis sõltuda OS/browserist; kopeerimiseks eelista --flat).
     w = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
     if args.header or args.all:
         w.writerow(DAY_HEADER[cols])
@@ -1588,6 +1788,94 @@ def cmd_uninstall(args, cfg):
     uninstall_scheduler()
 
 
+def _cli_base_cmd() -> str:
+    """Käsk, millega kasutaja saab seda skripti käivitada selles checkout'is."""
+    if shutil.which("aitrack"):
+        return "aitrack"
+    py = "python" if _platform() == "windows" else "python3"
+    script = ".\\aitrack.py" if _platform() == "windows" else "aitrack.py"
+    return f"{py} {script}"
+
+
+def _copy_command(date: str = "", *, full: bool = False, plat: str | None = None) -> tuple[str, str]:
+    """Tagasta (käsk, märkus) Google Sheetsi clipboardi jaoks jooksval OS-il."""
+    plat = plat or _platform()
+    base = _cli_base_cmd()
+    date_arg = f" {date}" if date else ""
+    full_arg = " --full" if full else ""
+    day_plain = f"{base} day{date_arg}{full_arg}"
+    target = "A-lahter" if full else "D-lahter"
+
+    if plat == "linux":
+        if shutil.which("wl-copy"):
+            return (f"{day_plain} --html | wl-copy -t text/html",
+                    f"Vali Sheetsis {target}. HTML hoiab punktid lahtris eraldi ridadel.")
+        if shutil.which("xclip"):
+            return (f"{day_plain} --html | xclip -selection clipboard -t text/html",
+                    f"Vali Sheetsis {target}. HTML hoiab punktid lahtris eraldi ridadel.")
+        if shutil.which("xsel"):
+            return (f"{day_plain} --flat | xsel --clipboard --input",
+                    f"Vali Sheetsis {target}. Märkus: xsel ei anna HTML-i; --flat paneb punktid ühele reale.")
+        return (f"{day_plain} --html > /tmp/aitrack-day.html",
+                "Clipboardi tööriista ei leitud; paigalda wl-clipboard või xclip ja kleebi HTML väljund.")
+    if plat == "macos":
+        return (f"{day_plain} | pbcopy",
+                f"Vali Sheetsis {target}. pbcopy kasutab macOS-i clipboardi.")
+    if plat == "windows":
+        # PowerShell Set-Clipboard on tavakasutajale kõige lühem ja töötab ilma lisapakettideta.
+        return (f"{day_plain} | Set-Clipboard",
+                f"Vali Sheetsis {target}. PowerShellis kasuta Set-Clipboard; CMD-s võib kasutada '| clip'.")
+    return (day_plain, f"Kopeeri väljund ja kleebi Sheetsis {target}.")
+
+
+def _help_text(cfg: dict) -> str:
+    last = ""
+    days = _read_raw_days()
+    if days:
+        last = sorted(days)[-1]
+    cmd_d, note_d = _copy_command(last)
+    cmd_a, note_a = _copy_command(last, full=True)
+    date_hint = last or "YYYY-MM-DD"
+    cd_line = "" if shutil.which("aitrack") else f"cd {THIS.parent} && "
+    return f"""aitrack — kiire abi
+
+Kõige sagedasem: kopeeri päeva väljund Google Sheetsi
+  D-lahtrisse (ainult Objekt/Saavutused/Takistused/Uued teadmised):
+    {cd_line}{cmd_d}
+    → {note_d}
+
+  A-lahtrisse (kõik veerud A–G):
+    {cd_line}{cmd_a}
+    → {note_a}
+
+Põhikäsud
+  { _cli_base_cmd() } status                 näita seadistust ja logiallikaid
+  { _cli_base_cmd() } day {date_hint}        prindi päeva D–G väljund terminali
+  { _cli_base_cmd() } note "tekst"           lisa käsitsi märge praegusele tunnile
+  { _cli_base_cmd() } note                   näita käsitsi märkmeid
+  { _cli_base_cmd() } preview --hours 8      vaata, mida tracker leiaks
+  { _cli_base_cmd() } suggest --days 7       soovita logidest projektikaustu
+  { _cli_base_cmd() } add <tee>              lisa projekt jälgimisse
+  { _cli_base_cmd() } list                   näita jälgitavaid projekte
+  { _cli_base_cmd() } backfill --hours 12    töötle tagantjärele viimased tunnid
+
+OS-ide copy-käsud (D-lahtrisse)
+  Linux/Wayland:       { _cli_base_cmd() } day {date_hint} --html | wl-copy -t text/html
+  Linux/X11:           { _cli_base_cmd() } day {date_hint} --html | xclip -selection clipboard -t text/html
+  macOS:               { _cli_base_cmd() } day {date_hint} | pbcopy
+  Windows PowerShell:  { _cli_base_cmd() } day {date_hint} | Set-Clipboard
+  Windows CMD:         { _cli_base_cmd() } day {date_hint} | clip
+
+Abi konkreetse käsu kohta:
+  { _cli_base_cmd() } day --help
+  { _cli_base_cmd() } note --help
+"""
+
+
+def cmd_help(args, cfg):
+    print(_help_text(cfg))
+
+
 def cmd_status(args, cfg):
     plat = _platform()
     eng, exe = resolve_engine(cfg)
@@ -1600,7 +1888,8 @@ def cmd_status(args, cfg):
         exists = "olemas" if path and path.exists() else "puudub veel"
         print(f"Väljund:         päevavaade → {path} ({exists})")
         print(f"Algandmestik:    {HOURS_CSV} ({'olemas' if HOURS_CSV.exists() else 'puudub veel'})")
-        print("Kleebi Sheetsi:  aitrack day   (viimane päev, tab-eraldus)")
+        copy_cmd, _ = _copy_command()
+        print(f"Kleebi Sheetsi:  {copy_cmd}   (vali D-lahter)")
     else:
         print(f"Väljund:         Google Sheets ({'seadistatud' if sink.get('webapp_url') else 'URL PUUDUB'})")
     print(f"Kokkuvõtja:      {eng}" + (f" ({exe})" if exe else " — AI-CLI puudub"))
@@ -1612,7 +1901,8 @@ def cmd_status(args, cfg):
         print(f"Viimati töödeldud: {raw.get('last_processed_hour', '(pole veel)')}")
     print("Tuvastatud logiallikad:")
     for name, p in [("Claude", CLAUDE_PROJECTS), ("Codex", CODEX_HISTORY),
-                    ("Antigravity", ANTIGRAVITY_HISTORY)]:
+                    ("Antigravity", ANTIGRAVITY_HISTORY), ("Pi", PI_SESSIONS),
+                    ("OpenCode", OPENCODE_DB)]:
         print(f"  {name:12} {'✓' if p.exists() else '–'}  {p}")
 
 
@@ -1714,9 +2004,16 @@ def _setup_flow() -> None:
 
 def main():
     cfg = load_config()
-    p = argparse.ArgumentParser(prog="aitrack", description="AI-tööriistade tunnipõhine tööpäevik")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p = argparse.ArgumentParser(
+        prog="aitrack",
+        description="AI-tööriistade tunnipõhine tööpäevik",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Kiireim Sheets-copy käsk sõltub OS-ist. Vaata: aitrack help\n"
+                "Näide Linux/Wayland: aitrack day --html | wl-copy -t text/html"),
+    )
+    sub = p.add_subparsers(dest="cmd")
 
+    sub.add_parser("help", help="näita praktilist abi ja OS-iga sobivaid copy-käske").set_defaults(fn=cmd_help)
     sub.add_parser("setup", help="interaktiivne seadistus algusest lõpuni (soovitatav)").set_defaults(fn=cmd_setup)
 
     ini = sub.add_parser("init", help="seadista config (Sheetsi URL + token)")
@@ -1765,9 +2062,14 @@ def main():
     dy.add_argument("--all", action="store_true", help="prindi kõik päevad")
     dy.add_argument("--header", action="store_true", help="lisa ka päiserida")
     dy.add_argument("--full", action="store_true", help="kõik 7 veergu (ka Kuupäev/Punkte/Nädalapäev)")
+    dy.add_argument("--flat", action="store_true", help="clipboard-kindel üks füüsiline TSV-rida (sisemised reavahetused → ·)")
+    dy.add_argument("--html", action="store_true", help="HTML-tabel clipboardi jaoks (säilitab punktid lahtris eri ridadel)")
     dy.set_defaults(fn=cmd_day)
 
     args = p.parse_args()
+    if not hasattr(args, "fn"):
+        cmd_help(args, cfg)
+        return
     args.fn(args, cfg)
 
 

@@ -1,6 +1,6 @@
 # aitrack — AI-tööriistade tunnipõhine tööpäevik
 
-Vaatab iga tund läbi sinu **Claude Code**, **Codex** ja **Antigravity** (agy) sessioonid,
+Vaatab iga tund läbi sinu **Claude Code**, **Codex**, **Antigravity** (agy), **Pi** ja **OpenCode** sessioonid,
 filtreerib **ainult sinu valitud projektid** ja kirjutab **Google Sheetsi** ühe rea iga
 (tund × projekt) kohta — lühikese eestikeelse kokkuvõttega tehtud tööst.
 
@@ -11,6 +11,7 @@ oma Google Sheeti ja jälgitavad projektid ise.
 - **Python 3.9+** (muud sõltuvused puuduvad — ainult standardteek)
 - Vähemalt üks AI-CLI kokkuvõtete tegemiseks: **`claude`**, **`codex`** või **`gemini`**
   (automaattuvastus selles järjekorras; saab configis fikseerida)
+  > Logide lugemiseks toetab aitrack Claude/Codex/Antigravity/Pi/OpenCode sessioone.
 - Väljund: **lokaalne CSV-fail** (vaikimisi — `~/aitrack-log.csv`, kohe, ilma Google'ita)
   VÕI **Google'i konto** (jagatav Sheet). Vaikeväljund töötab ilma seadistuseta.
 
@@ -26,7 +27,7 @@ OS-i tunniajasti (iga tund):  Linux→systemd · macOS→launchd · Windows→Ta
   aitrack run
    ├─ võtab luku (väldib paralleelseid käivitusi)
    ├─ loeb state-failist viimati töödeldud tunni → jätkab katkenud kohast
-   ├─ parsib kolme tööriista lokaalsed logid (Claude jsonl / Codex+agy history.jsonl)
+   ├─ parsib tööriistade lokaalsed logid (Claude/Codex/Antigravity/Pi/OpenCode)
    ├─ FILTREERIB ainult lubatud projektid (projects.json)
    ├─ grupeerib LÕPETATUD tunnid (vaikimisi kõik kaustad koos) — arvestus UTC-s (DST-kindel)
    ├─ iga tunni kohta → AI-CLI jagab 4 välja: Objekt/Saavutused/Takistused/Uued teadmised
@@ -70,11 +71,12 @@ kõik ühe vooluga:
 
 | Käsk | Tähendus |
 |---|---|
+| `aitrack help` / `aitrack --help` | Näita praktilist abi ja sinu OS-iga sobivaid kopeerimiskäske Google Sheetsi jaoks. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
 | `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Läheb "Uued teadmised" veergu. Tühjalt = kuva märkmed. |
-| `aitrack day [KUUPÄEV]` | **Prindi päeva sisuveerud D–G** (Objekt/Saavutused/Takistused/Uued teadmised, tab-eraldus) — vali Sheetsis lahter `D<rida>` ja Ctrl+V. Vaikimisi viimane päev; `--all` = kõik; `--header` = päiserida; `--full` = kõik 7 veergu (ka Kuupäev/Punkte/Nädalapäev). |
+| `aitrack day [KUUPÄEV]` | **Prindi päeva sisuveerud D–G** (Objekt/Saavutused/Takistused/Uued teadmised, tab-eraldus) — vali Sheetsis lahter `D<rida>` ja Ctrl+V. Vaikimisi viimane päev; `--all` = kõik; `--header` = päiserida; `--full` = kõik 7 veergu; `--html` = clipboardi jaoks, säilitab punktid lahtris eri ridadel; `--flat` = üks füüsiline rida. |
 | `aitrack digest [--days N] [--notify]` | Päeva/nädala kokkuvõte (valikuliselt töölaua-teavitus). |
 | `aitrack status` | Näita platvormi, mootorit, väljundit ja logiallikaid. |
 | `aitrack preview --hours N` | Kuiv vaade — mida kirjutataks, väljundisse saatmata. |
@@ -112,10 +114,12 @@ nelja välja: *Objekt ja ülesanne / Saavutused / Takistused / Uued teadmised*.
 |---|---|---|---|---|---|---|
 | 2026-06-17 | 3 | K | 1. …<br>2. …<br>3. … | 1. …<br>2. …<br>3. … | 1. Ei olnud<br>… | 1. …<br>… |
 
-**Kleepimine Google Sheetsi:** jooksuta `aitrack day` — see prindib viimase päeva **sisuveerud
-D–G** tab-eraldusega (mitmerealised lahtrid jutumärkides). Vali lehel lahter `D<rida>` ja
-Ctrl+V (A/B/C = Kuupäev/Punkte/Nädalapäev täidad ise; `--full` annab ka need). Kogu ajalugu on
-failis `~/aitrack-log.csv` (renderdatakse iga tund ümber).
+**Kleepimine Google Sheetsi:** vaata alati enda OS-i käsku: `aitrack help`.
+Linux/Waylandis on tavaliselt `aitrack day --html | wl-copy -t text/html`; Linux/X11-s
+`aitrack day --html | xclip -selection clipboard -t text/html`; macOS-is `aitrack day | pbcopy`;
+Windows PowerShellis `aitrack day | Set-Clipboard`. Käsk prindib viimase päeva **sisuveerud D–G**;
+vali lehel lahter `D<rida>` ja Ctrl+V. A/B/C = Kuupäev/Punkte/Nädalapäev täidad ise;
+`--full` annab ka need. Kogu ajalugu on failis `~/aitrack-log.csv` (renderdatakse iga tund ümber).
 
 **Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status`.
 **Tööpäeva lõpp:** `aitrack day` → kleebi lehele. (Digest/teavitus töötab nagu enne.)

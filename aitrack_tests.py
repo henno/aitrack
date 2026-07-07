@@ -437,5 +437,86 @@ check("_local_path austab seatud teed",
 check("_local_path → None kui sheets ja path tühi",
       A._local_path({"sink": {"type": "google_sheets", "path": ""}}) is None)
 
+# ============ TEST 33: git worktree kaardistub lubatud põhiprojekti alla ============
+print("TEST 33: match_project tunneb sibling git-worktree põhiprojekti ära")
+main = CFG / "mainrepo"
+wt = CFG / "mainrepo-662"
+(main / ".git" / "worktrees" / "mainrepo-662").mkdir(parents=True, exist_ok=True)
+(wt / "src").mkdir(parents=True, exist_ok=True)
+(wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/mainrepo-662\n", encoding="utf-8")
+A._WORKTREE_MAIN_CACHE.clear()
+check("worktree juur sobib põhiprojektiga", A.match_project(str(wt), [str(main)]) == str(main))
+check("worktree alamkaust sobib põhiprojektiga", A.match_project(str(wt / "src"), [str(main)]) == str(main))
+
+# ============ TEST 34: pi_records fixture ============
+print("TEST 34: pi_records loeb Pi JSONL-sessioonist kasutaja prompti")
+piroot = CFG / "pi_sessions"
+(piroot / "--home-x-proj--").mkdir(parents=True, exist_ok=True)
+pifile = piroot / "--home-x-proj--" / "s.jsonl"
+pifile.write_text(
+    json.dumps({"type": "session", "timestamp": D(10).isoformat(), "cwd": "/home/x/proj"}) + "\n" +
+    json.dumps({"type": "message", "timestamp": D(11).isoformat(),
+                "message": {"role": "user", "content": [{"type": "text", "text": "tee pi töö"}]}}) + "\n",
+    encoding="utf-8")
+_orig_pi = A.PI_SESSIONS
+A.PI_SESSIONS = piroot
+pir = A.pi_records(D(10))
+A.PI_SESSIONS = _orig_pi
+check("Pi parser tagastas 1 kirje", len(pir) == 1)
+check("Pi parser projekt ja tekst õiged", pir and pir[0].tool == "Pi" and pir[0].project == "/home/x/proj" and pir[0].text == "tee pi töö")
+
+# ============ TEST 35: opencode_records fixture ============
+print("TEST 35: opencode_records loeb OpenCode SQLite baasist kasutaja tekstiosa")
+import sqlite3 as _sqlite3
+odb = CFG / "opencode.db"
+odb.unlink(missing_ok=True)
+conn = _sqlite3.connect(odb)
+conn.execute("CREATE TABLE session(id text primary key, directory text)")
+conn.execute("CREATE TABLE message(id text primary key, session_id text, data text)")
+conn.execute("CREATE TABLE part(id text primary key, message_id text, session_id text, time_created integer, data text)")
+conn.execute("INSERT INTO session VALUES (?, ?)", ("s1", "/home/x/proj"))
+conn.execute("INSERT INTO message VALUES (?, ?, ?)", ("m1", "s1", json.dumps({"role": "user"})))
+conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+             ("p1", "m1", "s1", int(D(11).timestamp() * 1000), json.dumps({"type": "text", "text": "tee opencode töö"})))
+conn.commit(); conn.close()
+_orig_oc = A.OPENCODE_DB
+A.OPENCODE_DB = odb
+ocr = A.opencode_records(D(10))
+A.OPENCODE_DB = _orig_oc
+check("OpenCode parser tagastas 1 kirje", len(ocr) == 1)
+check("OpenCode parser projekt ja tekst õiged", ocr and ocr[0].tool == "OpenCode" and ocr[0].project == "/home/x/proj" and ocr[0].text == "tee opencode töö")
+
+# ============ TEST 36: day --flat on clipboard-kindel D–G TSV ============
+print("TEST 36: day --flat väljastab ühe füüsilise D–G TSV-rea")
+import io as _io
+import contextlib as _contextlib
+A.HOURS_CSV.write_text(
+    ",".join(A.RAW_HEADER) + "\n" +
+    "2026-06-16,11:00–12:00,1. objekt,1. saavutus,1. takistus,1. teadmine,Claude,k:flat\n",
+    encoding="utf-8")
+buf = _io.StringIO()
+with _contextlib.redirect_stdout(buf):
+    A.cmd_day(types.SimpleNamespace(date="2026-06-16", all=False, header=False, full=False, flat=True), {"sink": {"type": "local", "path": ""}})
+flat_out = buf.getvalue()
+check("flat väljundis üks reavahetus lõpus", flat_out.count("\n") == 1)
+check("flat D–G = 4 veergu / 3 tabi", flat_out.rstrip("\n").count("\t") == 3)
+check("flat ei sisalda kuupäeva A-veerust", not flat_out.startswith("2026-06-16\t"))
+
+# ============ TEST 37: day --html säilitab lahtrisisese reavahetuse ============
+print("TEST 37: day --html väljastab HTML-tabeli D–G lahtritega ja <br> punktidega")
+A.HOURS_CSV.write_text(
+    ",".join(A.RAW_HEADER) + "\n" +
+    "2026-06-16,11:00–12:00,esimene,saav,tak,tead,Claude,k:h1\n" +
+    "2026-06-16,12:00–13:00,teine,saav2,tak2,tead2,Pi,k:h2\n",
+    encoding="utf-8")
+buf = _io.StringIO()
+with _contextlib.redirect_stdout(buf):
+    A.cmd_day(types.SimpleNamespace(date="2026-06-16", all=False, header=False, full=False, flat=False, html=True), {"sink": {"type": "local", "path": ""}})
+html_out = buf.getvalue()
+check("html väljund on tabel", html_out.startswith("<table><tr><td>") and html_out.rstrip().endswith("</table>"))
+check("html D–G = 4 lahtrit", html_out.count("<td>") == 4)
+check("html säilitab punktid <br>-idega", "1. esimene<br>2. teine" in html_out)
+check("html ei sisalda kuupäeva A-veerust", "2026-06-16" not in html_out)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

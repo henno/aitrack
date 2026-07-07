@@ -24,6 +24,7 @@ if (-not (Test-Path $BinDir)) { $BinDir = $Dir }
 $Shim = Join-Path $BinDir "aitrack.cmd"
 Set-Content -Path $Shim -Encoding ASCII -Value "@echo off`r`n`"$Py`" `"$Dir\aitrack.py`" %*"
 Write-Host "==> Loodud kask: $Shim"
+Write-Host "    Abi: aitrack help"
 
 # kaivita seadistusnoustaja
 Write-Host ""

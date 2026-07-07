@@ -25,6 +25,7 @@ BIN="$HOME/.local/bin"
 mkdir -p "$BIN"
 ln -sf "$DIR/aitrack.py" "$BIN/aitrack"
 echo "==> Loodud käsk: $BIN/aitrack  →  $DIR/aitrack.py"
+echo "    Abi: aitrack help"
 case ":$PATH:" in
   *":$BIN:"*) : ;;
   *) echo "    NB! $BIN ei ole PATH-is. Lisa see oma ~/.bashrc / ~/.config/fish'i:"
