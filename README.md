@@ -79,6 +79,7 @@ kõik ühe vooluga:
 | `aitrack project-id` | Näita serveri ühist projektivõtit: Git repo korral normaliseeritud remote URL, muidu `local:<kaust>`. |
 | `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; mitu kasutajat/agentit võivad sama issue all paralleelselt töötada. |
 | `aitrack tick` | Saada kõigi aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
+| `https://SERVER/activity` | Serveri veebivaade work session'ite, prompt-eventide ja tegevuste vaatamiseks. |
 | `aitrack install --minute-tracking` | Lisa tavapärase tunniajasti kõrvale OS-i iga-minuti tick timer. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
@@ -163,6 +164,9 @@ aitrack tick
 
 aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 ```
+
+Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Sama tokeniga näeb kasutaja enda
+work session'eid, prompt-evente ja tegevuste ajalugu; admin-token näeb kõigi kasutajate tegevusi.
 
 Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 

@@ -2021,6 +2021,113 @@ def _db_practice_summary(path: Path, token: str, q: dict) -> dict:
             "days": [days[k] for k in sorted(days)]}
 
 
+def _activity_bounds(q: dict) -> tuple[str, str, str]:
+    date_s = _qval(q, "date")
+    if _valid_date(date_s):
+        start = dt.datetime.fromisoformat(date_s).replace(tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(days=1)
+        return start.isoformat(), end.isoformat(), date_s
+    return _period_bounds(q)
+
+
+def _db_activity_log(path: Path, token: str, q: dict) -> dict:
+    """Serveri tegevuste vaade: tagastab faktid, mitte arve/praktika tuletatud read."""
+    _db_init(path)
+    start_iso, end_iso, label = _activity_bounds(q)
+    limit = max(1, min(int(_qval(q, "limit") or 200), 1000))
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        session_where = ["ws.started_at < ?", "COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ?"]
+        session_args: list = [end_iso, start_iso]
+        prompt_where = ["pe.started_at >= ?", "pe.started_at < ?"]
+        prompt_args: list = [start_iso, end_iso]
+        if user["role"] != "admin":
+            session_where.append("ws.user_id = ?")
+            session_args.append(int(user["id"]))
+            prompt_where.append("pe.user_id = ?")
+            prompt_args.append(int(user["id"]))
+        sessions = conn.execute(f"""
+            SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
+                   wi.title AS work_title, p.project_key, p.name AS project_name,
+                   i.provider, i.issue_key, i.title AS issue_title,
+                   (SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count
+            FROM work_sessions ws
+            JOIN users u ON u.id = ws.user_id
+            JOIN devices d ON d.id = ws.device_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(session_where)}
+            ORDER BY ws.started_at DESC
+            LIMIT ?
+        """, (*session_args, limit)).fetchall()
+        prompts = conn.execute(f"""
+            SELECT pe.*, u.name AS user_name, p.project_key, p.name AS project_name,
+                   i.provider, i.issue_key, ws.session_uid
+            FROM prompt_events pe
+            JOIN users u ON u.id = pe.user_id
+            LEFT JOIN projects p ON p.id = pe.project_id
+            LEFT JOIN issues i ON i.id = pe.issue_id
+            LEFT JOIN work_sessions ws ON ws.id = pe.work_session_id
+            WHERE {' AND '.join(prompt_where)}
+            ORDER BY pe.started_at DESC
+            LIMIT ?
+        """, (*prompt_args, limit)).fetchall()
+    session_items = []
+    activity = []
+    for r in sessions:
+        tick_count = int(r["tick_count"] or 0)
+        minutes = _work_session_minutes(r, tick_count)
+        item = {
+            "type": "work_session",
+            "work_session_uid": r["session_uid"],
+            "work_session_id": int(r["id"]),
+            "work_item_id": int(r["work_item_id"]),
+            "user": r["user_name"],
+            "device": r["device_name"],
+            "client_id": r["client_id"],
+            "project": r["project_name"],
+            "project_key": r["project_key"],
+            "issue": f"#{r['issue_key']}" if r["issue_key"] else "",
+            "issue_key": r["issue_key"] or "",
+            "tool": r["tool"],
+            "status": r["status"],
+            "result": r["result"],
+            "billable": bool(r["billable"]),
+            "summary": r["summary"] or r["work_title"],
+            "started_at": r["started_at"],
+            "ended_at": r["ended_at"],
+            "last_seen_at": r["last_seen_at"],
+            "minutes": minutes,
+            "tick_count": tick_count,
+        }
+        session_items.append(item)
+        activity.append({**item, "at": r["started_at"], "label": "work_session"})
+    prompt_items = []
+    for r in prompts:
+        item = {
+            "type": "prompt_event",
+            "id": int(r["id"]),
+            "event_key": r["event_key"],
+            "user": r["user_name"],
+            "tool": r["tool"],
+            "project": r["project_name"] or r["project"],
+            "project_key": r["project_key"] or "",
+            "issue": f"#{r['issue_key']}" if r["issue_key"] else "",
+            "issue_key": r["issue_key"] or "",
+            "work_session_uid": r["session_uid"] or "",
+            "prompt_text": r["prompt_text"],
+            "started_at": r["started_at"],
+            "ended_at": r["ended_at"],
+            "duration_seconds": int(r["duration_seconds"] or 0),
+        }
+        prompt_items.append(item)
+        activity.append({**item, "at": r["started_at"], "label": "prompt_event"})
+    activity.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "sessions": session_items, "prompt_events": prompt_items, "activity": activity[:limit]}
+
+
 def _db_rows_for_day(path: Path, token: str, date: str) -> list[list]:
     _db_init(path)
     with _db_connect(path) as conn:
@@ -3160,7 +3267,7 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 <body>
 <header>
   <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
-  <div class="toolbar"><button onclick="showHelp()">Abi</button><button onclick="refreshFromLogs()">Töötle lõpetatud tunnid</button><button onclick="backfill()">Backfill 12h</button></div>
+  <div class="toolbar"><button onclick="showHelp()">Abi</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="refreshFromLogs()">Töötle lõpetatud tunnid</button><button onclick="backfill()">Backfill 12h</button></div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -3331,6 +3438,142 @@ init().catch(e => setStatus(e.message, true));
 </html>"""
 
 
+def _activity_page_html() -> str:
+    return r"""<!doctype html>
+<html lang="et">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitrack server tegevused</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --bad:#f97316; --line:#334155; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --bad:#c2410c; --line:#cbd5e1; } }
+* { box-sizing: border-box; }
+body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+h1 { margin:0; font-size:22px; }
+main { padding:18px 22px 40px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:16px; box-shadow:0 8px 30px rgba(0,0,0,.12); }
+.toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+button, input, select { font:inherit; }
+button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:8px 11px; cursor:pointer; }
+button.primary { background:var(--accent); color:white; border-color:var(--accent); }
+button:hover { filter:brightness(1.08); }
+input, select { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
+.small { color:var(--muted); font-size:13px; }
+.status { color:var(--muted); min-height:20px; }
+table { width:100%; border-collapse:collapse; }
+th, td { border-top:1px solid var(--line); padding:8px; vertical-align:top; }
+th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
+pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; }
+.bad { color:var(--bad); }
+.pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-size:12px; }
+.empty { text-align:center; color:var(--muted); padding:26px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; }
+.metric { border:1px solid var(--line); border-radius:12px; padding:10px; }
+.metric b { display:block; font-size:22px; }
+@media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>aitrack server tegevused</h1><div class="small">Work session'id, prompt-eventid ja tegevuste ajalugu tokeni õiguste piires.</div></div>
+  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="loadActivity()" class="primary">Värskenda</button></div>
+</header>
+<main>
+  <section class="panel toolbar">
+    <label>Kuupäev <input type="date" id="dateInput"></label>
+    <label>Piir <input type="number" id="limitInput" value="200" min="1" max="1000" style="width:90px"></label>
+    <label>Server token <input id="tokenInput" type="password" placeholder="keskserveri token"></label>
+    <button onclick="loadActivity()">Ava</button>
+    <span class="status" id="status"></span>
+  </section>
+  <section class="panel grid" id="metrics"></section>
+  <section class="panel">
+    <h2>Tegevuste ajalugu</h2>
+    <table><thead><tr><th>Aeg</th><th>Tüüp</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Sisu</th></tr></thead><tbody id="activityBody"><tr><td class="empty" colspan="6">Laen…</td></tr></tbody></table>
+  </section>
+  <section class="panel">
+    <h2>Work session'id</h2>
+    <table><thead><tr><th>Session UID</th><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Staatus</th><th>Min</th><th>Kokkuvõte</th></tr></thead><tbody id="sessionsBody"></tbody></table>
+  </section>
+  <section class="panel">
+    <h2>Prompt-eventid</h2>
+    <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Kestus</th><th>Prompt</th></tr></thead><tbody id="promptsBody"></tbody></table>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
+function authToken() { return $('tokenInput').value.trim(); }
+function esc(s) { return String(s ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtTime(s) { if (!s) return ''; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }
+function projectLabel(x) { return `${esc(x.project_key || x.project || '')}${x.issue ? ' <span class="pill">' + esc(x.issue) + '</span>' : ''}`; }
+async function api(path) {
+  const tok = authToken();
+  const res = await fetch(path, {headers: tok ? {'X-Aitrack-Token': tok} : {}});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data;
+}
+function renderMetrics(data) {
+  const minutes = (data.sessions || []).reduce((a, s) => a + Number(s.minutes || 0), 0);
+  $('metrics').innerHTML = `
+    <div class="metric"><span class="small">Work session'id</span><b>${(data.sessions || []).length}</b></div>
+    <div class="metric"><span class="small">Prompt-eventid</span><b>${(data.prompt_events || []).length}</b></div>
+    <div class="metric"><span class="small">Minutid</span><b>${minutes}</b></div>
+    <div class="metric"><span class="small">Periood</span><b style="font-size:16px">${esc(data.period || '')}</b></div>`;
+}
+function renderActivity(rows) {
+  $('activityBody').innerHTML = rows.length ? rows.map(x => {
+    const body = x.type === 'prompt_event'
+      ? `<pre>${esc(x.prompt_text || '')}</pre>`
+      : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
+    return `<tr><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td></tr>`;
+  }).join('') : '<tr><td class="empty" colspan="6">Tegevusi pole.</td></tr>';
+}
+function renderSessions(rows) {
+  $('sessionsBody').innerHTML = rows.length ? rows.map(x => `<tr>
+    <td data-label="Session UID"><code>${esc(x.work_session_uid || '')}</code></td>
+    <td data-label="Aeg">${fmtTime(x.started_at)}<div class="small">${x.ended_at ? fmtTime(x.ended_at) : 'aktiivne / lõpp puudub'}</div></td>
+    <td data-label="Kasutaja">${esc(x.user || '')}<div class="small">${esc(x.device || '')}</div></td>
+    <td data-label="Projekt">${projectLabel(x)}</td>
+    <td data-label="Staatus"><span class="pill">${esc(x.status || '')}</span><div class="small">${esc(x.result || '')}</div></td>
+    <td data-label="Min">${esc(x.minutes || 0)}<div class="small">ticke ${esc(x.tick_count || 0)}</div></td>
+    <td data-label="Kokkuvõte">${esc(x.summary || '')}</td>
+  </tr>`).join('') : '<tr><td class="empty" colspan="7">Sessioone pole.</td></tr>';
+}
+function renderPrompts(rows) {
+  $('promptsBody').innerHTML = rows.length ? rows.map(x => `<tr>
+    <td data-label="Aeg">${fmtTime(x.started_at)}</td>
+    <td data-label="Kasutaja">${esc(x.user || '')}</td>
+    <td data-label="Projekt">${projectLabel(x)}<div class="small">${esc(x.work_session_uid || '')}</div></td>
+    <td data-label="Tööriist">${esc(x.tool || '')}</td>
+    <td data-label="Kestus">${Math.round(Number(x.duration_seconds || 0) / 60)} min</td>
+    <td data-label="Prompt"><pre>${esc(x.prompt_text || '')}</pre></td>
+  </tr>`).join('') : '<tr><td class="empty" colspan="6">Prompt-evente pole.</td></tr>';
+}
+async function loadActivity() {
+  localStorage.setItem('aitrackToken', authToken());
+  const date = $('dateInput').value;
+  const limit = $('limitInput').value || '200';
+  setStatus('Laen…');
+  const data = await api('/api/activity?date=' + encodeURIComponent(date) + '&limit=' + encodeURIComponent(limit));
+  renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []);
+  setStatus('Laetud');
+}
+function init() {
+  $('dateInput').value = new Date().toISOString().slice(0, 10);
+  $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
+  $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
+  loadActivity().catch(e => setStatus(e.message, true));
+}
+init();
+</script>
+</body>
+</html>"""
+
+
 class _AitrackHandler(BaseHTTPRequestHandler):
     cfg: dict = {}
 
@@ -3376,7 +3619,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         return _server_db_path(self.cfg.get("_db_path"))
 
     def do_HEAD(self) -> None:  # noqa: N802 (http.server API)
-        if urllib.parse.urlparse(self.path).path in ("/", "/index.html"):
+        if urllib.parse.urlparse(self.path).path in ("/", "/index.html", "/activity"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -3390,6 +3633,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             if u.path in ("/", "/index.html"):
                 self._html(_start_page_html())
+                return
+            if u.path == "/activity":
+                self._html(_activity_page_html())
                 return
             if u.path == "/api/days":
                 today = _today_local_str(self.cfg)
@@ -3437,6 +3683,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/work/status" and self._server_mode():
                 self._json({"ok": True, "sessions": _db_work_status(self._db_path(), self._token(q))})
+                return
+            if u.path == "/api/activity" and self._server_mode():
+                self._json(_db_activity_log(self._db_path(), self._token(q), q))
                 return
             if u.path == "/api/billing/invoice-lines" and self._server_mode():
                 self._json(_db_invoice_lines(self._db_path(), self._token(q), q))

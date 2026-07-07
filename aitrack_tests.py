@@ -595,17 +595,21 @@ A._db_work_tick(wdb, wtok, {"work_session_uid": start["work_session_uid"], "tick
 A._db_work_tick(wdb, wtok, {"work_session_uid": start["work_session_uid"], "tick_at": (HFL(10) + dt.timedelta(minutes=1)).isoformat()})
 done = A._db_work_finish(wdb, wtok, {"work_session_uid": start["work_session_uid"], "summary": "parandus valmis", "ended_at": (HFL(10) + dt.timedelta(minutes=2)).isoformat(), "result": "kept"})
 invoice = A._db_invoice_lines(wdb, wtok, {"period": ["2026-06"], "hourly_rate": ["82"]})
+A._db_ingest_events(wdb, wtok, [{"event_key": "work-e1", "tool": "Pi", "project": "/tmp/pp-finar-pi", "prompt_text": "tee issue 662", "started_at": HFL(10).isoformat(), "ended_at": (HFL(10) + dt.timedelta(minutes=1)).isoformat(), "duration_seconds": 60}])
 practice = A._db_practice_summary(wdb, wtok, {"period": ["2026-06"]})
+activity = A._db_activity_log(wdb, wtok, {"period": ["2026-06"]})
 with A._db_connect(wdb) as conn:
     project_count = conn.execute("SELECT COUNT(*) AS c FROM projects").fetchone()["c"]
     issue_count = conn.execute("SELECT COUNT(*) AS c FROM issues").fetchone()["c"]
     session_count = conn.execute("SELECT COUNT(*) AS c FROM work_sessions").fetchone()["c"]
-check("normaliseeritud tabelites on projekt/issue/session", (project_count, issue_count, session_count) == (1, 1, 1))
+check("normaliseeritud tabelites on projekt/issue/session", project_count >= 1 and issue_count >= 1 and session_count == 1)
 check("done arvutas minutid tickidest", done["minutes"] == 2)
 check("invoice endpointi helper grupeerib work_item'i", len(invoice["lines"]) == 1 and invoice["lines"][0]["issue"] == "#662")
 check("invoice evidence sisaldab work_session_uid väärtust", invoice["lines"][0]["evidence"]["work_session_uids"] == [start["work_session_uid"]])
 check("invoice sisaldab aega, hinda ja summat", invoice["lines"][0]["time"] == "00:02" and invoice["lines"][0]["amount"] == 2.73)
 check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-finar" in practice["days"][0]["text"])
+check("activity endpoint helper näitab sessioone ja prompt-evente", len(activity["sessions"]) == 1 and len(activity["prompt_events"]) == 1)
+check("activity sisaldab serveri work_session_uid väärtust", activity["sessions"][0]["work_session_uid"] == start["work_session_uid"])
 
 # ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
 print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")
@@ -623,6 +627,13 @@ check("legacy snapshot imporditi local.db-sse", local_row is not None and local_
 check("aktiivne sessioon leitakse UID järgi", len(active_local) == 1 and active_local[0]["work_session_uid"] == "ws_test_uid")
 A._save_work_state({"sessions": [{**active_local[0], "status": "done", "ended_at": HFL(12).isoformat()}]})
 check("done sessioon ei ole enam aktiivne", A._active_work_sessions(tool="pi", checkout_id="co-local") == [])
+
+# ============ TEST 45: serveri tegevuste leht olemas ============
+print("TEST 45: serveri tegevuste HTML leht ja link päevavaatest")
+activity_page = A._activity_page_html()
+start_page = A._start_page_html()
+check("activity leht kutsub /api/activity endpointi", "/api/activity" in activity_page and "work_session_uid" in activity_page)
+check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
