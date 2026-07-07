@@ -633,6 +633,7 @@ print("TEST 45: serveri tegevuste HTML leht ja link päevavaatest")
 activity_page = A._activity_page_html()
 start_page = A._start_page_html()
 check("activity leht kutsub /api/activity endpointi", "/api/activity" in activity_page and "work_session_uid" in activity_page)
+check("activity leht ei päri API-t enne tokenit", "Sisesta serveri token" in activity_page and "if (!tok)" in activity_page)
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")

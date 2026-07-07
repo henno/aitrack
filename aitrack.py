@@ -3553,20 +3553,38 @@ function renderPrompts(rows) {
     <td data-label="Prompt"><pre>${esc(x.prompt_text || '')}</pre></td>
   </tr>`).join('') : '<tr><td class="empty" colspan="6">Prompt-evente pole.</td></tr>';
 }
+function renderWaiting(message) {
+  $('metrics').innerHTML = '';
+  $('activityBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
+  $('sessionsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
+  $('promptsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
+}
 async function loadActivity() {
-  localStorage.setItem('aitrackToken', authToken());
+  const tok = authToken();
+  localStorage.setItem('aitrackToken', tok);
+  if (!tok) {
+    renderWaiting('Sisesta serveri token ja vajuta “Ava”.');
+    setStatus('token puudub', true);
+    $('tokenInput').focus();
+    return;
+  }
   const date = $('dateInput').value;
   const limit = $('limitInput').value || '200';
   setStatus('Laen…');
-  const data = await api('/api/activity?date=' + encodeURIComponent(date) + '&limit=' + encodeURIComponent(limit));
-  renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []);
-  setStatus('Laetud');
+  try {
+    const data = await api('/api/activity?date=' + encodeURIComponent(date) + '&limit=' + encodeURIComponent(limit));
+    renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []);
+    setStatus('Laetud');
+  } catch (e) {
+    renderWaiting(e.message || 'Päring ebaõnnestus');
+    setStatus(e.message, true);
+  }
 }
 function init() {
   $('dateInput').value = new Date().toISOString().slice(0, 10);
   $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
   $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
-  loadActivity().catch(e => setStatus(e.message, true));
+  loadActivity();
 }
 init();
 </script>
@@ -3619,9 +3637,14 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         return _server_db_path(self.cfg.get("_db_path"))
 
     def do_HEAD(self) -> None:  # noqa: N802 (http.server API)
-        if urllib.parse.urlparse(self.path).path in ("/", "/index.html", "/activity"):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/index.html", "/activity"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            return
+        if path == "/favicon.ico":
+            self.send_response(204)
             self.end_headers()
             return
         self.send_response(404)
@@ -3636,6 +3659,10 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/activity":
                 self._html(_activity_page_html())
+                return
+            if u.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
                 return
             if u.path == "/api/days":
                 today = _today_local_str(self.cfg)
