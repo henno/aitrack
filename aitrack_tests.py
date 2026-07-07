@@ -588,9 +588,10 @@ payload = {
     "started_at": HFL(10).isoformat(),
 }
 start = A._db_work_start(wdb, wtok, payload)
-A._db_work_tick(wdb, wtok, {"work_session_id": start["work_session_id"], "tick_at": HFL(10).isoformat()})
-A._db_work_tick(wdb, wtok, {"work_session_id": start["work_session_id"], "tick_at": (HFL(10) + dt.timedelta(minutes=1)).isoformat()})
-done = A._db_work_finish(wdb, wtok, {"work_session_id": start["work_session_id"], "summary": "parandus valmis", "ended_at": (HFL(10) + dt.timedelta(minutes=2)).isoformat(), "result": "kept"})
+check("server väljastab avaliku work_session_uid", str(start.get("work_session_uid", "")).startswith("ws_"))
+A._db_work_tick(wdb, wtok, {"work_session_uid": start["work_session_uid"], "tick_at": HFL(10).isoformat()})
+A._db_work_tick(wdb, wtok, {"work_session_uid": start["work_session_uid"], "tick_at": (HFL(10) + dt.timedelta(minutes=1)).isoformat()})
+done = A._db_work_finish(wdb, wtok, {"work_session_uid": start["work_session_uid"], "summary": "parandus valmis", "ended_at": (HFL(10) + dt.timedelta(minutes=2)).isoformat(), "result": "kept"})
 invoice = A._db_invoice_lines(wdb, wtok, {"period": ["2026-06"], "hourly_rate": ["82"]})
 practice = A._db_practice_summary(wdb, wtok, {"period": ["2026-06"]})
 with A._db_connect(wdb) as conn:
@@ -600,6 +601,7 @@ with A._db_connect(wdb) as conn:
 check("normaliseeritud tabelites on projekt/issue/session", (project_count, issue_count, session_count) == (1, 1, 1))
 check("done arvutas minutid tickidest", done["minutes"] == 2)
 check("invoice endpointi helper grupeerib work_item'i", len(invoice["lines"]) == 1 and invoice["lines"][0]["issue"] == "#662")
+check("invoice evidence sisaldab work_session_uid väärtust", invoice["lines"][0]["evidence"]["work_session_uids"] == [start["work_session_uid"]])
 check("invoice sisaldab aega, hinda ja summat", invoice["lines"][0]["time"] == "00:02" and invoice["lines"][0]["amount"] == 2.73)
 check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-finar" in practice["days"][0]["text"])
 

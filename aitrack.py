@@ -1265,6 +1265,7 @@ def _db_init(path: Path) -> None:
         CREATE INDEX IF NOT EXISTS work_items_project_title_idx ON work_items(project_id, normalized_title);
         CREATE TABLE IF NOT EXISTS work_sessions (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_uid TEXT NOT NULL UNIQUE,
           work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -1347,6 +1348,9 @@ def _db_init(path: Path) -> None:
         """)
         # Vanade server.db failide kerge migratsioon: prompt_events jäi alles, aga saab nüüd
         # viidata normaliseeritud projekti/töö/sessiooni ridadele.
+        _db_add_column_if_missing(conn, "work_sessions", "session_uid", "TEXT")
+        conn.execute("UPDATE work_sessions SET session_uid = 'ws_legacy_' || id WHERE session_uid IS NULL OR session_uid = ''")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS work_sessions_session_uid_idx ON work_sessions(session_uid)")
         _db_add_column_if_missing(conn, "prompt_events", "project_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "issue_id", "INTEGER REFERENCES issues(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "work_item_id", "INTEGER REFERENCES work_items(id) ON DELETE SET NULL")
@@ -1379,6 +1383,11 @@ def _db_one_id(conn: sqlite3.Connection, sql: str, args: tuple) -> int:
     if row is None:
         raise RuntimeError("andmebaasi upsert ei tagastanud id-d")
     return int(row["id"])
+
+
+def _new_work_session_uid() -> str:
+    # Serveri antud avalik sessioonivõti; SQLite integer id jääb sisemiseks DB viiteks.
+    return "ws_" + secrets.token_urlsafe(18).rstrip("=")
 
 
 def _db_upsert_device(conn: sqlite3.Connection, user_id: int, client_id: str, name: str, plat: str, now: str) -> int:
@@ -1547,20 +1556,29 @@ def _db_work_start(path: Path, token: str, payload: dict) -> dict:
             checkout_id = hashlib.sha1(f"{graph['project_id']}|{local_path}".encode("utf-8", errors="replace")).hexdigest()[:16]
         summary = str(work.get("summary") or work.get("title") or payload.get("title") or "")
         billable = 1 if bool(work.get("billable", payload.get("billable", True))) else 0
+        session_uid = _new_work_session_uid()
         cur = conn.execute(
-            "INSERT INTO work_sessions(work_item_id, user_id, device_id, project_checkout_id, checkout_id, tool, "
+            "INSERT INTO work_sessions(session_uid, work_item_id, user_id, device_id, project_checkout_id, checkout_id, tool, "
             "local_path, cwd, branch, started_at, last_seen_at, status, billable, summary, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
-            (graph["work_item_id"], int(user["id"]), graph["device_id"], graph["checkout_row_id"], checkout_id,
-             tool, local_path, cwd, branch, started_at, started_at, billable, summary, now, now),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            (session_uid, graph["work_item_id"], int(user["id"]), graph["device_id"], graph["checkout_row_id"],
+             checkout_id, tool, local_path, cwd, branch, started_at, started_at, billable, summary, now, now),
         )
         session_id = int(cur.lastrowid)
-        return {"ok": True, "work_session_id": session_id, "work_item_id": graph["work_item_id"],
-                "project_id": graph["project_id"], "issue_id": graph["issue_id"]}
+        return {"ok": True, "work_session_uid": session_uid, "work_session_id": session_id,
+                "work_item_id": graph["work_item_id"], "project_id": graph["project_id"], "issue_id": graph["issue_id"]}
 
 
-def _db_session_for_user(conn: sqlite3.Connection, user_id: int, session_id: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM work_sessions WHERE id = ? AND user_id = ?", (session_id, user_id)).fetchone()
+def _db_session_for_user(conn: sqlite3.Connection, user_id: int, session_ref) -> sqlite3.Row:
+    ref = str(session_ref or "").strip()
+    if not ref:
+        raise PermissionError("work_session puudub")
+    if ref.isdigit():
+        row = conn.execute("SELECT * FROM work_sessions WHERE id = ? AND user_id = ?",
+                           (int(ref), user_id)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM work_sessions WHERE session_uid = ? AND user_id = ?",
+                           (ref, user_id)).fetchone()
     if row is None:
         raise PermissionError("work_session puudub või ei kuulu sellele kasutajale")
     return row
@@ -1576,10 +1594,13 @@ def _db_work_tick(path: Path, token: str, payload: dict) -> dict:
     now = _now_utc().isoformat()
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        session_id = int(payload.get("work_session_id") or payload.get("session_id") or 0)
-        row = _db_session_for_user(conn, int(user["id"]), session_id)
+        session_ref = payload.get("work_session_uid") or payload.get("work_session_id") or payload.get("session_id")
+        row = _db_session_for_user(conn, int(user["id"]), session_ref)
+        session_id = int(row["id"])
+        session_uid = str(row["session_uid"])
         if row["status"] != "active":
-            return {"ok": True, "ignored": True, "reason": f"session status is {row['status']}"}
+            return {"ok": True, "ignored": True, "reason": f"session status is {row['status']}",
+                    "work_session_uid": session_uid, "work_session_id": session_id}
         minute = _minute_floor_iso(str(payload.get("minute_start_utc") or payload.get("tick_at") or ""))
         conn.execute(
             "INSERT OR IGNORE INTO minute_ticks(work_session_id, work_item_id, user_id, minute_start_utc, source, created_at) "
@@ -1588,7 +1609,8 @@ def _db_work_tick(path: Path, token: str, payload: dict) -> dict:
              str(payload.get("source") or "heartbeat"), now),
         )
         conn.execute("UPDATE work_sessions SET last_seen_at = ?, updated_at = ? WHERE id = ?", (minute, now, session_id))
-        return {"ok": True, "work_session_id": session_id, "minute_start_utc": minute}
+        return {"ok": True, "work_session_uid": session_uid, "work_session_id": session_id,
+                "minute_start_utc": minute}
 
 
 def _work_session_minutes(row: sqlite3.Row | dict, tick_count: int | None = None) -> int:
@@ -1613,8 +1635,10 @@ def _db_work_finish(path: Path, token: str, payload: dict, *, status: str = "don
     now = _now_utc().isoformat()
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        session_id = int(payload.get("work_session_id") or payload.get("session_id") or 0)
-        row = _db_session_for_user(conn, int(user["id"]), session_id)
+        session_ref = payload.get("work_session_uid") or payload.get("work_session_id") or payload.get("session_id")
+        row = _db_session_for_user(conn, int(user["id"]), session_ref)
+        session_id = int(row["id"])
+        session_uid = str(row["session_uid"])
         ended_at = str(payload.get("ended_at") or now)
         manual_minutes = payload.get("minutes")
         if manual_minutes not in (None, ""):
@@ -1641,7 +1665,8 @@ def _db_work_finish(path: Path, token: str, payload: dict, *, status: str = "don
             "WHERE id = ?",
             (status, now, int(row["work_item_id"])),
         )
-        return {"ok": True, "work_session_id": session_id, "minutes": minutes, "status": status}
+        return {"ok": True, "work_session_uid": session_uid, "work_session_id": session_id,
+                "minutes": minutes, "status": status}
 
 
 def _db_work_status(path: Path, token: str) -> list[dict]:
@@ -1649,7 +1674,7 @@ def _db_work_status(path: Path, token: str) -> list[dict]:
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
         rows = conn.execute(
-            "SELECT ws.id, ws.tool, ws.started_at, ws.last_seen_at, ws.summary, ws.status, ws.branch, "
+            "SELECT ws.id, ws.session_uid, ws.tool, ws.started_at, ws.last_seen_at, ws.summary, ws.status, ws.branch, "
             "wi.id AS work_item_id, wi.title AS work_title, p.project_key, p.name AS project_name, "
             "i.provider, i.issue_key, u.name AS user_name "
             "FROM work_sessions ws "
@@ -1756,17 +1781,19 @@ def _db_invoice_lines(path: Path, token: str, q: dict) -> dict:
             "hourly_rate": hourly_rate,
             "amount": None,
             "sessions": [],
-            "evidence": {"work_item_id": gid, "session_ids": []},
+            "evidence": {"work_item_id": gid, "session_ids": [], "work_session_uids": []},
         })
         if r["summary"] and r["summary"] not in line["work_done"]:
             line["work_done"].append(r["summary"])
         line["minutes"] += minutes
         line["sessions"].append({
-            "session_id": int(r["id"]), "user": r["user_name"], "tool": r["tool"],
+            "session_uid": r["session_uid"], "session_id": int(r["id"]),
+            "user": r["user_name"], "tool": r["tool"],
             "device": r["device_name"], "branch": r["branch"], "started_at": r["started_at"],
             "ended_at": r["ended_at"], "minutes": minutes, "result": r["result"],
         })
         line["evidence"]["session_ids"].append(int(r["id"]))
+        line["evidence"]["work_session_uids"].append(r["session_uid"])
     lines = []
     for line in groups.values():
         mins = int(line["minutes"])
@@ -3443,23 +3470,27 @@ def cmd_work(args, cfg):
         if active and not args.force:
             print("Selles checkout'is ja tööriistas on juba aktiivne work_session:")
             for s in active:
-                print(f"  session {s['work_session_id']}: {s.get('summary', '')} ({s.get('project_key', '')} {s.get('issue_key', '')})")
+                sid = s.get("work_session_uid") or s.get("work_session_id")
+                print(f"  session {sid}: {s.get('summary', '')} ({s.get('project_key', '')} {s.get('issue_key', '')})")
             print("Lõpeta enne: aitrack work done 'kokkuvõte'  või kasuta --force teadlikuks paralleelsuseks.")
             return
         body = _server_post("work/start", payload, cfg)
         if not body or not body.get("ok"):
             raise SystemExit(f"work start ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
         state = _load_work_state()
-        session_id = int(body["work_session_id"])
-        state["sessions"] = [s for s in state.get("sessions", []) if s.get("work_session_id") != session_id]
+        session_uid = str(body.get("work_session_uid") or body.get("work_session_id"))
+        session_db_id = body.get("work_session_id")
+        state["sessions"] = [s for s in state.get("sessions", [])
+                             if str(s.get("work_session_uid") or s.get("work_session_id")) != session_uid]
         state["sessions"].append({
-            "work_session_id": session_id, "work_item_id": body.get("work_item_id"), "status": "active",
+            "work_session_uid": session_uid, "work_session_id": session_db_id,
+            "work_item_id": body.get("work_item_id"), "status": "active",
             "summary": summary, "project_key": ctx["project_key"], "issue_key": ctx.get("issue_key", ""),
             "checkout_id": ctx["checkout_id"], "tool": tool, "client_id": client["client_id"],
             "started_at": payload["started_at"], "state_key": _work_state_key(client["client_id"], ctx["checkout_id"], tool),
         })
         _save_work_state(state)
-        print(f"Alustatud work_session {session_id}: {ctx['project_key']}" + (f" #{ctx['issue_key']}" if ctx.get("issue_key") else ""))
+        print(f"Alustatud work_session {session_uid}: {ctx['project_key']}" + (f" #{ctx['issue_key']}" if ctx.get("issue_key") else ""))
         return
 
     if args.work_cmd == "status":
@@ -3467,7 +3498,8 @@ def cmd_work(args, cfg):
         if local:
             print("Kohalikud aktiivsed sessioonid:")
             for s in local:
-                print(f"  {s['work_session_id']:>5}  {s.get('tool','')}  {s.get('project_key','')} {('#' + s.get('issue_key')) if s.get('issue_key') else ''}  {s.get('summary','')}")
+                sid = str(s.get("work_session_uid") or s.get("work_session_id"))
+                print(f"  {sid:>5}  {s.get('tool','')}  {s.get('project_key','')} {('#' + s.get('issue_key')) if s.get('issue_key') else ''}  {s.get('summary','')}")
         else:
             print("Kohalikus state'is aktiivseid sessioone pole.")
         body = _server_get("work/status", {}, cfg)
@@ -3475,7 +3507,8 @@ def cmd_work(args, cfg):
             print("Serveri aktiivsed sessioonid selle tokeni all:")
             for s in body["sessions"]:
                 issue = f"#{s.get('issue_key')}" if s.get("issue_key") else ""
-                print(f"  {s['id']:>5}  {s.get('tool','')}  {s.get('project_key','')} {issue}  {s.get('summary','')}")
+                sid = str(s.get("session_uid") or s.get("id"))
+                print(f"  {sid:>5}  {s.get('tool','')}  {s.get('project_key','')} {issue}  {s.get('summary','')}")
         return
 
     if args.work_cmd in ("tick", "done", "discard"):
@@ -3491,13 +3524,22 @@ def cmd_work(args, cfg):
         return
 
 
+def _session_ref_matches(session: dict, ref) -> bool:
+    wanted = str(ref or "").strip()
+    if not wanted:
+        return False
+    return wanted in {str(session.get("work_session_uid") or ""), str(session.get("work_session_id") or "")}
+
+
 def _select_local_session(args) -> dict:
     sessions = _active_work_sessions()
     if getattr(args, "session_id", None):
-        sid = int(args.session_id)
+        sid = str(args.session_id).strip()
         for s in sessions:
-            if int(s.get("work_session_id") or 0) == sid:
+            if _session_ref_matches(s, sid):
                 return s
+        if sid.startswith("ws_"):
+            return {"work_session_uid": sid, "summary": "", "status": "active"}
         return {"work_session_id": sid, "summary": "", "status": "active"}
     tool = _detect_cli(getattr(args, "tool", None))
     ctx = _project_context(getattr(args, "cwd", None) or ".", getattr(args, "issue", None))
@@ -3513,14 +3555,18 @@ def cmd_tick(args, cfg):
     _require_server_cfg(cfg)
     sessions = _active_work_sessions()
     if getattr(args, "session_id", None):
-        sessions = [s for s in sessions if int(s.get("work_session_id") or 0) == int(args.session_id)]
+        sessions = [s for s in sessions if _session_ref_matches(s, args.session_id)]
     if not sessions:
         print("Aktiivseid work_session'eid pole; ticki ei saadetud.")
         return
     sent = 0
     for s in sessions:
-        body = _server_post("work/tick", {"work_session_id": s["work_session_id"], "tick_at": _now_utc().isoformat(),
-                                          "source": "heartbeat"}, cfg)
+        payload = {"tick_at": _now_utc().isoformat(), "source": "heartbeat"}
+        if s.get("work_session_uid"):
+            payload["work_session_uid"] = s["work_session_uid"]
+        else:
+            payload["work_session_id"] = s["work_session_id"]
+        body = _server_post("work/tick", payload, cfg)
         if body and body.get("ok"):
             sent += 1
     print(f"Saadetud ticke: {sent}")
@@ -3530,7 +3576,11 @@ def _cmd_work_finish(args, cfg, *, discard: bool, summary_override: str | None =
     _require_server_cfg(cfg)
     s = _select_local_session(args)
     summary = summary_override or " ".join(getattr(args, "summary", []) or []).strip() or s.get("summary", "")
-    payload = {"work_session_id": int(s["work_session_id"]), "summary": summary, "ended_at": _now_utc().isoformat()}
+    payload = {"summary": summary, "ended_at": _now_utc().isoformat()}
+    if s.get("work_session_uid"):
+        payload["work_session_uid"] = s["work_session_uid"]
+    else:
+        payload["work_session_id"] = s["work_session_id"]
     if getattr(args, "minutes", None):
         payload["minutes"] = int(args.minutes)
     if getattr(args, "result", None):
@@ -3542,13 +3592,14 @@ def _cmd_work_finish(args, cfg, *, discard: bool, summary_override: str | None =
     if not body or not body.get("ok"):
         raise SystemExit(f"work finish ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
     state = _load_work_state()
+    finished_ref = str(s.get("work_session_uid") or s.get("work_session_id"))
     for item in state.get("sessions", []):
-        if int(item.get("work_session_id") or 0) == int(s["work_session_id"]):
+        if _session_ref_matches(item, finished_ref):
             item["status"] = "discarded" if discard else "done"
             item["ended_at"] = payload["ended_at"]
             item["minutes"] = body.get("minutes")
     _save_work_state(state)
-    print(f"Lõpetatud work_session {s['work_session_id']} ({body.get('minutes')} min, {body.get('status')}).")
+    print(f"Lõpetatud work_session {finished_ref} ({body.get('minutes')} min, {body.get('status')}).")
 
 
 def cmd_init(args, cfg):
@@ -3874,7 +3925,7 @@ def main():
     pid.set_defaults(fn=cmd_project_id)
 
     tick = sub.add_parser("tick", help="saada kõigi aktiivsete work_session'ite minut serverisse")
-    tick.add_argument("--session-id", type=int, help="saada tick ainult sellele sessioonile")
+    tick.add_argument("--session-id", help="saada tick ainult sellele sessioonile (serveri ws_... id või legacy number)")
     tick.set_defaults(fn=cmd_tick)
 
     wk = sub.add_parser("work", help="serveripõhine work_session ajamõõtmine")
@@ -3890,11 +3941,11 @@ def main():
     wstatus = ws.add_parser("status", help="näita aktiivseid work_session'eid")
     wstatus.set_defaults(fn=cmd_work)
     wtick = ws.add_parser("tick", help="saada minut serverisse")
-    wtick.add_argument("--session-id", type=int)
+    wtick.add_argument("--session-id")
     wtick.set_defaults(fn=cmd_work)
     wdone = ws.add_parser("done", help="lõpeta aktiivne work_session")
     wdone.add_argument("summary", nargs="*", help="lõpetamise kokkuvõte")
-    wdone.add_argument("--session-id", type=int)
+    wdone.add_argument("--session-id")
     wdone.add_argument("--minutes", type=int, help="käsitsi hinnatud aktiivsed minutid")
     wdone.add_argument("--issue")
     wdone.add_argument("--tool")
@@ -3904,7 +3955,7 @@ def main():
     wdone.set_defaults(fn=cmd_work)
     wdiscard = ws.add_parser("discard", help="lõpeta sessioon mittearvestatavana")
     wdiscard.add_argument("summary", nargs="*", help="põhjus")
-    wdiscard.add_argument("--session-id", type=int)
+    wdiscard.add_argument("--session-id")
     wdiscard.add_argument("--minutes", type=int)
     wdiscard.add_argument("--issue")
     wdiscard.add_argument("--tool")

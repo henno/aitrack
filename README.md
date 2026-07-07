@@ -146,7 +146,9 @@ Git repo korral on ühine `project_key` normaliseeritud remote URL, nt
 `git@github.com:Puhastusproff/pp-finar.git` ja `https://github.com/Puhastusproff/pp-finar.git` →
 `github.com/puhastusproff/pp-finar`; Gitita kaustal kasutatakse `local:<kaustanimi>`.
 
-Näide sama issue paralleelseks lahendamiseks eri agentidega/checkout'ides:
+Näide sama issue paralleelseks lahendamiseks eri agentidega/checkout'ides. `work start` vastuseks annab
+server avaliku unikaalse `work_session_uid` kujul `ws_...`; klient kasutab seda edaspidi `tick`/`done`
+sidumiseks.
 
 ```bash
 cd ~/agents/pp-finar-pi
