@@ -2211,6 +2211,8 @@ function renderRows(rows) {
   wireTextareas($('rowsBody'));
 }
 async function init() {
+  currentDate = new Date().toISOString().slice(0, 10);
+  $('dateInput').value = currentDate;
   if ($('tokenInput')) {
     $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
     $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
@@ -2336,6 +2338,15 @@ class _AitrackHandler(BaseHTTPRequestHandler):
 
     def _db_path(self) -> Path:
         return _server_db_path(self.cfg.get("_db_path"))
+
+    def do_HEAD(self) -> None:  # noqa: N802 (http.server API)
+        if urllib.parse.urlparse(self.path).path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
