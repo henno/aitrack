@@ -19,8 +19,10 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -46,6 +48,8 @@ STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
 NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
+CLIENT_FILE = CONFIG_DIR / "client.json"  # selle arvuti püsiv client_id serveri jaoks
+WORK_STATE_FILE = CONFIG_DIR / "work-state.json"  # aktiivsed serveri work_session'id sellel kliendil
 SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack serve)
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
@@ -288,6 +292,140 @@ def match_project(record_project: str, allow: list[str]) -> str | None:
     return None
 
 
+# --- ühise projekti tuvastus (serveri work tracking) ------------------------
+def _git_capture(args: list[str], cwd: Path) -> str:
+    try:
+        p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=3)
+    except Exception:  # noqa: BLE001 - git võib puududa või cwd olla kustunud
+        return ""
+    if p.returncode != 0:
+        return ""
+    return p.stdout.strip()
+
+
+def _normalise_repo_url(url: str) -> str:
+    """Muuda git remote eri kujud samaks projektivõtmeks.
+
+    Näited:
+      git@github.com:Org/Repo.git -> github.com/org/repo
+      https://github.com/Org/Repo.git -> github.com/org/repo
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    raw = raw.removesuffix("/")
+    parsed = urllib.parse.urlparse(raw)
+    host = parsed.hostname or ""
+    path = parsed.path.strip("/")
+    if host and path:
+        path = path[:-4] if path.lower().endswith(".git") else path
+        return f"{host.lower()}/{path.lower()}"
+    m = re.match(r"^(?:[^@\s]+@)?([^:\s]+):(.+)$", raw)
+    if m:
+        host, path = m.group(1), m.group(2).strip("/")
+        path = path[:-4] if path.lower().endswith(".git") else path
+        return f"{host.lower()}/{path.lower()}"
+    p = raw[:-4] if raw.lower().endswith(".git") else raw
+    return p.lower()
+
+
+def _issue_provider_for_project_key(project_key: str) -> str:
+    key = (project_key or "").lower()
+    if key.startswith("github.com/"):
+        return "github"
+    if key.startswith("bitbucket.org/"):
+        return "bitbucket"
+    if key.startswith("gitlab.com/"):
+        return "gitlab"
+    return "local"
+
+
+def _normalise_issue_key(value: str | None) -> str:
+    v = (value or "").strip()
+    if not v:
+        return ""
+    v = re.sub(r"^issue[:#\s-]*", "", v, flags=re.I)
+    v = v.lstrip("#")
+    return v.strip()
+
+
+def _issue_from_branch(branch: str) -> str:
+    b = branch or ""
+    # Eelista haru alguses või kaldkriipsu järel olevat issue numbrit: 662-x, gh-662-x, fix/662-x.
+    m = re.search(r"(?:^|/)(?:gh-|bb-)?#?(\d{2,7})(?=$|[-_/])", b, flags=re.I)
+    return m.group(1) if m else ""
+
+
+def _normalise_title(title: str) -> str:
+    return re.sub(r"\s+", " ", (title or "").strip().lower())
+
+
+def _project_context(path: str | Path = ".", issue: str | None = None) -> dict:
+    """Tagasta kliendi/serveri ühine projektifingerprint.
+
+    Git repo korral on põhinimi normaliseeritud remote URL; muidu fallback on local:<kaustanimi>.
+    Local path jääb alles ainult checkout'i tõendiks, mitte projekti ühise identifikaatorina.
+    """
+    cwd = Path(path).expanduser()
+    try:
+        cwd = cwd.resolve()
+    except (OSError, RuntimeError):
+        pass
+    root_s = _git_capture(["rev-parse", "--show-toplevel"], cwd)
+    root = Path(root_s) if root_s else cwd
+    remote = _git_capture(["config", "--get", "remote.origin.url"], root)
+    branch = _git_capture(["branch", "--show-current"], root) or _git_capture(["rev-parse", "--abbrev-ref", "HEAD"], root)
+    project_key = _normalise_repo_url(remote)
+    if not project_key:
+        project_key = f"local:{root.name.lower()}"
+    name = project_key.rstrip("/").split("/")[-1] if "/" in project_key else root.name
+    issue_key = _normalise_issue_key(issue) or _issue_from_branch(branch)
+    checkout_seed = f"{project_key}|{str(root)}".encode("utf-8", errors="replace")
+    return {
+        "project_key": project_key,
+        "repo_url": remote,
+        "name": name,
+        "local_path": str(root),
+        "cwd": str(cwd),
+        "branch": branch or "",
+        "issue_key": issue_key,
+        "issue_provider": _issue_provider_for_project_key(project_key),
+        "checkout_id": hashlib.sha1(checkout_seed).hexdigest()[:16],
+    }
+
+
+def _client_info() -> dict:
+    """Püsiv, mitte-salajane client_id selle seadme eristamiseks serveris."""
+    _mkconfdir()
+    data = {}
+    if CLIENT_FILE.exists():
+        try:
+            data = json.loads(CLIENT_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if not data.get("client_id"):
+        data = {
+            "client_id": f"client-{secrets.token_hex(12)}",
+            "name": socket.gethostname() or platform.node() or "unknown",
+            "platform": _platform(),
+            "created_at": _now_utc().isoformat(),
+        }
+        _atomic_write_json(CLIENT_FILE, data, 0o600)
+    data.setdefault("name", socket.gethostname() or platform.node() or "unknown")
+    data.setdefault("platform", _platform())
+    return data
+
+
+def _detect_cli(explicit: str | None = None) -> str:
+    if explicit:
+        return explicit.strip().lower()
+    for key in ("AITRACK_TOOL", "AGENT_TASK_CLI", "AGENT_CLI", "AI_TOOL"):
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val.lower()
+    return "manual"
+
+
 # --- state ------------------------------------------------------------------
 def load_state() -> dict | None:
     """Tagastab state-dict'i; {} kui faili pole (uus paigaldus); None kui RIKUTUD."""
@@ -304,6 +442,41 @@ def load_state() -> dict | None:
 
 def save_state(state: dict) -> None:
     _atomic_write_json(STATE_FILE, state)
+
+
+def _load_work_state() -> dict:
+    if WORK_STATE_FILE.exists():
+        try:
+            data = json.loads(WORK_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("sessions", [])
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"sessions": []}
+
+
+def _save_work_state(state: dict) -> None:
+    state.setdefault("sessions", [])
+    _atomic_write_json(WORK_STATE_FILE, state, 0o600)
+
+
+def _work_state_key(client_id: str, checkout_id: str, tool: str) -> str:
+    raw = f"{client_id}|{checkout_id}|{tool.lower()}".encode("utf-8", errors="replace")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _active_work_sessions(*, tool: str | None = None, checkout_id: str | None = None) -> list[dict]:
+    out = []
+    for s in _load_work_state().get("sessions", []):
+        if s.get("status") != "active":
+            continue
+        if tool and s.get("tool") != tool:
+            continue
+        if checkout_id and s.get("checkout_id") != checkout_id:
+            continue
+        out.append(s)
+    return out
 
 
 # --- platvormiülene lukk (väldib paralleelseid run'e) -----------------------
@@ -1003,6 +1176,15 @@ def _db_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _db_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _db_add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if column not in _db_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def _db_init(path: Path) -> None:
     with _db_connect(path) as conn:
         conn.executescript("""
@@ -1011,6 +1193,125 @@ def _db_init(path: Path) -> None:
           name TEXT NOT NULL UNIQUE,
           token TEXT NOT NULL UNIQUE,
           role TEXT NOT NULL DEFAULT 'user',
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS devices (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          client_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          UNIQUE(user_id, client_id)
+        );
+        CREATE TABLE IF NOT EXISTS customers (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          external_key TEXT UNIQUE,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS projects (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_key TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL,
+          customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS project_remotes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          remote_url TEXT NOT NULL,
+          normalized_url TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(project_id, normalized_url)
+        );
+        CREATE TABLE IF NOT EXISTS project_checkouts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+          checkout_id TEXT NOT NULL,
+          local_path TEXT NOT NULL,
+          branch TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          UNIQUE(user_id, device_id, checkout_id)
+        );
+        CREATE TABLE IF NOT EXISTS issues (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL,
+          issue_key TEXT NOT NULL,
+          title TEXT NOT NULL DEFAULT '',
+          url TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(project_id, provider, issue_key)
+        );
+        CREATE TABLE IF NOT EXISTS work_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          issue_id INTEGER REFERENCES issues(id) ON DELETE SET NULL,
+          title TEXT NOT NULL,
+          normalized_title TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          billable_default INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(project_id, issue_id)
+        );
+        CREATE INDEX IF NOT EXISTS work_items_project_title_idx ON work_items(project_id, normalized_title);
+        CREATE TABLE IF NOT EXISTS work_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+          project_checkout_id INTEGER REFERENCES project_checkouts(id) ON DELETE SET NULL,
+          checkout_id TEXT NOT NULL,
+          tool TEXT NOT NULL,
+          local_path TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          branch TEXT NOT NULL DEFAULT '',
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          last_seen_at TEXT,
+          status TEXT NOT NULL DEFAULT 'active',
+          result TEXT NOT NULL DEFAULT '',
+          billable INTEGER NOT NULL DEFAULT 1,
+          summary TEXT NOT NULL DEFAULT '',
+          minutes_final INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS work_sessions_work_item_idx ON work_sessions(work_item_id, started_at);
+        CREATE INDEX IF NOT EXISTS work_sessions_user_status_idx ON work_sessions(user_id, status, started_at);
+        CREATE TABLE IF NOT EXISTS minute_ticks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          work_session_id INTEGER NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
+          work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          minute_start_utc TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'heartbeat',
+          created_at TEXT NOT NULL,
+          UNIQUE(work_session_id, minute_start_utc)
+        );
+        CREATE INDEX IF NOT EXISTS minute_ticks_item_minute_idx ON minute_ticks(work_item_id, minute_start_utc);
+        CREATE TABLE IF NOT EXISTS contracts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'EUR',
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS contract_rates (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contract_id INTEGER NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+          valid_from TEXT NOT NULL,
+          valid_to TEXT,
+          hourly_rate REAL NOT NULL,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS hour_rows (
@@ -1044,6 +1345,14 @@ def _db_init(path: Path) -> None:
         );
         CREATE INDEX IF NOT EXISTS prompt_events_user_started_idx ON prompt_events(user_id, started_at);
         """)
+        # Vanade server.db failide kerge migratsioon: prompt_events jäi alles, aga saab nüüd
+        # viidata normaliseeritud projekti/töö/sessiooni ridadele.
+        _db_add_column_if_missing(conn, "prompt_events", "project_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL")
+        _db_add_column_if_missing(conn, "prompt_events", "issue_id", "INTEGER REFERENCES issues(id) ON DELETE SET NULL")
+        _db_add_column_if_missing(conn, "prompt_events", "work_item_id", "INTEGER REFERENCES work_items(id) ON DELETE SET NULL")
+        _db_add_column_if_missing(conn, "prompt_events", "work_session_id", "INTEGER REFERENCES work_sessions(id) ON DELETE SET NULL")
+        _db_add_column_if_missing(conn, "prompt_events", "confidence", "REAL")
+        _db_add_column_if_missing(conn, "prompt_events", "payload_json", "TEXT")
 
 
 def _db_user_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
@@ -1063,6 +1372,453 @@ def _db_add_user(path: Path, name: str, role: str = "user") -> str:
         conn.execute("INSERT INTO users(name, token, role, created_at) VALUES (?, ?, ?, ?)",
                      (name, token, role, now))
     return token
+
+
+def _db_one_id(conn: sqlite3.Connection, sql: str, args: tuple) -> int:
+    row = conn.execute(sql, args).fetchone()
+    if row is None:
+        raise RuntimeError("andmebaasi upsert ei tagastanud id-d")
+    return int(row["id"])
+
+
+def _db_upsert_device(conn: sqlite3.Connection, user_id: int, client_id: str, name: str, plat: str, now: str) -> int:
+    client_id = client_id or "unknown"
+    conn.execute(
+        "INSERT OR IGNORE INTO devices(user_id, client_id, name, platform, created_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, client_id, name or "unknown", plat or "unknown", now, now),
+    )
+    conn.execute(
+        "UPDATE devices SET name = ?, platform = ?, last_seen_at = ? WHERE user_id = ? AND client_id = ?",
+        (name or "unknown", plat or "unknown", now, user_id, client_id),
+    )
+    return _db_one_id(conn, "SELECT id FROM devices WHERE user_id = ? AND client_id = ?", (user_id, client_id))
+
+
+def _db_upsert_project(conn: sqlite3.Connection, project: dict, now: str) -> int:
+    repo_url = str(project.get("repo_url") or "")
+    project_key = str(project.get("project_key") or project.get("key") or _normalise_repo_url(repo_url))
+    local_path = str(project.get("local_path") or "")
+    if not project_key:
+        project_key = f"local:{Path(local_path or '.').name.lower()}"
+    name = str(project.get("name") or project_key.rstrip("/").split("/")[-1] or "project")
+    conn.execute(
+        "INSERT OR IGNORE INTO projects(project_key, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        (project_key, name, now, now),
+    )
+    conn.execute("UPDATE projects SET name = ?, updated_at = ? WHERE project_key = ?", (name, now, project_key))
+    project_id = _db_one_id(conn, "SELECT id FROM projects WHERE project_key = ?", (project_key,))
+    norm = _normalise_repo_url(repo_url)
+    if repo_url and norm:
+        conn.execute(
+            "INSERT OR IGNORE INTO project_remotes(project_id, remote_url, normalized_url, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (project_id, repo_url, norm, now),
+        )
+    return project_id
+
+
+def _db_upsert_issue(conn: sqlite3.Connection, project_id: int, issue: dict, default_provider: str, now: str) -> int | None:
+    issue_key = _normalise_issue_key(str(issue.get("issue_key") or issue.get("key") or issue.get("id") or ""))
+    if not issue_key:
+        return None
+    provider = str(issue.get("provider") or default_provider or "local")
+    title = str(issue.get("title") or "")
+    url = str(issue.get("url") or "")
+    conn.execute(
+        "INSERT OR IGNORE INTO issues(project_id, provider, issue_key, title, url, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (project_id, provider, issue_key, title, url, now, now),
+    )
+    conn.execute(
+        "UPDATE issues SET title = COALESCE(NULLIF(?, ''), title), url = COALESCE(NULLIF(?, ''), url), "
+        "updated_at = ? WHERE project_id = ? AND provider = ? AND issue_key = ?",
+        (title, url, now, project_id, provider, issue_key),
+    )
+    return _db_one_id(
+        conn,
+        "SELECT id FROM issues WHERE project_id = ? AND provider = ? AND issue_key = ?",
+        (project_id, provider, issue_key),
+    )
+
+
+def _db_upsert_work_item(conn: sqlite3.Connection, project_id: int, issue_id: int | None,
+                         title: str, billable_default: bool, now: str) -> int:
+    title = (title or "").strip() or "Nimetu töö"
+    norm = _normalise_title(title)
+    if issue_id is not None:
+        row = conn.execute(
+            "SELECT id FROM work_items WHERE project_id = ? AND issue_id = ?",
+            (project_id, issue_id),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO work_items(project_id, issue_id, title, normalized_title, status, billable_default, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                (project_id, issue_id, title, norm, 1 if billable_default else 0, now, now),
+            )
+        else:
+            conn.execute("UPDATE work_items SET updated_at = ? WHERE id = ?", (now, row["id"]))
+        return _db_one_id(conn, "SELECT id FROM work_items WHERE project_id = ? AND issue_id = ?", (project_id, issue_id))
+    row = conn.execute(
+        "SELECT id FROM work_items WHERE project_id = ? AND issue_id IS NULL AND normalized_title = ?",
+        (project_id, norm),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO work_items(project_id, issue_id, title, normalized_title, status, billable_default, created_at, updated_at) "
+            "VALUES (?, NULL, ?, ?, 'active', ?, ?, ?)",
+            (project_id, title, norm, 1 if billable_default else 0, now, now),
+        )
+    else:
+        conn.execute("UPDATE work_items SET updated_at = ? WHERE id = ?", (now, row["id"]))
+    return _db_one_id(
+        conn,
+        "SELECT id FROM work_items WHERE project_id = ? AND issue_id IS NULL AND normalized_title = ?",
+        (project_id, norm),
+    )
+
+
+def _db_upsert_checkout(conn: sqlite3.Connection, project_id: int, user_id: int, device_id: int,
+                        session: dict, project: dict, now: str) -> int:
+    checkout_id = str(session.get("checkout_id") or project.get("checkout_id") or "")
+    local_path = str(project.get("local_path") or session.get("local_path") or session.get("cwd") or "")
+    if not checkout_id:
+        checkout_id = hashlib.sha1(f"{project_id}|{local_path}".encode("utf-8", errors="replace")).hexdigest()[:16]
+    branch = str(session.get("branch") or project.get("branch") or "")
+    conn.execute(
+        "INSERT OR IGNORE INTO project_checkouts(project_id, user_id, device_id, checkout_id, local_path, branch, created_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (project_id, user_id, device_id, checkout_id, local_path, branch, now, now),
+    )
+    conn.execute(
+        "UPDATE project_checkouts SET local_path = ?, branch = ?, last_seen_at = ? "
+        "WHERE user_id = ? AND device_id = ? AND checkout_id = ?",
+        (local_path, branch, now, user_id, device_id, checkout_id),
+    )
+    return _db_one_id(
+        conn,
+        "SELECT id FROM project_checkouts WHERE user_id = ? AND device_id = ? AND checkout_id = ?",
+        (user_id, device_id, checkout_id),
+    )
+
+
+def _db_work_graph(conn: sqlite3.Connection, user: sqlite3.Row, payload: dict, now: str) -> dict:
+    project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
+    issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    work = payload.get("work") if isinstance(payload.get("work"), dict) else {}
+
+    client_id = str(session.get("client_id") or payload.get("client_id") or "unknown")
+    device_id = _db_upsert_device(
+        conn, int(user["id"]), client_id,
+        str(session.get("device_name") or session.get("name") or "unknown"),
+        str(session.get("platform") or "unknown"), now,
+    )
+    project_id = _db_upsert_project(conn, project, now)
+    default_provider = str(issue.get("provider") or _issue_provider_for_project_key(str(project.get("project_key") or project.get("key") or "")))
+    if not issue.get("issue_key") and not issue.get("key") and session.get("branch"):
+        issue = {**issue, "issue_key": _issue_from_branch(str(session.get("branch")))}
+    issue_id = _db_upsert_issue(conn, project_id, issue, default_provider, now)
+    title = str(work.get("title") or payload.get("title") or issue.get("title") or "").strip()
+    billable_default = bool(work.get("billable", payload.get("billable", True)))
+    work_item_id = _db_upsert_work_item(conn, project_id, issue_id, title, billable_default, now)
+    checkout_id = _db_upsert_checkout(conn, project_id, int(user["id"]), device_id, session, project, now)
+    return {"device_id": device_id, "project_id": project_id, "issue_id": issue_id,
+            "work_item_id": work_item_id, "checkout_row_id": checkout_id}
+
+
+def _db_work_start(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        graph = _db_work_graph(conn, user, payload, now)
+        project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
+        session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+        work = payload.get("work") if isinstance(payload.get("work"), dict) else {}
+        started_at = str(payload.get("started_at") or session.get("started_at") or now)
+        tool = str(session.get("tool") or work.get("tool") or "manual")
+        local_path = str(project.get("local_path") or session.get("local_path") or "")
+        cwd = str(session.get("cwd") or project.get("cwd") or local_path)
+        branch = str(session.get("branch") or project.get("branch") or "")
+        checkout_id = str(session.get("checkout_id") or project.get("checkout_id") or "")
+        if not checkout_id:
+            checkout_id = hashlib.sha1(f"{graph['project_id']}|{local_path}".encode("utf-8", errors="replace")).hexdigest()[:16]
+        summary = str(work.get("summary") or work.get("title") or payload.get("title") or "")
+        billable = 1 if bool(work.get("billable", payload.get("billable", True))) else 0
+        cur = conn.execute(
+            "INSERT INTO work_sessions(work_item_id, user_id, device_id, project_checkout_id, checkout_id, tool, "
+            "local_path, cwd, branch, started_at, last_seen_at, status, billable, summary, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            (graph["work_item_id"], int(user["id"]), graph["device_id"], graph["checkout_row_id"], checkout_id,
+             tool, local_path, cwd, branch, started_at, started_at, billable, summary, now, now),
+        )
+        session_id = int(cur.lastrowid)
+        return {"ok": True, "work_session_id": session_id, "work_item_id": graph["work_item_id"],
+                "project_id": graph["project_id"], "issue_id": graph["issue_id"]}
+
+
+def _db_session_for_user(conn: sqlite3.Connection, user_id: int, session_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM work_sessions WHERE id = ? AND user_id = ?", (session_id, user_id)).fetchone()
+    if row is None:
+        raise PermissionError("work_session puudub või ei kuulu sellele kasutajale")
+    return row
+
+
+def _minute_floor_iso(value: str | None = None) -> str:
+    d = parse_iso(value or "") or _now_utc()
+    return d.astimezone(dt.timezone.utc).replace(second=0, microsecond=0).isoformat()
+
+
+def _db_work_tick(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        session_id = int(payload.get("work_session_id") or payload.get("session_id") or 0)
+        row = _db_session_for_user(conn, int(user["id"]), session_id)
+        if row["status"] != "active":
+            return {"ok": True, "ignored": True, "reason": f"session status is {row['status']}"}
+        minute = _minute_floor_iso(str(payload.get("minute_start_utc") or payload.get("tick_at") or ""))
+        conn.execute(
+            "INSERT OR IGNORE INTO minute_ticks(work_session_id, work_item_id, user_id, minute_start_utc, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, int(row["work_item_id"]), int(user["id"]), minute,
+             str(payload.get("source") or "heartbeat"), now),
+        )
+        conn.execute("UPDATE work_sessions SET last_seen_at = ?, updated_at = ? WHERE id = ?", (minute, now, session_id))
+        return {"ok": True, "work_session_id": session_id, "minute_start_utc": minute}
+
+
+def _work_session_minutes(row: sqlite3.Row | dict, tick_count: int | None = None) -> int:
+    final = row["minutes_final"] if isinstance(row, sqlite3.Row) else row.get("minutes_final")
+    if final is not None:
+        try:
+            return max(0, int(final))
+        except (TypeError, ValueError):
+            pass
+    if tick_count is not None and tick_count > 0:
+        return int(tick_count)
+    start = parse_iso(row["started_at"] if isinstance(row, sqlite3.Row) else row.get("started_at", ""))
+    end = parse_iso((row["ended_at"] if isinstance(row, sqlite3.Row) else row.get("ended_at")) or
+                    (row["last_seen_at"] if isinstance(row, sqlite3.Row) else row.get("last_seen_at")) or "")
+    if not start or not end or end <= start:
+        return 0
+    return max(1, int((end - start).total_seconds() + 59) // 60)
+
+
+def _db_work_finish(path: Path, token: str, payload: dict, *, status: str = "done") -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        session_id = int(payload.get("work_session_id") or payload.get("session_id") or 0)
+        row = _db_session_for_user(conn, int(user["id"]), session_id)
+        ended_at = str(payload.get("ended_at") or now)
+        manual_minutes = payload.get("minutes")
+        if manual_minutes not in (None, ""):
+            minutes = max(1, int(manual_minutes))
+        else:
+            tick_count = int(conn.execute("SELECT COUNT(*) AS c FROM minute_ticks WHERE work_session_id = ?", (session_id,)).fetchone()["c"])
+            minutes = _work_session_minutes(row, tick_count)
+            if minutes <= 0:
+                start = parse_iso(row["started_at"]) or parse_iso(ended_at) or _now_utc()
+                end = parse_iso(ended_at) or _now_utc()
+                minutes = max(1, int((end - start).total_seconds() + 59) // 60)
+        summary = str(payload.get("summary") or row["summary"] or "")
+        result = str(payload.get("result") or ("discarded" if status == "discarded" else row["result"] or ""))
+        billable = row["billable"]
+        if "billable" in payload:
+            billable = 1 if bool(payload.get("billable")) else 0
+        conn.execute(
+            "UPDATE work_sessions SET ended_at = ?, last_seen_at = ?, status = ?, result = ?, billable = ?, "
+            "summary = ?, minutes_final = ?, updated_at = ? WHERE id = ?",
+            (ended_at, ended_at, status, result, billable, summary, minutes, now, session_id),
+        )
+        conn.execute(
+            "UPDATE work_items SET status = CASE WHEN ? = 'discarded' THEN status ELSE 'active' END, updated_at = ? "
+            "WHERE id = ?",
+            (status, now, int(row["work_item_id"])),
+        )
+        return {"ok": True, "work_session_id": session_id, "minutes": minutes, "status": status}
+
+
+def _db_work_status(path: Path, token: str) -> list[dict]:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        rows = conn.execute(
+            "SELECT ws.id, ws.tool, ws.started_at, ws.last_seen_at, ws.summary, ws.status, ws.branch, "
+            "wi.id AS work_item_id, wi.title AS work_title, p.project_key, p.name AS project_name, "
+            "i.provider, i.issue_key, u.name AS user_name "
+            "FROM work_sessions ws "
+            "JOIN work_items wi ON wi.id = ws.work_item_id "
+            "JOIN projects p ON p.id = wi.project_id "
+            "LEFT JOIN issues i ON i.id = wi.issue_id "
+            "JOIN users u ON u.id = ws.user_id "
+            "WHERE ws.user_id = ? AND ws.status = 'active' ORDER BY ws.started_at",
+            (int(user["id"]),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _qval(q: dict, key: str, default: str = "") -> str:
+    val = q.get(key, default)
+    if isinstance(val, list):
+        return str(val[0]) if val else default
+    return str(val) if val is not None else default
+
+
+def _period_bounds(q: dict) -> tuple[str, str, str]:
+    period = _qval(q, "period")
+    if re.fullmatch(r"\d{4}-\d{2}", period):
+        y, m = map(int, period.split("-"))
+        start = dt.datetime(y, m, 1, tzinfo=dt.timezone.utc)
+        end = dt.datetime(y + (m // 12), 1 if m == 12 else m + 1, 1, tzinfo=dt.timezone.utc)
+        return start.isoformat(), end.isoformat(), period
+    from_s = _qval(q, "from") or _qval(q, "start")
+    to_s = _qval(q, "to") or _qval(q, "end")
+    now = _now_utc()
+    start = parse_iso(from_s) if from_s else dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
+    if to_s:
+        end = parse_iso(to_s)
+        if end and re.fullmatch(r"\d{4}-\d{2}-\d{2}", to_s):
+            end = end + dt.timedelta(days=1)
+    else:
+        end = dt.datetime(now.year + (now.month // 12), 1 if now.month == 12 else now.month + 1, 1,
+                          tzinfo=dt.timezone.utc)
+    start = start or dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
+    end = end or now
+    label = f"{start.date()}..{end.date()}"
+    return start.isoformat(), end.isoformat(), label
+
+
+def _db_invoice_lines(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _period_bounds(q)
+    rate_s = _qval(q, "hourly_rate") or _qval(q, "rate")
+    hourly_rate = float(rate_s) if rate_s else None
+    project_filter = _qval(q, "project_key")
+    customer_filter = _qval(q, "customer_id")
+    issue_filter = _normalise_issue_key(_qval(q, "issue"))
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        where = ["ws.billable = 1", "ws.status != 'discarded'",
+                 "ws.started_at < ?", "COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ?"]
+        args: list = [end_iso, start_iso]
+        if user["role"] != "admin":
+            where.append("ws.user_id = ?")
+            args.append(int(user["id"]))
+        if project_filter:
+            where.append("p.project_key = ?")
+            args.append(project_filter)
+        if customer_filter:
+            where.append("p.customer_id = ?")
+            args.append(int(customer_filter))
+        if issue_filter:
+            where.append("i.issue_key = ?")
+            args.append(issue_filter)
+        sql = f"""
+            SELECT ws.*, u.name AS user_name, d.client_id, d.name AS device_name,
+                   wi.id AS work_item_id, wi.title AS work_title, p.project_key, p.name AS project_name,
+                   c.name AS customer_name, i.provider, i.issue_key, i.title AS issue_title,
+                   (SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count
+            FROM work_sessions ws
+            JOIN users u ON u.id = ws.user_id
+            JOIN devices d ON d.id = ws.device_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN customers c ON c.id = p.customer_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(where)}
+            ORDER BY p.project_key, i.issue_key, wi.title, ws.started_at
+        """
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    groups: dict[int, dict] = {}
+    for r in rows:
+        minutes = _work_session_minutes(r, int(r["tick_count"] or 0))
+        if minutes <= 0:
+            continue
+        gid = int(r["work_item_id"])
+        line = groups.setdefault(gid, {
+            "work_item_id": gid,
+            "customer": r["customer_name"] or "",
+            "project": r["project_name"],
+            "project_key": r["project_key"],
+            "issue": (f"#{r['issue_key']}" if r["issue_key"] else ""),
+            "issue_provider": r["provider"] or "",
+            "title": r["issue_title"] or r["work_title"],
+            "problem_text": r["issue_title"] or r["work_title"],
+            "work_done": [],
+            "minutes": 0,
+            "time": "00:00",
+            "hourly_rate": hourly_rate,
+            "amount": None,
+            "sessions": [],
+            "evidence": {"work_item_id": gid, "session_ids": []},
+        })
+        if r["summary"] and r["summary"] not in line["work_done"]:
+            line["work_done"].append(r["summary"])
+        line["minutes"] += minutes
+        line["sessions"].append({
+            "session_id": int(r["id"]), "user": r["user_name"], "tool": r["tool"],
+            "device": r["device_name"], "branch": r["branch"], "started_at": r["started_at"],
+            "ended_at": r["ended_at"], "minutes": minutes, "result": r["result"],
+        })
+        line["evidence"]["session_ids"].append(int(r["id"]))
+    lines = []
+    for line in groups.values():
+        mins = int(line["minutes"])
+        line["time"] = f"{mins // 60:02d}:{mins % 60:02d}"
+        if hourly_rate is not None:
+            line["amount"] = round((mins / 60.0) * hourly_rate, 2)
+        lines.append(line)
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "currency": "EUR", "hourly_rate": hourly_rate, "lines": lines}
+
+
+def _db_practice_summary(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _period_bounds(q)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        target_user = int(_qval(q, "user_id") or user["id"]) if user["role"] == "admin" else int(user["id"])
+        rows = conn.execute(
+            "SELECT ws.*, p.project_key, p.name AS project_name, wi.title AS work_title, "
+            "i.issue_key, i.title AS issue_title, "
+            "(SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count "
+            "FROM work_sessions ws "
+            "JOIN work_items wi ON wi.id = ws.work_item_id "
+            "JOIN projects p ON p.id = wi.project_id "
+            "LEFT JOIN issues i ON i.id = wi.issue_id "
+            "WHERE ws.user_id = ? AND ws.status != 'discarded' AND ws.started_at < ? "
+            "AND COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ? "
+            "ORDER BY ws.started_at",
+            (target_user, end_iso, start_iso),
+        ).fetchall()
+    days: dict[str, dict] = {}
+    for r in rows:
+        started = parse_iso(r["started_at"]) or _now_utc()
+        day_key = started.date().isoformat()
+        minutes = _work_session_minutes(r, int(r["tick_count"] or 0))
+        issue = f"#{r['issue_key']}" if r["issue_key"] else ""
+        title = r["issue_title"] or r["work_title"]
+        day = days.setdefault(day_key, {"date": day_key, "minutes": 0, "items": [], "text": ""})
+        day["minutes"] += minutes
+        day["items"].append({
+            "project": r["project_name"], "project_key": r["project_key"], "issue": issue,
+            "title": title, "tool": r["tool"], "summary": r["summary"], "minutes": minutes,
+        })
+    for day in days.values():
+        parts = []
+        for item in day["items"]:
+            label_i = " ".join(x for x in [item["project"], item["issue"], item["title"]] if x)
+            summary = f": {item['summary']}" if item["summary"] else ""
+            parts.append(f"{label_i} ({item['tool']}, {item['minutes']} min){summary}")
+        day["text"] = "; ".join(parts)
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "days": [days[k] for k in sorted(days)]}
 
 
 def _db_rows_for_day(path: Path, token: str, date: str) -> list[list]:
@@ -1152,13 +1908,27 @@ def _db_ingest_events(path: Path, token: str, events: list[dict]) -> None:
             key = str(e.get("event_key", ""))
             if not key:
                 continue
+            project_raw = str(e.get("project", ""))
+            ctx = _project_context(project_raw or ".")
+            project_id = _db_upsert_project(conn, {
+                "project_key": ctx["project_key"], "repo_url": ctx["repo_url"],
+                "name": ctx["name"], "local_path": ctx["local_path"],
+            }, now)
+            issue_id = None
+            if ctx.get("issue_key"):
+                issue_id = _db_upsert_issue(conn, project_id, {
+                    "provider": ctx.get("issue_provider") or "local", "issue_key": ctx.get("issue_key")
+                }, ctx.get("issue_provider") or "local", now)
             conn.execute(
                 "INSERT OR IGNORE INTO prompt_events "
-                "(user_id, event_key, tool, project, prompt_text, started_at, ended_at, duration_seconds, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (user["id"], key, str(e.get("tool", "")), str(e.get("project", "")),
+                "(user_id, event_key, tool, project, prompt_text, started_at, ended_at, duration_seconds, "
+                "created_at, project_id, issue_id, confidence, payload_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user["id"], key, str(e.get("tool", "")), project_raw,
                  str(e.get("prompt_text", "")), str(e.get("started_at", "")),
-                 str(e.get("ended_at", "")), int(e.get("duration_seconds") or 0), now),
+                 str(e.get("ended_at", "")), int(e.get("duration_seconds") or 0), now,
+                 project_id, issue_id, float(e.get("confidence") or 0.5),
+                 json.dumps(e, ensure_ascii=False, sort_keys=True)),
             )
 
 
@@ -1167,6 +1937,20 @@ def _server_url(cfg: dict, op: str) -> str:
     if not base:
         raise ValueError("server_url puudub configis")
     return f"{base}/api/{op}"
+
+
+def _server_get(op: str, params: dict, cfg: dict) -> dict | None:
+    sink = cfg.get("sink", {})
+    params = {"token": sink.get("token", ""), **params}
+    qs = urllib.parse.urlencode(params)
+    url = _server_url(cfg, op) + (f"?{qs}" if qs else "")
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        log(f"server sink: GET /api/{op} ebaõnnestus: {e}")
+        return None
 
 
 def _server_post(op: str, payload: dict, cfg: dict) -> dict | None:
@@ -2399,6 +3183,15 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     html, text = _html_table_for_day(date, full)
                 self._json({"ok": True, "html": html, "text": text})
                 return
+            if u.path == "/api/work/status" and self._server_mode():
+                self._json({"ok": True, "sessions": _db_work_status(self._db_path(), self._token(q))})
+                return
+            if u.path == "/api/billing/invoice-lines" and self._server_mode():
+                self._json(_db_invoice_lines(self._db_path(), self._token(q), q))
+                return
+            if u.path == "/api/practice/summary" and self._server_mode():
+                self._json(_db_practice_summary(self._db_path(), self._token(q), q))
+                return
             self._json({"ok": False, "error": "not found"}, 404)
         except PermissionError as e:
             self._json({"ok": False, "error": str(e)}, 403)
@@ -2423,6 +3216,18 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 events = data.get("events") if isinstance(data.get("events"), list) else []
                 _db_ingest_events(self._db_path(), self._token(data=data), events)
                 self._json({"ok": True})
+                return
+            if u.path == "/api/work/start" and self._server_mode():
+                self._json(_db_work_start(self._db_path(), self._token(data=data), data))
+                return
+            if u.path == "/api/work/tick" and self._server_mode():
+                self._json(_db_work_tick(self._db_path(), self._token(data=data), data))
+                return
+            if u.path == "/api/work/done" and self._server_mode():
+                self._json(_db_work_finish(self._db_path(), self._token(data=data), data, status="done"))
+                return
+            if u.path == "/api/work/discard" and self._server_mode():
+                self._json(_db_work_finish(self._db_path(), self._token(data=data), data, status="discarded"))
                 return
             if u.path == "/api/day":
                 date = str(data.get("date") or _today_local_str(self.cfg))
@@ -2535,6 +3340,163 @@ def cmd_connect(args, cfg):
     save_config(cfg2)
     print(f"aitrack server seadistatud: {args.url.rstrip('/')}")
     print("Edaspidi saadab 'aitrack run' tunniread ja prompt-eventid serverisse.")
+
+
+def _require_server_cfg(cfg: dict) -> None:
+    sink = cfg.get("sink", {})
+    if sink.get("type") != "server" or not sink.get("server_url") or not sink.get("token"):
+        raise SystemExit("See käsk vajab keskserverit: aitrack connect --url URL --token TOKEN")
+
+
+def _work_payload_from_args(args, cfg: dict, *, summary: str = "") -> tuple[dict, dict, dict]:
+    ctx = _project_context(getattr(args, "cwd", None) or ".", getattr(args, "issue", None))
+    client = _client_info()
+    tool = _detect_cli(getattr(args, "tool", None))
+    title = summary or " ".join(getattr(args, "summary", []) or []).strip()
+    issue_key = _normalise_issue_key(getattr(args, "issue", None)) or ctx.get("issue_key", "")
+    project = {
+        "project_key": ctx["project_key"], "repo_url": ctx["repo_url"], "name": ctx["name"],
+        "local_path": ctx["local_path"], "checkout_id": ctx["checkout_id"], "branch": ctx["branch"],
+    }
+    session = {
+        "client_id": client["client_id"], "device_name": client.get("name", "unknown"),
+        "platform": client.get("platform", _platform()), "checkout_id": ctx["checkout_id"],
+        "tool": tool, "cwd": ctx["cwd"], "local_path": ctx["local_path"], "branch": ctx["branch"],
+    }
+    issue = {"provider": ctx.get("issue_provider") or "local", "issue_key": issue_key} if issue_key else {}
+    payload = {"project": project, "issue": issue, "session": session,
+               "work": {"title": title, "summary": title, "billable": not getattr(args, "non_billable", False)},
+               "started_at": _now_utc().isoformat()}
+    return payload, ctx, client
+
+
+def cmd_project_id(args, cfg):
+    ctx = _project_context(args.path, args.issue)
+    if args.json:
+        print(json.dumps(ctx, ensure_ascii=False, indent=2))
+    else:
+        for k in ("project_key", "repo_url", "name", "local_path", "branch", "issue_key", "checkout_id"):
+            print(f"{k}: {ctx.get(k, '')}")
+
+
+def cmd_work(args, cfg):
+    _require_server_cfg(cfg)
+    if args.work_cmd == "start":
+        summary = " ".join(args.summary).strip()
+        if not summary:
+            raise SystemExit("Kasuta: aitrack work start [--issue N] 'töö kirjeldus'")
+        payload, ctx, client = _work_payload_from_args(args, cfg, summary=summary)
+        tool = payload["session"]["tool"]
+        active = _active_work_sessions(tool=tool, checkout_id=ctx["checkout_id"])
+        if active and not args.force:
+            print("Selles checkout'is ja tööriistas on juba aktiivne work_session:")
+            for s in active:
+                print(f"  session {s['work_session_id']}: {s.get('summary', '')} ({s.get('project_key', '')} {s.get('issue_key', '')})")
+            print("Lõpeta enne: aitrack work done 'kokkuvõte'  või kasuta --force teadlikuks paralleelsuseks.")
+            return
+        body = _server_post("work/start", payload, cfg)
+        if not body or not body.get("ok"):
+            raise SystemExit(f"work start ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+        state = _load_work_state()
+        session_id = int(body["work_session_id"])
+        state["sessions"] = [s for s in state.get("sessions", []) if s.get("work_session_id") != session_id]
+        state["sessions"].append({
+            "work_session_id": session_id, "work_item_id": body.get("work_item_id"), "status": "active",
+            "summary": summary, "project_key": ctx["project_key"], "issue_key": ctx.get("issue_key", ""),
+            "checkout_id": ctx["checkout_id"], "tool": tool, "client_id": client["client_id"],
+            "started_at": payload["started_at"], "state_key": _work_state_key(client["client_id"], ctx["checkout_id"], tool),
+        })
+        _save_work_state(state)
+        print(f"Alustatud work_session {session_id}: {ctx['project_key']}" + (f" #{ctx['issue_key']}" if ctx.get("issue_key") else ""))
+        return
+
+    if args.work_cmd == "status":
+        local = _active_work_sessions()
+        if local:
+            print("Kohalikud aktiivsed sessioonid:")
+            for s in local:
+                print(f"  {s['work_session_id']:>5}  {s.get('tool','')}  {s.get('project_key','')} {('#' + s.get('issue_key')) if s.get('issue_key') else ''}  {s.get('summary','')}")
+        else:
+            print("Kohalikus state'is aktiivseid sessioone pole.")
+        body = _server_get("work/status", {}, cfg)
+        if body and body.get("ok") and body.get("sessions"):
+            print("Serveri aktiivsed sessioonid selle tokeni all:")
+            for s in body["sessions"]:
+                issue = f"#{s.get('issue_key')}" if s.get("issue_key") else ""
+                print(f"  {s['id']:>5}  {s.get('tool','')}  {s.get('project_key','')} {issue}  {s.get('summary','')}")
+        return
+
+    if args.work_cmd in ("tick", "done", "discard"):
+        cmd_tick(args, cfg) if args.work_cmd == "tick" else _cmd_work_finish(args, cfg, discard=(args.work_cmd == "discard"))
+        return
+
+    if args.work_cmd == "switch":
+        _cmd_work_finish(args, cfg, discard=False, summary_override=args.done_summary or "pooleli: " + " ".join(args.summary).strip())
+        start_args = argparse.Namespace(**vars(args))
+        start_args.work_cmd = "start"
+        start_args.force = False
+        cmd_work(start_args, cfg)
+        return
+
+
+def _select_local_session(args) -> dict:
+    sessions = _active_work_sessions()
+    if getattr(args, "session_id", None):
+        sid = int(args.session_id)
+        for s in sessions:
+            if int(s.get("work_session_id") or 0) == sid:
+                return s
+        return {"work_session_id": sid, "summary": "", "status": "active"}
+    tool = _detect_cli(getattr(args, "tool", None))
+    ctx = _project_context(getattr(args, "cwd", None) or ".", getattr(args, "issue", None))
+    matches = [s for s in sessions if s.get("tool") == tool and s.get("checkout_id") == ctx["checkout_id"]]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit("Aktiivset work_session'it ei leitud. Vaata: aitrack work status")
+    raise SystemExit("Mitu aktiivset sessiooni sobib. Anna --session-id.")
+
+
+def cmd_tick(args, cfg):
+    _require_server_cfg(cfg)
+    sessions = _active_work_sessions()
+    if getattr(args, "session_id", None):
+        sessions = [s for s in sessions if int(s.get("work_session_id") or 0) == int(args.session_id)]
+    if not sessions:
+        print("Aktiivseid work_session'eid pole; ticki ei saadetud.")
+        return
+    sent = 0
+    for s in sessions:
+        body = _server_post("work/tick", {"work_session_id": s["work_session_id"], "tick_at": _now_utc().isoformat(),
+                                          "source": "heartbeat"}, cfg)
+        if body and body.get("ok"):
+            sent += 1
+    print(f"Saadetud ticke: {sent}")
+
+
+def _cmd_work_finish(args, cfg, *, discard: bool, summary_override: str | None = None):
+    _require_server_cfg(cfg)
+    s = _select_local_session(args)
+    summary = summary_override or " ".join(getattr(args, "summary", []) or []).strip() or s.get("summary", "")
+    payload = {"work_session_id": int(s["work_session_id"]), "summary": summary, "ended_at": _now_utc().isoformat()}
+    if getattr(args, "minutes", None):
+        payload["minutes"] = int(args.minutes)
+    if getattr(args, "result", None):
+        payload["result"] = args.result
+    if getattr(args, "non_billable", False):
+        payload["billable"] = False
+    op = "work/discard" if discard else "work/done"
+    body = _server_post(op, payload, cfg)
+    if not body or not body.get("ok"):
+        raise SystemExit(f"work finish ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+    state = _load_work_state()
+    for item in state.get("sessions", []):
+        if int(item.get("work_session_id") or 0) == int(s["work_session_id"]):
+            item["status"] = "discarded" if discard else "done"
+            item["ended_at"] = payload["ended_at"]
+            item["minutes"] = body.get("minutes")
+    _save_work_state(state)
+    print(f"Lõpetatud work_session {s['work_session_id']} ({body.get('minutes')} min, {body.get('status')}).")
 
 
 def cmd_init(args, cfg):
@@ -2665,6 +3627,10 @@ Põhikäsud
   { _cli_base_cmd() } start                  ava brauseris visuaalne päevavaade/editor
   { _cli_base_cmd() } serve                  käivita keskserver SQLite andmebaasiga
   { _cli_base_cmd() } connect --url URL --token TOKEN  ühenda klient keskserveriga
+  { _cli_base_cmd() } project-id             näita repo URL-il põhinevat ühist project_key'd
+  { _cli_base_cmd() } work start --issue 662 "töö"  alusta serveris work_session'it
+  { _cli_base_cmd() } tick                   saada kõigi aktiivsete work_session'ite minut
+  { _cli_base_cmd() } work done "kokkuvõte"  lõpeta aktiivne work_session
   { _cli_base_cmd() } note "tekst"           lisa käsitsi märge praegusele tunnile
   { _cli_base_cmd() } note                   näita käsitsi märkmeid
   { _cli_base_cmd() } preview --hours 8      vaata, mida tracker leiaks
@@ -2847,6 +3813,59 @@ def main():
     cn.add_argument("--url", required=True, help="serveri URL, nt https://aitrack.example.com")
     cn.add_argument("--token", required=True, help="kasutaja token serverist")
     cn.set_defaults(fn=cmd_connect)
+
+    pid = sub.add_parser("project-id", help="näita serveri ühist projektivõtit (git remote URL või local:<kaust>)")
+    pid.add_argument("path", nargs="?", default=".")
+    pid.add_argument("--issue", help="issue võti; puudumisel proovitakse branchi nimest")
+    pid.add_argument("--json", action="store_true", help="väljasta JSON")
+    pid.set_defaults(fn=cmd_project_id)
+
+    tick = sub.add_parser("tick", help="saada kõigi aktiivsete work_session'ite minut serverisse")
+    tick.add_argument("--session-id", type=int, help="saada tick ainult sellele sessioonile")
+    tick.set_defaults(fn=cmd_tick)
+
+    wk = sub.add_parser("work", help="serveripõhine work_session ajamõõtmine")
+    ws = wk.add_subparsers(dest="work_cmd", required=True)
+    wstart = ws.add_parser("start", help="alusta uut work_session'it praeguses checkout'is")
+    wstart.add_argument("summary", nargs="+", help="töö lühikirjeldus")
+    wstart.add_argument("--issue", help="issue number/võti; puudumisel proovitakse branchist")
+    wstart.add_argument("--tool", help="agent/tööriist, nt pi/claude/opencode/codex")
+    wstart.add_argument("--cwd", help="projekti/checkout'i tee (vaikimisi praegune kaust)")
+    wstart.add_argument("--non-billable", action="store_true", help="märgi sessioon vaikimisi mittearveldatavaks")
+    wstart.add_argument("--force", action="store_true", help="luba sama checkout+tool paralleelsessioon teadlikult")
+    wstart.set_defaults(fn=cmd_work)
+    wstatus = ws.add_parser("status", help="näita aktiivseid work_session'eid")
+    wstatus.set_defaults(fn=cmd_work)
+    wtick = ws.add_parser("tick", help="saada minut serverisse")
+    wtick.add_argument("--session-id", type=int)
+    wtick.set_defaults(fn=cmd_work)
+    wdone = ws.add_parser("done", help="lõpeta aktiivne work_session")
+    wdone.add_argument("summary", nargs="*", help="lõpetamise kokkuvõte")
+    wdone.add_argument("--session-id", type=int)
+    wdone.add_argument("--minutes", type=int, help="käsitsi hinnatud aktiivsed minutid")
+    wdone.add_argument("--issue")
+    wdone.add_argument("--tool")
+    wdone.add_argument("--cwd")
+    wdone.add_argument("--result", choices=["kept", "discarded", "superseded", "merged", "review", ""], default="")
+    wdone.add_argument("--non-billable", action="store_true")
+    wdone.set_defaults(fn=cmd_work)
+    wdiscard = ws.add_parser("discard", help="lõpeta sessioon mittearvestatavana")
+    wdiscard.add_argument("summary", nargs="*", help="põhjus")
+    wdiscard.add_argument("--session-id", type=int)
+    wdiscard.add_argument("--minutes", type=int)
+    wdiscard.add_argument("--issue")
+    wdiscard.add_argument("--tool")
+    wdiscard.add_argument("--cwd")
+    wdiscard.set_defaults(fn=cmd_work)
+    wswitch = ws.add_parser("switch", help="lõpeta praegune sessioon ja alusta uus")
+    wswitch.add_argument("summary", nargs="+", help="uue töö kirjeldus")
+    wswitch.add_argument("--done-summary", help="eelmise sessiooni kokkuvõte")
+    wswitch.add_argument("--minutes", type=int, help="eelmise sessiooni aktiivsed minutid")
+    wswitch.add_argument("--issue", help="uue töö issue")
+    wswitch.add_argument("--tool")
+    wswitch.add_argument("--cwd")
+    wswitch.add_argument("--non-billable", action="store_true")
+    wswitch.set_defaults(fn=cmd_work)
 
     up = sub.add_parser("user", help="halda keskserveri kasutajaid")
     us = up.add_subparsers(dest="user_cmd", required=True)

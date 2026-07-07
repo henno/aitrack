@@ -76,6 +76,9 @@ kõik ühe vooluga:
 | `aitrack serve` | Käivita keskserver SQLite andmebaasiga mitme kasutaja jaoks. |
 | `aitrack user add/list` | Lisa/listi keskserveri kasutajaid ja token'eid. |
 | `aitrack connect --url ... --token ...` | Ühenda klient keskserveriga; `aitrack run` saadab tunniread ja prompt-eventid serverisse. |
+| `aitrack project-id` | Näita serveri ühist projektivõtit: Git repo korral normaliseeritud remote URL, muidu `local:<kaust>`. |
+| `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; mitu kasutajat/agentit võivad sama issue all paralleelselt töötada. |
+| `aitrack tick` | Saada kõigi aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
@@ -135,6 +138,41 @@ SQLite-põhise keskserveri. Serveris loo kasutaja `aitrack user add karl --db /d
 seadista `aitrack connect --url https://aitrack.example.com --token TOKEN`. Seejärel saadab kliendi
 `aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta repo juures
 `docker compose up -d --build` (vaikimisi seob `127.0.0.1:3103`).
+
+**Normaliseeritud work tracking:** serveri DB hoiab projektid/issue'd/sessioonid/minutitickid 3NF-laadselt
+eraldi tabelites (`projects`, `project_remotes`, `issues`, `work_items`, `work_sessions`, `minute_ticks`).
+Git repo korral on ühine `project_key` normaliseeritud remote URL, nt
+`git@github.com:Puhastusproff/pp-finar.git` ja `https://github.com/Puhastusproff/pp-finar.git` →
+`github.com/puhastusproff/pp-finar`; Gitita kaustal kasutatakse `local:<kaustanimi>`.
+
+Näide sama issue paralleelseks lahendamiseks eri agentidega/checkout'ides:
+
+```bash
+cd ~/agents/pp-finar-pi
+aitrack work start --issue 662 --tool pi "asendaja pühadetasu vea parandamine"
+
+cd ~/agents/pp-finar-claude
+aitrack work start --issue 662 --tool claude "alternatiivne lahendus Claude'iga"
+
+# cron/systemd/launchd/Task Scheduler võib kutsuda iga minut:
+aitrack tick
+
+aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
+```
+
+Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
+
+```bash
+curl -H "X-Aitrack-Token: TOKEN" \
+  "https://aitrack.example.com/api/billing/invoice-lines?period=2026-06&hourly_rate=82"
+```
+
+Praktikakokkuvõtte saab serverist:
+
+```bash
+curl -H "X-Aitrack-Token: TOKEN" \
+  "https://aitrack.example.com/api/practice/summary?period=2026-06"
+```
 
 **Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status` või `aitrack start`.
 **Tööpäeva lõpp:** `aitrack start` → kontrolli/muuda → “Kopeeri D–G” → kleebi lehele. (Digest/teavitus töötab nagu enne.)

@@ -567,5 +567,41 @@ with A._db_connect(sdb) as conn:
     ev_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
 check("server salvestas prompt-eventi", ev_count == 1)
 
+# ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
+print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")
+check("SSH ja HTTPS URL normaliseeruvad samaks",
+      A._normalise_repo_url("git@github.com:Puhastusproff/pp-finar.git") ==
+      A._normalise_repo_url("https://github.com/Puhastusproff/pp-finar.git") ==
+      "github.com/puhastusproff/pp-finar")
+check("branchist leitakse issue number", A._issue_from_branch("fix/662-asendaja-puhadetasu") == "662")
+
+# ============ TEST 43: 3NF work_session + invoice/practice vaated ============
+print("TEST 43: serveri normaliseeritud work_session'id toidavad arve- ja praktikavaadet")
+wdb = CFG / "server-work-test.db"
+wdb.unlink(missing_ok=True)
+wtok = A._db_add_user(wdb, "karl")
+payload = {
+    "project": {"project_key": "github.com/puhastusproff/pp-finar", "repo_url": "git@github.com:Puhastusproff/pp-finar.git", "name": "pp-finar", "local_path": "/tmp/pp-finar-pi", "checkout_id": "co-pi", "branch": "662-test"},
+    "issue": {"provider": "github", "issue_key": "662", "title": "Asendaja pühadetasu"},
+    "work": {"title": "asendaja pühadetasu parandamine", "summary": "algus", "billable": True},
+    "session": {"client_id": "client-test", "device_name": "testbox", "platform": "linux", "checkout_id": "co-pi", "tool": "pi", "local_path": "/tmp/pp-finar-pi", "cwd": "/tmp/pp-finar-pi", "branch": "662-test"},
+    "started_at": HFL(10).isoformat(),
+}
+start = A._db_work_start(wdb, wtok, payload)
+A._db_work_tick(wdb, wtok, {"work_session_id": start["work_session_id"], "tick_at": HFL(10).isoformat()})
+A._db_work_tick(wdb, wtok, {"work_session_id": start["work_session_id"], "tick_at": (HFL(10) + dt.timedelta(minutes=1)).isoformat()})
+done = A._db_work_finish(wdb, wtok, {"work_session_id": start["work_session_id"], "summary": "parandus valmis", "ended_at": (HFL(10) + dt.timedelta(minutes=2)).isoformat(), "result": "kept"})
+invoice = A._db_invoice_lines(wdb, wtok, {"period": ["2026-06"], "hourly_rate": ["82"]})
+practice = A._db_practice_summary(wdb, wtok, {"period": ["2026-06"]})
+with A._db_connect(wdb) as conn:
+    project_count = conn.execute("SELECT COUNT(*) AS c FROM projects").fetchone()["c"]
+    issue_count = conn.execute("SELECT COUNT(*) AS c FROM issues").fetchone()["c"]
+    session_count = conn.execute("SELECT COUNT(*) AS c FROM work_sessions").fetchone()["c"]
+check("normaliseeritud tabelites on projekt/issue/session", (project_count, issue_count, session_count) == (1, 1, 1))
+check("done arvutas minutid tickidest", done["minutes"] == 2)
+check("invoice endpointi helper grupeerib work_item'i", len(invoice["lines"]) == 1 and invoice["lines"][0]["issue"] == "#662")
+check("invoice sisaldab aega, hinda ja summat", invoice["lines"][0]["time"] == "00:02" and invoice["lines"][0]["amount"] == 2.73)
+check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-finar" in practice["days"][0]["text"])
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
