@@ -49,7 +49,8 @@ LOG_FILE = CONFIG_DIR / "aitrack.log"
 LOCK_FILE = CONFIG_DIR / "aitrack.lock"
 NOTES_FILE = CONFIG_DIR / "notes.jsonl"  # käsitsi lisatud tunnimärkmed (aitrack note)
 CLIENT_FILE = CONFIG_DIR / "client.json"  # selle arvuti püsiv client_id serveri jaoks
-WORK_STATE_FILE = CONFIG_DIR / "work-state.json"  # aktiivsed serveri work_session'id sellel kliendil
+LOCAL_DB = CONFIG_DIR / "local.db"  # lokaalse agendi SQLite DB (aktiivsed work_session'id + outbox)
+WORK_STATE_FILE = CONFIG_DIR / "work-state.json"  # legacy snapshot aktiivsetest work_session'idest
 SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack serve)
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
@@ -444,20 +445,174 @@ def save_state(state: dict) -> None:
     _atomic_write_json(STATE_FILE, state)
 
 
-def _load_work_state() -> dict:
+def _local_db_connect() -> sqlite3.Connection:
+    _mkconfdir()
+    created = not LOCAL_DB.exists()
+    conn = sqlite3.connect(LOCAL_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    if created:
+        try:
+            os.chmod(LOCAL_DB, 0o600)
+        except OSError:
+            pass
+    return conn
+
+
+def _local_session_ref(session: dict) -> str:
+    return str(session.get("work_session_uid") or session.get("work_session_id") or "").strip()
+
+
+def _local_row_to_session(row: sqlite3.Row) -> dict:
+    out = {k: row[k] for k in row.keys()}
+    if out.get("owner_pid") is None:
+        out.pop("owner_pid", None)
+    return out
+
+
+def _local_upsert_work_session_row(conn: sqlite3.Connection, session: dict) -> None:
+    now = _now_utc().isoformat()
+    uid = str(session.get("work_session_uid") or "").strip() or None
+    sid = str(session.get("work_session_id") or "").strip() or None
+    if not uid and not sid:
+        return
+    existing = None
+    if uid:
+        existing = conn.execute("SELECT id FROM local_work_sessions WHERE work_session_uid = ?", (uid,)).fetchone()
+    if existing is None and sid:
+        existing = conn.execute("SELECT id FROM local_work_sessions WHERE work_session_id = ?", (sid,)).fetchone()
+    values = {
+        "work_session_uid": uid,
+        "work_session_id": sid,
+        "work_item_id": str(session.get("work_item_id") or ""),
+        "project_key": str(session.get("project_key") or ""),
+        "issue_key": str(session.get("issue_key") or ""),
+        "checkout_id": str(session.get("checkout_id") or ""),
+        "tool": str(session.get("tool") or "manual"),
+        "client_id": str(session.get("client_id") or ""),
+        "summary": str(session.get("summary") or ""),
+        "status": str(session.get("status") or "active"),
+        "owner_pid": session.get("owner_pid"),
+        "owner_start": str(session.get("owner_start") or ""),
+        "owner_command": str(session.get("owner_command") or ""),
+        "owner_cli": str(session.get("owner_cli") or session.get("tool") or ""),
+        "started_at": str(session.get("started_at") or ""),
+        "last_tick_at": str(session.get("last_tick_at") or ""),
+        "ended_at": str(session.get("ended_at") or ""),
+        "minutes": session.get("minutes"),
+        "state_key": str(session.get("state_key") or ""),
+    }
+    if existing is None:
+        conn.execute(
+            "INSERT INTO local_work_sessions "
+            "(work_session_uid, work_session_id, work_item_id, project_key, issue_key, checkout_id, tool, "
+            "client_id, summary, status, owner_pid, owner_start, owner_command, owner_cli, started_at, "
+            "last_tick_at, ended_at, minutes, state_key, created_at, updated_at) "
+            "VALUES (:work_session_uid, :work_session_id, :work_item_id, :project_key, :issue_key, :checkout_id, "
+            ":tool, :client_id, :summary, :status, :owner_pid, :owner_start, :owner_command, :owner_cli, "
+            ":started_at, :last_tick_at, :ended_at, :minutes, :state_key, :created_at, :updated_at)",
+            {**values, "created_at": now, "updated_at": now},
+        )
+    else:
+        conn.execute(
+            "UPDATE local_work_sessions SET work_session_uid = COALESCE(:work_session_uid, work_session_uid), "
+            "work_session_id = COALESCE(:work_session_id, work_session_id), work_item_id = :work_item_id, "
+            "project_key = :project_key, issue_key = :issue_key, checkout_id = :checkout_id, tool = :tool, "
+            "client_id = :client_id, summary = :summary, status = :status, owner_pid = :owner_pid, "
+            "owner_start = :owner_start, owner_command = :owner_command, owner_cli = :owner_cli, "
+            "started_at = :started_at, last_tick_at = :last_tick_at, ended_at = :ended_at, minutes = :minutes, "
+            "state_key = :state_key, updated_at = :updated_at WHERE id = :id",
+            {**values, "updated_at": now, "id": int(existing["id"])},
+        )
+
+
+def _local_import_legacy_work_state(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT value FROM local_meta WHERE key = 'legacy_work_state_imported'").fetchone()
+    if row and row["value"] == "1":
+        return
     if WORK_STATE_FILE.exists():
         try:
             data = json.loads(WORK_STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("sessions", [])
-                return data
         except (OSError, json.JSONDecodeError):
-            pass
-    return {"sessions": []}
+            data = {}
+        if isinstance(data, dict):
+            for session in data.get("sessions", []):
+                if isinstance(session, dict):
+                    _local_upsert_work_session_row(conn, session)
+    conn.execute(
+        "INSERT OR REPLACE INTO local_meta(key, value, updated_at) VALUES ('legacy_work_state_imported', '1', ?)",
+        (_now_utc().isoformat(),),
+    )
+
+
+def _local_db_init() -> None:
+    with _local_db_connect() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS local_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS local_work_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          work_session_uid TEXT UNIQUE,
+          work_session_id TEXT,
+          work_item_id TEXT,
+          project_key TEXT NOT NULL DEFAULT '',
+          issue_key TEXT NOT NULL DEFAULT '',
+          checkout_id TEXT NOT NULL DEFAULT '',
+          tool TEXT NOT NULL DEFAULT 'manual',
+          client_id TEXT NOT NULL DEFAULT '',
+          summary TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'active',
+          owner_pid INTEGER,
+          owner_start TEXT NOT NULL DEFAULT '',
+          owner_command TEXT NOT NULL DEFAULT '',
+          owner_cli TEXT NOT NULL DEFAULT '',
+          started_at TEXT NOT NULL DEFAULT '',
+          last_tick_at TEXT NOT NULL DEFAULT '',
+          ended_at TEXT NOT NULL DEFAULT '',
+          minutes INTEGER,
+          state_key TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS local_work_sessions_status_idx ON local_work_sessions(status, checkout_id, tool);
+        CREATE INDEX IF NOT EXISTS local_work_sessions_server_id_idx ON local_work_sessions(work_session_id);
+        CREATE TABLE IF NOT EXISTS local_event_outbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_uid TEXT NOT NULL UNIQUE,
+          work_session_uid TEXT,
+          event_type TEXT NOT NULL,
+          occurred_at TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          sent_at TEXT,
+          ack_at TEXT,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS local_event_outbox_pending_idx ON local_event_outbox(ack_at, occurred_at);
+        """)
+        _local_import_legacy_work_state(conn)
+
+
+def _load_work_state() -> dict:
+    _local_db_init()
+    with _local_db_connect() as conn:
+        rows = conn.execute("SELECT * FROM local_work_sessions ORDER BY id").fetchall()
+    return {"sessions": [_local_row_to_session(r) for r in rows]}
 
 
 def _save_work_state(state: dict) -> None:
     state.setdefault("sessions", [])
+    _local_db_init()
+    with _local_db_connect() as conn:
+        for session in state.get("sessions", []):
+            if isinstance(session, dict):
+                _local_upsert_work_session_row(conn, session)
+    # Kirjuta legacy snapshot ainult inimloetavaks üleminekuperioodiks; source of truth on local.db.
     _atomic_write_json(WORK_STATE_FILE, state, 0o600)
 
 
@@ -477,6 +632,24 @@ def _active_work_sessions(*, tool: str | None = None, checkout_id: str | None = 
             continue
         out.append(s)
     return out
+
+
+def _local_update_work_session(ref, **fields) -> None:
+    ref_s = str(ref or "").strip()
+    if not ref_s:
+        return
+    allowed = {"status", "last_tick_at", "ended_at", "minutes", "summary"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    updates["updated_at"] = _now_utc().isoformat()
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+    _local_db_init()
+    with _local_db_connect() as conn:
+        conn.execute(
+            f"UPDATE local_work_sessions SET {set_clause} WHERE work_session_uid = :ref OR work_session_id = :ref",
+            {**updates, "ref": ref_s},
+        )
 
 
 # --- platvormiülene lukk (väldib paralleelseid run'e) -----------------------
@@ -3561,6 +3734,7 @@ def cmd_tick(args, cfg):
         return
     sent = 0
     for s in sessions:
+        ref = _local_session_ref(s)
         payload = {"tick_at": _now_utc().isoformat(), "source": "heartbeat"}
         if s.get("work_session_uid"):
             payload["work_session_uid"] = s["work_session_uid"]
@@ -3568,7 +3742,13 @@ def cmd_tick(args, cfg):
             payload["work_session_id"] = s["work_session_id"]
         body = _server_post("work/tick", payload, cfg)
         if body and body.get("ok"):
-            sent += 1
+            if body.get("ignored"):
+                reason = str(body.get("reason") or "")
+                remote_status = reason.rsplit(" ", 1)[-1] if reason.startswith("session status is ") else "stale"
+                _local_update_work_session(ref, status=remote_status or "stale", ended_at=_now_utc().isoformat())
+            else:
+                sent += 1
+                _local_update_work_session(ref, last_tick_at=str(body.get("minute_start_utc") or payload["tick_at"]))
     print(f"Saadetud ticke: {sent}")
 
 
@@ -3780,6 +3960,7 @@ def cmd_status(args, cfg):
         print(f"Väljund:         Google Sheets ({'seadistatud' if sink.get('webapp_url') else 'URL PUUDUB'})")
     print(f"Kokkuvõtja:      {eng}" + (f" ({exe})" if exe else " — AI-CLI puudub"))
     print(f"Projekte:        {len(load_projects())}")
+    print(f"Local agent DB:  {LOCAL_DB} ({'olemas' if LOCAL_DB.exists() else 'puudub veel'})")
     raw = load_state()  # None = rikutud (ära kuku kokku diagnoosikäsus)
     if raw is None:
         print("Viimati töödeldud: RIKUTUD state.json — kustuta ~/.config/aitrack/state.json")

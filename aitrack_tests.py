@@ -58,6 +58,8 @@ def setup(records, state=None, allow=None):
     A.fetch_existing_keys = lambda cfg: None  # vaikimisi: ei küsi (tavakäitumine)
     (CFG / "aitrack.lock").unlink(missing_ok=True)
     (CFG / "notes.jsonl").unlink(missing_ok=True)  # käsitsi-märkmed: puhas leht iga testi eel
+    A.WORK_STATE_FILE.unlink(missing_ok=True)
+    A.LOCAL_DB.unlink(missing_ok=True)
     A.HOURS_CSV.unlink(missing_ok=True)  # sisemine algandmestik: isoleeri iga test (real-append testid)
 
 def cur_state():
@@ -604,6 +606,23 @@ check("invoice endpointi helper grupeerib work_item'i", len(invoice["lines"]) ==
 check("invoice evidence sisaldab work_session_uid väärtust", invoice["lines"][0]["evidence"]["work_session_uids"] == [start["work_session_uid"]])
 check("invoice sisaldab aega, hinda ja summat", invoice["lines"][0]["time"] == "00:02" and invoice["lines"][0]["amount"] == 2.73)
 check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-finar" in practice["days"][0]["text"])
+
+# ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
+print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")
+A.LOCAL_DB.unlink(missing_ok=True)
+A.WORK_STATE_FILE.write_text(json.dumps({"sessions": [{
+    "work_session_uid": "ws_test_uid", "work_session_id": 42, "work_item_id": 7,
+    "project_key": "github.com/puhastusproff/pp-finar", "issue_key": "662",
+    "checkout_id": "co-local", "tool": "pi", "client_id": "client-test",
+    "summary": "kohalik sessioon", "status": "active", "started_at": HFL(11).isoformat(),
+}]}), encoding="utf-8")
+active_local = A._active_work_sessions(tool="pi", checkout_id="co-local")
+with A._local_db_connect() as conn:
+    local_row = conn.execute("SELECT work_session_uid, status FROM local_work_sessions WHERE work_session_uid = 'ws_test_uid'").fetchone()
+check("legacy snapshot imporditi local.db-sse", local_row is not None and local_row["status"] == "active")
+check("aktiivne sessioon leitakse UID järgi", len(active_local) == 1 and active_local[0]["work_session_uid"] == "ws_test_uid")
+A._save_work_state({"sessions": [{**active_local[0], "status": "done", "ended_at": HFL(12).isoformat()}]})
+check("done sessioon ei ole enam aktiivne", A._active_work_sessions(tool="pi", checkout_id="co-local") == [])
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
