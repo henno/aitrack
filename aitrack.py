@@ -2297,19 +2297,19 @@ def _platform() -> str:
     return "linux"
 
 
-def install_scheduler() -> None:
+def install_scheduler(minute_tracking: bool = False) -> None:
     plat = _platform()
     py = sys.executable
     script = str(THIS)
-    log(f"install: platvorm={plat}, python={py}")
+    log(f"install: platvorm={plat}, python={py}, minute_tracking={minute_tracking}")
     if plat == "linux":
-        _install_systemd(py, script)
+        _install_systemd(py, script, minute_tracking=minute_tracking)
     elif plat == "macos":
-        _install_launchd(py, script)
+        _install_launchd(py, script, minute_tracking=minute_tracking)
     elif plat == "windows":
-        _install_schtasks(py, script)
+        _install_schtasks(py, script, minute_tracking=minute_tracking)
     else:
-        log("install: tundmatu platvorm — seadista ajasti käsitsi käsuga 'aitrack run'")
+        log("install: tundmatu platvorm — seadista ajasti käsitsi käsuga 'aitrack run' ja soovi korral 'aitrack tick'")
 
 
 def _run_logged(cmd: list[str]) -> None:
@@ -2323,29 +2323,30 @@ def _run_logged(cmd: list[str]) -> None:
 def uninstall_scheduler() -> None:
     plat = _platform()
     if plat == "linux":
-        for t in ("aitrack.timer", "aitrack-digest.timer"):
+        for t in ("aitrack.timer", "aitrack-digest.timer", "aitrack-tick.timer"):
             _run_logged(["systemctl", "--user", "disable", "--now", t])
-        _run_logged(["systemctl", "--user", "stop", "aitrack.service"])  # peata jooksev oneshot
-        for f in ("aitrack.timer", "aitrack.service",
+        for svc in ("aitrack.service", "aitrack-tick.service"):
+            _run_logged(["systemctl", "--user", "stop", svc])
+        for f in ("aitrack.timer", "aitrack.service", "aitrack-tick.timer", "aitrack-tick.service",
                   "aitrack-digest.timer", "aitrack-digest.service"):
             (HOME / ".config" / "systemd" / "user" / f).unlink(missing_ok=True)
         _run_logged(["systemctl", "--user", "daemon-reload"])
         log("uninstall: systemd timer(id) eemaldatud")
     elif plat == "macos":
         domain = f"gui/{os.getuid()}"
-        for name in ("com.aitrack.agent", "com.aitrack.digest"):
+        for name in ("com.aitrack.agent", "com.aitrack.tick", "com.aitrack.digest"):
             plist = HOME / "Library" / "LaunchAgents" / f"{name}.plist"
             _run_logged(["launchctl", "bootout", domain, str(plist)])
             _run_logged(["launchctl", "unload", "-w", str(plist)])  # vanade macOS-ide jaoks
             plist.unlink(missing_ok=True)
         log("uninstall: launchd agent(id) eemaldatud")
     elif plat == "windows":
-        for tn in ("aitrack", "aitrack-digest"):
+        for tn in ("aitrack", "aitrack-tick", "aitrack-digest"):
             _run_logged(["schtasks", "/Delete", "/TN", tn, "/F"])
         log("uninstall: Task Scheduler ülesanne(d) eemaldatud")
 
 
-def _install_systemd(py: str, script: str) -> None:
+def _install_systemd(py: str, script: str, *, minute_tracking: bool = False) -> None:
     unit_dir = HOME / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
     path_env = os.environ.get("PATH", "")
@@ -2364,15 +2365,33 @@ def _install_systemd(py: str, script: str) -> None:
         "[Install]\nWantedBy=timers.target\n",
         encoding="utf-8",
     )
+    if minute_tracking:
+        (unit_dir / "aitrack-tick.service").write_text(
+            "[Unit]\nDescription=aitrack — aktiivse work_session minuti heartbeat\n"
+            "After=network-online.target\nWants=network-online.target\n\n"
+            "[Service]\nType=oneshot\n"
+            f"ExecStart={py} {script} tick\n"
+            f"Environment=PATH={path_env}\n",
+            encoding="utf-8",
+        )
+        (unit_dir / "aitrack-tick.timer").write_text(
+            "[Unit]\nDescription=aitrack tick iga minut aktiivse work_session jaoks\n\n"
+            "[Timer]\nOnBootSec=1min\nOnUnitActiveSec=60s\nAccuracySec=10s\n\n"
+            "[Install]\nWantedBy=timers.target\n",
+            encoding="utf-8",
+        )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", "aitrack.timer"], check=False)
-    log("install: systemd user-timer lubatud (iga tund :05)")
-    subprocess.run(["systemctl", "--user", "list-timers", "aitrack.timer", "--no-pager"], check=False)
+    if minute_tracking:
+        subprocess.run(["systemctl", "--user", "enable", "--now", "aitrack-tick.timer"], check=False)
+    log("install: systemd user-timer lubatud (iga tund :05" + (", tick iga minut" if minute_tracking else "") + ")")
+    timers = ["aitrack.timer"] + (["aitrack-tick.timer"] if minute_tracking else [])
+    subprocess.run(["systemctl", "--user", "list-timers", *timers, "--no-pager"], check=False)
     print("\nSoovitus, et timer jookseks ka väljalogituna:")
     print(f"  sudo loginctl enable-linger {os.environ.get('USER', '$USER')}")
 
 
-def _install_launchd(py: str, script: str) -> None:
+def _install_launchd(py: str, script: str, *, minute_tracking: bool = False) -> None:
     la_dir = HOME / "Library" / "LaunchAgents"
     la_dir.mkdir(parents=True, exist_ok=True)
     plist = la_dir / "com.aitrack.agent.plist"
@@ -2397,16 +2416,38 @@ def _install_launchd(py: str, script: str) -> None:
     )
     # Moderne macOS: bootstrap/kickstart; vanematel langeb tagasi load -w peale.
     domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", domain, str(plist)],
-                   check=False, capture_output=True)
-    res = subprocess.run(["launchctl", "bootstrap", domain, str(plist)],
-                         capture_output=True, text=True)
-    if res.returncode != 0:
-        subprocess.run(["launchctl", "load", "-w", str(plist)], check=False)
-    # paigaldusjärgne suitsutest — käivita kohe, et katki plist/PATH avastada nüüd, mitte tunni pärast
-    subprocess.run(["launchctl", "kickstart", f"{domain}/com.aitrack.agent"],
-                   check=False, capture_output=True)
-    log(f"install: launchd agent laetud ({plist}) — iga tund :05")
+    plists = [(plist, "com.aitrack.agent")]
+    if minute_tracking:
+        tick_plist = la_dir / "com.aitrack.tick.plist"
+        tick_plist.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            "  <key>Label</key><string>com.aitrack.tick</string>\n"
+            f"  <key>ProgramArguments</key><array><string>{py}</string>"
+            f"<string>{script}</string><string>tick</string></array>\n"
+            "  <key>StartInterval</key><integer>60</integer>\n"
+            f"  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string></dict>\n"
+            f"  <key>StandardErrorPath</key><string>{err_log}</string>\n"
+            f"  <key>StandardOutPath</key><string>{out_log}</string>\n"
+            "  <key>RunAtLoad</key><false/>\n"
+            "</dict></plist>\n",
+            encoding="utf-8",
+        )
+        plists.append((tick_plist, "com.aitrack.tick"))
+    for pth, label in plists:
+        subprocess.run(["launchctl", "bootout", domain, str(pth)],
+                       check=False, capture_output=True)
+        res = subprocess.run(["launchctl", "bootstrap", domain, str(pth)],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            subprocess.run(["launchctl", "load", "-w", str(pth)], check=False)
+        if label == "com.aitrack.agent":
+            # paigaldusjärgne suitsutest — käivita kohe, et katki plist/PATH avastada nüüd, mitte tunni pärast
+            subprocess.run(["launchctl", "kickstart", f"{domain}/{label}"],
+                           check=False, capture_output=True)
+    log(f"install: launchd agent laetud ({plist}) — iga tund :05" + (", tick iga minut" if minute_tracking else ""))
 
 
 def _next_hh05() -> str:
@@ -2418,7 +2459,7 @@ def _next_hh05() -> str:
     return nxt.strftime("%H:%M")
 
 
-def _install_schtasks(py: str, script: str) -> None:
+def _install_schtasks(py: str, script: str, *, minute_tracking: bool = False) -> None:
     # Iga tund minutil :05 (sama nihe kui systemd/launchd). Vahelejäänud tunnid püüab run järele.
     cmd = f'"{py}" "{script}" run'
     res = subprocess.run(
@@ -2430,6 +2471,17 @@ def _install_schtasks(py: str, script: str) -> None:
         log("install: Windows Task Scheduler ülesanne 'aitrack' loodud (iga tund :05)")
     else:
         log(f"install: schtasks ebaõnnestus: {(res.stderr or res.stdout).strip()[:300]}")
+    if minute_tracking:
+        tick_cmd = f'"{py}" "{script}" tick'
+        res = subprocess.run(
+            ["schtasks", "/Create", "/TN", "aitrack-tick", "/TR", tick_cmd,
+             "/SC", "MINUTE", "/MO", "1", "/F"],
+            capture_output=True, text=True,
+        )
+        if res.returncode == 0:
+            log("install: Windows Task Scheduler ülesanne 'aitrack-tick' loodud (iga minut)")
+        else:
+            log(f"install: schtasks tick ebaõnnestus: {(res.stderr or res.stdout).strip()[:300]}")
 
 
 # --- soovitused / digest / teavitused ---------------------------------------
@@ -3551,7 +3603,7 @@ def cmd_install(args, cfg):
         log(f"install: mootor '{eng}' lukustatud teele: {exe}")
     elif eng == "none":
         log("install: HOIATUS — AI-CLI mootorit ei leitud; kokkuvõtted tulevad varurežiimis")
-    install_scheduler()
+    install_scheduler(minute_tracking=getattr(args, "minute_tracking", False))
 
 
 def cmd_uninstall(args, cfg):
@@ -3630,6 +3682,7 @@ Põhikäsud
   { _cli_base_cmd() } project-id             näita repo URL-il põhinevat ühist project_key'd
   { _cli_base_cmd() } work start --issue 662 "töö"  alusta serveris work_session'it
   { _cli_base_cmd() } tick                   saada kõigi aktiivsete work_session'ite minut
+  { _cli_base_cmd() } install --minute-tracking  lisa OS-i iga-minuti tick timer
   { _cli_base_cmd() } work done "kokkuvõte"  lõpeta aktiivne work_session
   { _cli_base_cmd() } note "tekst"           lisa käsitsi märge praegusele tunnile
   { _cli_base_cmd() } note                   näita käsitsi märkmeid
@@ -3895,7 +3948,9 @@ def main():
     dg.add_argument("--notify", action="store_true")
     dg.set_defaults(fn=cmd_digest)
 
-    sub.add_parser("install", help="seadista OS-i tunniajasti (systemd/launchd/Task Scheduler)").set_defaults(fn=cmd_install)
+    inst = sub.add_parser("install", help="seadista OS-i tunniajasti (systemd/launchd/Task Scheduler)")
+    inst.add_argument("--minute-tracking", action="store_true", help="lisa ka aitrack tick iga minuti timer aktiivsete work_session'ite jaoks")
+    inst.set_defaults(fn=cmd_install)
     sub.add_parser("uninstall", help="eemalda ajasti").set_defaults(fn=cmd_uninstall)
     sub.add_parser("status", help="näita seadistust ja tuvastatud logiallikaid").set_defaults(fn=cmd_status)
     sub.add_parser("run", help="töötle lõpetatud tunnid (ajasti kutsub seda)").set_defaults(fn=cmd_run)

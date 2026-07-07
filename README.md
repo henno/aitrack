@@ -79,6 +79,7 @@ kõik ühe vooluga:
 | `aitrack project-id` | Näita serveri ühist projektivõtit: Git repo korral normaliseeritud remote URL, muidu `local:<kaust>`. |
 | `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; mitu kasutajat/agentit võivad sama issue all paralleelselt töötada. |
 | `aitrack tick` | Saada kõigi aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
+| `aitrack install --minute-tracking` | Lisa tavapärase tunniajasti kõrvale OS-i iga-minuti tick timer. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
@@ -154,7 +155,8 @@ aitrack work start --issue 662 --tool pi "asendaja pühadetasu vea parandamine"
 cd ~/agents/pp-finar-claude
 aitrack work start --issue 662 --tool claude "alternatiivne lahendus Claude'iga"
 
-# cron/systemd/launchd/Task Scheduler võib kutsuda iga minut:
+# automaatselt: aitrack install --minute-tracking
+# käsitsi/cron/systemd/launchd/Task Scheduler võib kutsuda iga minut:
 aitrack tick
 
 aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
