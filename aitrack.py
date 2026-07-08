@@ -5998,6 +5998,10 @@ def main():
     tick.add_argument("--session-id", help="saada tick ainult sellele sessioonile (serveri ws_... id või legacy number)")
     tick.set_defaults(fn=cmd_tick)
 
+    wd = sub.add_parser("watchdog", help="märgi heartbeatita aktiivsed serveri sessioonid stale olekusse")
+    wd.add_argument("--stale-minutes", type=int, default=10, help="mitu minutit heartbeatita tähendab stale (vaikimisi 10)")
+    wd.set_defaults(fn=cmd_watchdog)
+
     wk = sub.add_parser("work", help="serveripõhine work_session ajamõõtmine")
     ws = wk.add_subparsers(dest="work_cmd", required=True)
     wstart = ws.add_parser("start", help="alusta uut work_session'it praeguses checkout'is")
