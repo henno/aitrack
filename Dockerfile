@@ -3,6 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY aitrack.py README.md ./
+COPY aitrack_core ./aitrack_core
 
 ENV AITRACK_CONFIG_DIR=/data \
     PYTHONUNBUFFERED=1
