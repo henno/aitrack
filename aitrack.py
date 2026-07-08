@@ -2555,7 +2555,9 @@ def _db_work_session_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
     for g in grouped.values():
         key = f"k:{g['utc'].isoformat()}|__work_session__"
         analysis_texts = list(g["topics"]) + list(g["summaries"])
-        out.append([g["date"], g["hour"], "; ".join(g["objects"]), "; ".join(g["summaries"]),
+        plain = _plain_day_summary_from_texts(analysis_texts, g["objects"])
+        out.append([g["date"], g["hour"], plain["objekt"] or "; ".join(g["objects"]),
+                    plain["saavutus"] or "; ".join(g["summaries"]),
                     _infer_takistus_from_texts(analysis_texts), _infer_teadmine_from_texts(analysis_texts),
                     ", ".join(g["tools"]), key])
     return sorted(out, key=lambda r: (r[1], r[7]))
@@ -2628,6 +2630,68 @@ def _domain_learning_sentences(texts: list[str]) -> list[str]:
     if any(x in combined for x in ("raw_events", "raw event", "activity", "päevavaade", "praktikapäeviku")):
         add("Täpsustus aitracki tegevuslogi, activity-vaate ja praktikapäeviku vormingu kohta.")
     return out
+
+
+def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None = None) -> dict:
+    """Faktiline, aga lihtrahvale loetav päevikuvaate fallback.
+
+    Seda kasutatakse siis, kui päris LLM-kokkuvõtet pole või server ehitab vaate
+    prompt-eventidest/work-sessionitest. Eesmärk: mitte näidata toorprompte ega
+    sisemisi failinimesid, vaid kirjeldada töö mõtet lihtsas keeles.
+    """
+    safe_texts = [_safe_day_prompt_snippet(t, 500) for t in texts if str(t or "").strip()]
+    combined = " ".join(s.lower() for s in safe_texts)
+    project_blob = " ".join(str(p or "").lower() for p in (projects or []))
+
+    def has(*needles: str) -> bool:
+        return any(n in combined or n in project_blob for n in needles)
+
+    if has("tailscale"):
+        return {
+            "objekt": "Praktika – võrguühenduse kontroll ja ligipääsu uurimine.",
+            "saavutus": "Kontrolliti, kas Tailscale töötab, ja uuriti, kuidas teine kasutaja saab turvaliselt võrku liituda.",
+        }
+    if has("gnome", "draw-on-gnome", "draw on gnome"):
+        return {
+            "objekt": "Praktika – Linuxi töökeskkonna ja joonistustööriista seadistamine.",
+            "saavutus": "Selgitati välja kasutatav töölauakeskkond ning paigaldati ja katsetati ekraanile joonistamise tööriista.",
+        }
+    if has("pole arusaadav", "lihtrahva", "uued teadmised", "takistused"):
+        return {
+            "objekt": "Praktika – tööpäeviku kirjete arusaadavamaks muutmine.",
+            "saavutus": "Parandati päeviku tekstide koostamist, et kirjeldused oleksid lihtsas keeles ja sobiksid praktikapäevikusse.",
+        }
+    if has("raw_events", "raw event", "active interval", "export"):
+        return {
+            "objekt": "Praktika – aitracki tegevuslogide ja ekspordi arendamine.",
+            "saavutus": "Lisati ja kontrolliti detailsemat tegevuste salvestamist ning andmete eksportimist hilisemaks aruandluseks.",
+        }
+    if has("activity", "päevavaade", "failitee", "praktikapäeviku"):
+        return {
+            "objekt": "Praktika – aitracki tegevusvaate ja päevikuvaate parandamine.",
+            "saavutus": "Parandati tegevuste ülevaadet ja päeviku kuvamist, et töö oleks hiljem selgemini jälgitav.",
+        }
+    if has("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick", "hook", "alam-agent", "subagent"):
+        return {
+            "objekt": "Praktika – AI-tööpäeviku tööaja jälgimise arendamine.",
+            "saavutus": "Täpsustati, kuidas töö alustamine, minutipõhine jälgimine ja AI-agentide tegevus serverisse jõuavad.",
+        }
+    if has("server token", "servertoken", "login", "parool", "rate limiter", "ip ban", "kasutaja"):
+        return {
+            "objekt": "Praktika – aitrack serveri sisselogimise ja turvalisuse arendamine.",
+            "saavutus": "Täiendati serveri ligipääsu, kasutajate sisselogimist ja kaitset valede päringute vastu.",
+        }
+    if has("aitrack"):
+        return {
+            "objekt": "Praktika – AI-tööpäeviku süsteemi arendamine.",
+            "saavutus": "Täiendati tööpäeviku süsteemi ning kontrolliti, et tegevused jõuaksid ülevaatesse arusaadaval kujul.",
+        }
+
+    topics = _unique_limited([_topic_from_work_text(t, 90) for t in safe_texts], 2)
+    proj = next((str(p).strip() for p in (projects or []) if str(p).strip()), "Praktika")
+    objekt = f"Praktika – {topics[0]}." if topics else proj
+    saavutus = "; ".join(topics) + "." if topics else "Tegeldi praktikaga seotud tööülesandega."
+    return {"objekt": _cell_safe(objekt[:400]), "saavutus": _cell_safe(saavutus[:400])}
 
 
 def _learning_sentence_from_text(text: str) -> str:
@@ -2767,8 +2831,8 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
     out = []
     for g in grouped.values():
         key = f"k:{g['utc'].isoformat()}|__prompt_event__"
-        activities = "; ".join(g["activities"])
-        out.append([g["date"], g["hour"], "; ".join(g["projects"]), activities,
+        plain = _plain_day_summary_from_texts(g["texts"], g["projects"])
+        out.append([g["date"], g["hour"], plain["objekt"], plain["saavutus"],
                     _infer_takistus_from_texts(g["texts"]), _infer_teadmine_from_texts(g["texts"]),
                     ", ".join(g["tools"]), key])
     return sorted(out, key=lambda r: (r[1], r[7]))

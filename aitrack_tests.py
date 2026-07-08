@@ -573,13 +573,15 @@ prompt_day_rows = A._db_rows_for_day(sdb, tok, "2026-06-16")
 with A._db_connect(sdb) as conn:
     ev_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
 check("server salvestas prompt-eventi", ev_count == 2)
-check("serveri päevavaade asendab prompt placeholderi tegevuslausega", any("Tegin nähtav päevavaate kokkuvõte" in r[3] and "Promptid:" not in r[3] for r in prompt_day_rows))
+check("serveri päevavaade asendab prompt placeholderi lihtrahva tekstiga", any("Promptid:" not in r[3] and "automaatkokkuvõte" not in r[3] and "Praktika" in r[2] for r in prompt_day_rows if r[1] == "11:00–12:00"))
 check("serveri päevavaade tuletab promptidest uued teadmised", any(r[5] != A._NA for r in prompt_day_rows if r[1] == "11:00–12:00"))
 check("praktikapäeviku heuristika täidab takistuse/teadmise", A._infer_takistus_from_texts(["paranda activity mittekuvamine"]) != A._NA and A._infer_teadmine_from_texts(["selgita heartbeat mudelit"]) != A._NA)
 check("praktikapäeviku takistuse heuristika ei pea failiteed/faili veaks", A._infer_takistus_from_texts(["näita activity vaates failitee issue all", "ava claude.md fail"]) == A._NA)
 learn_tail = A._infer_teadmine_from_texts(["kas tailscale töötab?", "kuidas ta saab minu võrku tulla?"])
 learn_gnome = A._infer_teadmine_from_texts(["mis gnome mul on?", "tõmba https://github.com/daveprowse/Draw-On-Gnome"])
 check("praktikapäeviku teadmise heuristika annab loetava teksti", "Selgus, kas" not in learn_tail and "Tailscale" in learn_tail and "https://" not in learn_gnome)
+plain = A._plain_day_summary_from_texts(["aitrack uuenda globaalseid agent juhiseid", "aitrack work start ja tick käsuahel", "server login kasutajatele"])
+check("praktikapäeviku fallback ei kuva toorprompti objektina", "aitrack uuenda" not in plain["objekt"] and "Praktika" in plain["objekt"])
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
 print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")
