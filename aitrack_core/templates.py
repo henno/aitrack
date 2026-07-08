@@ -477,6 +477,11 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 .modal { width:min(980px,100%); max-height:88vh; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:0 24px 80px rgba(0,0,0,.38); padding:16px; }
 .modal header { padding:0 0 12px; border:0; }
 .modal pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
+.json-key { color:#7dd3fc; }
+.json-string { color:#86efac; }
+.json-number { color:#fbbf24; }
+.json-boolean { color:#f472b6; }
+.json-null { color:#c4b5fd; }
 body.modal-open { overflow:hidden; }
 @media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } }
 </style>
@@ -591,6 +596,14 @@ function closeDetailModal() {
   $('detailModal').hidden = true;
   document.body.classList.remove('modal-open');
 }
+function syntaxHighlightJson(value) {
+  const json = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  return esc(json).replace(/(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;\s*:)|(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)|\b(true|false)\b|\b(null)\b|(-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    (match, key, str, bool, nul, num) => {
+      const cls = key ? 'json-key' : str ? 'json-string' : bool ? 'json-boolean' : nul ? 'json-null' : 'json-number';
+      return `<span class="${cls}">${match}</span>`;
+    });
+}
 async function showDetail(type, id, sessionUid) {
   const params = new URLSearchParams();
   params.set('type', type);
@@ -602,7 +615,7 @@ async function showDetail(type, id, sessionUid) {
   document.body.classList.add('modal-open');
   try {
     const data = await api('/api/event-detail?' + params.toString());
-    $('detailPre').textContent = JSON.stringify(data.detail || data, null, 2);
+    $('detailPre').innerHTML = syntaxHighlightJson(data.detail || data);
   } catch (e) {
     $('detailPre').textContent = e.message || 'Toorandmete laadimine ebaõnnestus';
   }

@@ -986,6 +986,7 @@ activity_html = A._activity_page_html()
 check("event-detail tagastab raw event payload_json välja", raw_detail["detail"]["event_key"] == "detail-raw" and "echo detail" in raw_detail["detail"]["payload_json"])
 check("event-detail tagastab work_session toorrea", session_detail["detail"]["session_uid"] == detstart["work_session_uid"])
 check("activity HTML sisaldab detail modalit ja nuppe", "detailModal" in activity_html and "showDetail" in activity_html and "Toorandmed" in activity_html)
+check("detail modal värvib JSON-i süntaksit", "syntaxHighlightJson" in activity_html and "json-key" in activity_html and "json-string" in activity_html)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
