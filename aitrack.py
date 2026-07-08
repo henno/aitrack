@@ -1138,12 +1138,25 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
         "Sa teed eestikeelseid kokkuvõtteid arendustööst praktikapäeviku jaoks. "
         f"Allpool on kasutaja AI-promptid ühe tunni ({hour_label}) jooksul."
         f"{_object_context(project_label, cfg)} "
-        "Kirjelda TÖÖ SISU põhjal (ÄRA maini kaustanimesid ega failiteid). "
+        "Kirjelda TÖÖ SISU põhjal lihtsas praktikapäeviku keeles. ÄRA maini kaustanimesid, "
+        "failiteid, toorprompte ega sisemisi käske, kui need pole töö sisu ise. "
+        "Stiil peab olema nagu praktikapäeviku punktid: konkreetne objekt/projekt, tehtud töö, "
+        "takistus ja õpitu. Kirjuta lühidalt, aga piisavalt täpselt.\n"
+        "Stiilinäited (ära kopeeri, ainult jäljenda vormi):\n"
+        "OBJEKT: Puhastusproff - Finar projekti seadistamine kohalikus arvutis (GitHubist tõmbamine, env, käivitamine)\n"
+        "SAAVUTUS: Finar kohalikus arvutis üles seatud; live-andmebaasi koopia kätte saadud\n"
+        "TAKISTUS: Claude valis vale IP-aadressi -> kohaliku arvuti IP ja serveris seadistatud IP ei olnud samad\n"
+        "TEADMINE: Kuidas Finaris ./copy_from_live.sh skriptiga enda koopiasse live-andmebaasi koopia saada\n"
+        "Vormireeglid:\n"
+        "- OBJEKT: kujul 'Projekt/klient - teema (olulised detailid)', mitte vestluse küsimuste loetelu.\n"
+        "- SAAVUTUS: konkreetne tulemus, nt 'parandatud', 'valmis', 'üles seatud', 'kontrollitud'.\n"
+        "- TAKISTUS: kui takistust polnud, kirjuta täpselt: Ei olnud; muidu kirjuta päris probleem lihtsas keeles.\n"
+        "- TEADMINE: alusta võimalusel 'Kuidas...', 'Mis on...' või 'Miks...'; kirjuta õpitud mõte, mitte prompti ümbersõnastus.\n"
         "Vasta TÄPSELT neljal real, iga rida algab märksõnaga:\n"
-        "OBJEKT: <objekt/klient ja ülesanne, üks lause, kuni ~15 sõna>\n"
-        "SAAVUTUS: <mis sai tehtud või valmis, üks lause>\n"
-        "TAKISTUS: <mis takistas; kui takistust polnud, kirjuta täpselt: Ei olnud>\n"
-        "TEADMINE: <mida uut õpiti; kui uut polnud, kirjuta täpselt: Ei olnud>\n"
+        "OBJEKT: <projekt/klient - ülesanne>\n"
+        "SAAVUTUS: <mis sai tehtud või valmis>\n"
+        "TAKISTUS: <mis takistas või Ei olnud>\n"
+        "TEADMINE: <mida uut õpiti või Ei olnud>\n"
         "Ära lisa midagi peale nende nelja rea.\n\n"
         f"Promptid:\n{joined}"
     )
@@ -2634,17 +2647,17 @@ def _domain_learning_sentences(texts: list[str]) -> list[str]:
             out.append(sentence)
 
     if "tailscale" in combined:
-        add("Täpsustus Tailscale'i võrguühenduse ja võrgu jagamise kohta.")
+        add("Mis on Tailscale'i võrguühendus ja kuidas teist kasutajat võrku lubada")
     if "gnome" in combined or "draw-on-gnome" in combined or "draw on gnome" in combined:
-        add("Selgus GNOME töökeskkond ning ekraanile joonistamise tööriista kasutus.")
+        add("Mis on GNOME töökeskkond ja kuidas ekraanile joonistamise tööriista kasutada")
     if any(x in combined for x in ("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick")):
-        add("Selgus, kuidas süsteem saab töö alguse ja töö jätkumise automaatselt kirja panna.")
+        add("Kuidas töö algus ja töö jätkumine automaatselt serverisse kirja panna")
     if any(x in combined for x in ("hook", "tool-call", "alam-agent", "subagent", "hangumise")):
-        add("Selgus, kuidas märgata, kui AI-abiprotsess jääb seisma või ei tööta enam.")
+        add("Kuidas märgata, kui AI-abiprotsess jääb seisma või ei tööta enam")
     if any(x in combined for x in ("server token", "servertoken", "login", "parool", "rate limiter", "ip ban")):
-        add("Täpsustus kasutajate sisselogimise ja serveri turvalisuse korraldamise kohta.")
+        add("Kuidas kasutajate sisselogimist ja serveri turvalisust korraldada")
     if any(x in combined for x in ("raw_events", "raw event", "activity", "päevavaade", "praktikapäeviku")):
-        add("Selgus, kuidas tegevuste logi ja päevikuvaade aitavad tehtud tööd hiljem kontrollida.")
+        add("Kuidas tegevuste logi ja päevikuvaade aitavad tehtud tööd hiljem kontrollida")
     return out
 
 
@@ -2664,54 +2677,54 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
 
     if has("tailscale"):
         return {
-            "objekt": "Praktika – võrguühenduse kontroll ja ligipääsu uurimine.",
-            "saavutus": "Kontrolliti, kas Tailscale töötab, ja uuriti, kuidas teine kasutaja saab turvaliselt võrku liituda.",
+            "objekt": "Praktika - Tailscale võrguühenduse kontroll ja ligipääsu uurimine",
+            "saavutus": "Tailscale ühendus kontrollitud; selge, kuidas teine kasutaja saab turvaliselt võrku liituda",
         }
     if has("gnome", "draw-on-gnome", "draw on gnome"):
         return {
-            "objekt": "Praktika – Linuxi töökeskkonna ja joonistustööriista seadistamine.",
-            "saavutus": "Selgitati välja kasutatav töölauakeskkond ning paigaldati ja katsetati ekraanile joonistamise tööriista.",
+            "objekt": "Praktika - Linuxi töökeskkonna ja joonistustööriista seadistamine",
+            "saavutus": "GNOME töökeskkond tuvastatud; ekraanile joonistamise tööriist paigaldatud ja katsetatud",
         }
     if has("pole arusaadav", "lihtrahva", "uued teadmised", "takistused"):
         return {
-            "objekt": "Praktika – tööpäeviku kirjete arusaadavamaks muutmine.",
-            "saavutus": "Parandati päeviku tekstide koostamist, et kirjeldused oleksid lihtsas keeles ja sobiksid praktikapäevikusse.",
+            "objekt": "Praktika - tööpäeviku kirjete arusaadavamaks muutmine",
+            "saavutus": "Päeviku tekstide koostamine parandatud, et kirjeldused oleksid lihtsas keeles",
         }
     if has("pushi", "commit", "origin/main"):
         return {
-            "objekt": "Praktika – koodimuudatuste salvestamine ja avaldamine.",
-            "saavutus": "Kontrolliti, et muudatused on salvestatud ja GitHubi üles pandud.",
+            "objekt": "Praktika - koodimuudatuste salvestamine ja GitHubi pushimine",
+            "saavutus": "Muudatused salvestatud ja GitHubi üles pandud; kontrollitud, et seis on ajakohane",
         }
     if has("raw_events", "raw event", "active interval", "export"):
         return {
-            "objekt": "Praktika – tegevuste salvestamise ja aruandluse arendamine.",
-            "saavutus": "Lisati ja kontrolliti täpsemat tegevuste salvestamist, et tehtud tööd saaks hiljem aruandes kasutada.",
+            "objekt": "Praktika - tegevuste salvestamise ja aruandluse arendamine",
+            "saavutus": "Täpsem tegevuste salvestamine lisatud ja kontrollitud; andmed sobivad hilisemaks aruandluseks",
         }
     if has("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick", "hook", "alam-agent", "subagent"):
         return {
-            "objekt": "Praktika – AI-tööpäeviku tööaja jälgimise arendamine.",
-            "saavutus": "Täpsustati, kuidas töö algus ja töö jätkumine automaatselt serverisse kirja saavad.",
+            "objekt": "Praktika - AI-tööpäeviku tööaja automaatse jälgimise arendamine",
+            "saavutus": "Töö alguse ja töö jätkumise automaatne serverisse kirjapanek täpsustatud",
         }
     if has("server token", "servertoken", "login", "parool", "rate limiter", "ip ban", "kasutaja"):
         return {
-            "objekt": "Praktika – aitrack serveri sisselogimise ja turvalisuse arendamine.",
-            "saavutus": "Täiendati serveri ligipääsu, kasutajate sisselogimist ja kaitset valede päringute vastu.",
+            "objekt": "Praktika - aitrack serveri sisselogimise ja turvalisuse arendamine",
+            "saavutus": "Serveri ligipääs, kasutajate sisselogimine ja kaitse valede päringute vastu täiendatud",
         }
     if has("activity", "päevavaade", "failitee", "praktikapäeviku"):
         return {
-            "objekt": "Praktika – aitracki tegevusvaate ja päevikuvaate parandamine.",
-            "saavutus": "Parandati tegevuste ülevaadet ja päeviku kuvamist, et töö oleks hiljem selgemini jälgitav.",
+            "objekt": "Praktika - aitracki tegevusvaate ja päevikuvaate parandamine",
+            "saavutus": "Tegevuste ülevaade ja päeviku kuvamine parandatud, et tehtud töö oleks hiljem selgemini jälgitav",
         }
     if has("aitrack"):
         return {
-            "objekt": "Praktika – AI-tööpäeviku süsteemi arendamine.",
-            "saavutus": "Täiendati tööpäeviku süsteemi ning kontrolliti, et tegevused jõuaksid ülevaatesse arusaadaval kujul.",
+            "objekt": "Praktika - AI-tööpäeviku süsteemi arendamine",
+            "saavutus": "Tööpäeviku süsteemi täiendatud ja kontrollitud, et tegevused jõuaksid ülevaatesse arusaadavalt",
         }
 
     topics = _unique_limited([_topic_from_work_text(t, 90) for t in safe_texts], 2)
     proj = next((str(p).strip() for p in (projects or []) if str(p).strip()), "Praktika")
-    objekt = f"Praktika – {topics[0]}." if topics else proj
-    saavutus = "; ".join(topics) + "." if topics else "Tegeldi praktikaga seotud tööülesandega."
+    objekt = f"Praktika - {topics[0]}" if topics else proj
+    saavutus = "; ".join(topics) if topics else "Tegeldi praktikaga seotud tööülesandega"
     return {"objekt": _cell_safe(objekt[:400]), "saavutus": _cell_safe(saavutus[:400])}
 
 
