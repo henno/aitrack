@@ -1690,6 +1690,22 @@ def _db_set_user_password(path: Path, name: str, password: str) -> None:
             raise ValueError(f"kasutajat ei leitud: {name}")
 
 
+def _db_change_user_password(path: Path, user_id: int, current_password: str, new_password: str) -> dict:
+    if len(new_password) < 8:
+        raise ValueError("uus parool peab olema vähemalt 8 märki")
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (int(user_id),)).fetchone()
+        if row is None:
+            raise PermissionError("kasutajat ei leitud")
+        if not _verify_password(current_password, row["password_hash"]):
+            raise PermissionError("praegune parool on vale")
+        conn.execute("UPDATE users SET password_hash = ?, password_updated_at = ? WHERE id = ?",
+                     (_hash_password(new_password), now, int(user_id)))
+    return {"ok": True, "password_updated_at": now}
+
+
 def _db_login(path: Path, name: str, password: str) -> dict:
     _db_init(path)
     now_dt = _now_utc()
@@ -3745,6 +3761,7 @@ def _start_page_html(*, server_mode: bool = False) -> str:
         '<label title="Vajalik ainult aitrack serve keskserveri puhul">Server token '
         '<input id="tokenInput" type="password" placeholder="keskserveri token"></label>'
     )
+    user_button = '<button onclick="location.href=\'/account\'">Kasutaja</button>' if server_mode else '<button onclick="showHelp()">Abi</button>'
     server_actions = "" if server_mode else (
         '<button onclick="refreshFromLogs()">Töötle lõpetatud tunnid</button>'
         '<button onclick="backfill()">Backfill 12h</button>'
@@ -3788,7 +3805,7 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 <body>
 <header>
   <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
-  <div class="toolbar"><button onclick="showHelp()">Abi</button><button onclick="location.href='/activity'">Server tegevused</button>__SERVER_ACTIONS__</div>
+  <div class="toolbar">__USER_BUTTON__<button onclick="location.href='/activity'">Server tegevused</button>__SERVER_ACTIONS__</div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -3964,6 +3981,7 @@ init().catch(e => setStatus(e.message, true));
 </html>"""
     return (page
             .replace("__TOKEN_CONTROL__", token_control)
+            .replace("__USER_BUTTON__", user_button)
             .replace("__SERVER_ACTIONS__", server_actions)
             .replace("__SERVER_MODE__", "true" if server_mode else "false"))
 
@@ -4033,6 +4051,102 @@ $('loginForm').addEventListener('submit', async (e) => {
 </html>"""
 
 
+def _account_page_html() -> str:
+    return r"""<!doctype html>
+<html lang="et">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitrack kasutaja</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; } }
+* { box-sizing:border-box; }
+body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }
+header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+h1 { margin:0; font-size:22px; }
+main { padding:18px 22px 40px; max-width:860px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:16px; box-shadow:0 8px 30px rgba(0,0,0,.12); }
+.toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+button, input { font:inherit; }
+button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:8px 11px; cursor:pointer; }
+button.primary { background:var(--accent); color:white; border-color:var(--accent); }
+button:hover { filter:brightness(1.08); }
+label { display:block; margin:12px 0 6px; color:var(--muted); font-size:13px; }
+input { width:min(420px,100%); background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:10px; display:block; }
+.small { color:var(--muted); font-size:13px; }
+.status { min-height:20px; margin-top:12px; color:var(--muted); }
+.bad { color:var(--bad); }
+.ok { color:var(--ok); }
+.pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Kasutaja seaded</h1><div class="small">Parool ja tulevikus muud kasutaja seaded. <span id="userInfo"></span></div></div>
+  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="logout()">Logi välja</button></div>
+</header>
+<main>
+  <section class="panel">
+    <h2>Parooli muutmine</h2>
+    <form id="passwordForm">
+      <label for="currentPassword">Praegune parool</label>
+      <input id="currentPassword" type="password" autocomplete="current-password" required>
+      <label for="newPassword">Uus parool</label>
+      <input id="newPassword" type="password" autocomplete="new-password" minlength="8" required>
+      <label for="newPassword2">Korda uut parooli</label>
+      <input id="newPassword2" type="password" autocomplete="new-password" minlength="8" required>
+      <button class="primary" type="submit">Muuda parool</button>
+    </form>
+    <div id="status" class="status"></div>
+  </section>
+  <section class="panel small">
+    Tulevikus saab siia lisada kasutaja eelistused, teavitused ja muud seaded.
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function setStatus(msg, cls='') { $('status').className = 'status ' + cls; $('status').textContent = msg; }
+async function api(path, opts={}) {
+  const res = await fetch(path, {credentials:'same-origin', ...opts});
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
+    throw new Error(data.error || 'login puudub');
+  }
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data;
+}
+$('passwordForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const current = $('currentPassword').value;
+  const next = $('newPassword').value;
+  const next2 = $('newPassword2').value;
+  if (next !== next2) { setStatus('Uued paroolid ei klapi', 'bad'); return; }
+  setStatus('Muudan…');
+  try {
+    await api('/api/me/password', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({current_password: current, new_password: next})});
+    $('passwordForm').reset();
+    setStatus('Parool muudetud', 'ok');
+  } catch (err) {
+    setStatus(err.message || 'Parooli muutmine ebaõnnestus', 'bad');
+  }
+});
+async function logout() {
+  await fetch('/api/logout', {method:'POST', credentials:'same-origin'}).catch(() => {});
+  location.href = '/login?next=/account';
+}
+async function init() {
+  const me = await api('/api/me');
+  $('userInfo').innerHTML = me.user ? '(' + esc(me.user.name) + ', <span class="pill">' + esc(me.user.role) + '</span>)' : '';
+}
+init().catch(e => setStatus(e.message || 'login puudub', 'bad'));
+</script>
+</body>
+</html>"""
+
+
 def _activity_page_html() -> str:
     return r"""<!doctype html>
 <html lang="et">
@@ -4074,7 +4188,7 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 <body>
 <header>
   <div><h1>aitrack server tegevused</h1><div class="small">Work session'id, prompt-eventid ja tegevuste ajalugu sisselogitud kasutaja õiguste piires. <span id="userInfo"></span></div></div>
-  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
+  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -4352,7 +4466,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         if not self._allow_request():
             return
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html", "/activity", "/login"):
+        if path in ("/", "/index.html", "/activity", "/account", "/login"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -4384,6 +4498,15 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._redirect("/login?next=/activity")
                     return
                 self._html(_activity_page_html())
+                return
+            if u.path == "/account":
+                if not self._server_mode():
+                    self._redirect("/")
+                    return
+                if self._cookie_user() is None:
+                    self._redirect("/login?next=/account")
+                    return
+                self._html(_account_page_html())
                 return
             if u.path == "/favicon.ico":
                 self.send_response(204)
@@ -4484,6 +4607,19 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/logout" and self._server_mode():
                 _db_destroy_session(self._db_path(), self._cookie_value(WEB_SESSION_COOKIE))
                 self._json({"ok": True}, headers={"Set-Cookie": self._session_cookie_header("", clear=True)})
+                return
+            if u.path == "/api/me/password" and self._server_mode():
+                user = self._cookie_user()
+                if user is None:
+                    self._json({"ok": False, "error": "login puudub"}, 401)
+                    return
+                try:
+                    self._json(_db_change_user_password(
+                        self._db_path(), int(user["id"]),
+                        str(data.get("current_password") or ""), str(data.get("new_password") or ""),
+                    ))
+                except (PermissionError, ValueError) as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
                 return
             if u.path == "/api/keys" and self._server_mode():
                 keys = sorted(_db_keys(self._db_path(), self._token(data=data)))

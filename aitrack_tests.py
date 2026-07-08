@@ -645,6 +645,9 @@ check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
 server_start_page = A._start_page_html(server_mode=True)
 check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server token" not in server_start_page and "credentials:'same-origin'" in server_start_page and "const SERVER_MODE = true" in server_start_page)
+check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)
+account_page = A._account_page_html()
+check("kasutaja lehel saab parooli muuta", "/api/me/password" in account_page and "current-password" in account_page and "new-password" in account_page)
 check("login leht postitab /api/login endpointi", "/api/login" in A._login_page_html() and "password" in A._login_page_html())
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
 
@@ -666,6 +669,15 @@ with A._db_connect(ldb) as conn:
 check("õige parool loob web sessioni", login.get("ok") is True and login.get("user", {}).get("name") == "loginuser")
 check("web session mapib kasutaja tokenile", session_user is not None and session_user["token"] == ltok)
 check("vale parool ei valideeru", A._verify_password("vale", session_user["password_hash"]) is False)
+change = A._db_change_user_password(ldb, int(session_user["id"]), "väga-salajane-123", "uus-salajane-456")
+login2 = A._db_login(ldb, "loginuser", "uus-salajane-456")
+wrong_change = False
+try:
+    A._db_change_user_password(ldb, int(session_user["id"]), "väga-salajane-123", "kolmas-salajane-789")
+except PermissionError:
+    wrong_change = True
+check("kasutaja saab praeguse parooliga parooli muuta", change.get("ok") is True and login2.get("ok") is True)
+check("vana parooliga muutmine enam ei õnnestu", wrong_change is True)
 
 # ============ TEST 48: serveri rate-limit ja IP-ban abid ============
 print("TEST 48: rate limiter tuvastab kahtlased päringud ja login failure ban'i")
