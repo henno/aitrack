@@ -770,5 +770,30 @@ check("active interval export summeerib ainult tickidega minutid", interval_expo
 check("active interval export sisaldab work_session_uid", intervals and intervals[0]["work_session_uid"] == istart["work_session_uid"])
 check("work-sessions export sisaldab interval minuteid", work_export["count"] == 1 and work_export["sessions"][0]["interval_minutes"] == 3)
 
+# ============ TEST 51: watchdog märgib stale sessiooni ==========
+print("TEST 51: watchdog märgib heartbeatita aktiivse sessiooni stale olekusse")
+stdb = CFG / "server-watchdog-test.db"
+stdb.unlink(missing_ok=True)
+stok = A._db_add_user(stdb, "watchuser")
+A._now_utc = lambda: HFL(10)
+st_payload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "watchdog test", "summary": "watchdog"},
+    "session": {"client_id": "client-watch", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(10).isoformat(),
+}
+st_start = A._db_work_start(stdb, stok, st_payload)
+A._db_work_tick(stdb, stok, {"work_session_uid": st_start["work_session_uid"], "tick_at": HFL(10).isoformat()})
+A._now_utc = lambda: HFL(10) + dt.timedelta(minutes=20)
+stale = A._db_watchdog(stdb, stok, {"stale_minutes": 5})
+stale_again = A._db_watchdog(stdb, stok, {"stale_minutes": 5})
+with A._db_connect(stdb) as conn:
+    st_row = conn.execute("SELECT status FROM work_sessions WHERE session_uid = ?", (st_start["work_session_uid"],)).fetchone()
+    stale_events = conn.execute("SELECT COUNT(*) AS c FROM raw_events WHERE event_type = 'session_stale'").fetchone()["c"]
+check("watchdog märgib sessiooni stale", stale["marked_count"] == 1 and st_row["status"] == "stale")
+check("watchdog lisab session_stale raw eventi", stale_events == 1 and stale_again["marked_count"] == 0)
+check("stale sessioon ei ole enam aktiivses work/status vaates", A._db_work_status(stdb, stok) == [])
+A._now_utc = lambda: dt.datetime.now(dt.timezone.utc)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

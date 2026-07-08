@@ -3066,6 +3066,29 @@ def _raw_event_work_session_id(conn: sqlite3.Connection, user_id: int, work_sess
     return int(row["id"]) if row is not None else None
 
 
+def _db_insert_raw_event_conn(conn: sqlite3.Connection, user_id: int, e: dict, now: str,
+                              *, work_session_id: int | None = None) -> bool:
+    event_type = _event_text(e, "event_type", "type", "name") or "event"
+    occurred_at = _raw_event_occurred_at(e, now)
+    work_session_uid = _event_text(e, "work_session_uid", "session_uid")
+    tool_call_id = _event_text(e, "tool_call_id", "call_id")
+    event_key = _event_text(e, "event_key", "event_uid", "id")
+    dedup_key = _raw_event_dedup_key(e, event_type, occurred_at, tool_call_id)
+    if work_session_id is None:
+        work_session_id = _raw_event_work_session_id(conn, int(user_id), work_session_uid)
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO raw_events "
+        "(user_id, work_session_id, work_session_uid, agent_uid, parent_agent_uid, event_type, tool_name, "
+        "tool_call_id, event_key, dedup_key, occurred_at_utc, received_at_utc, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(user_id), work_session_id, work_session_uid,
+         _event_text(e, "agent_uid", "agent_id"), _event_text(e, "parent_agent_uid", "parent_agent_id"),
+         event_type, _event_text(e, "tool_name", "tool"), tool_call_id, event_key, dedup_key,
+         occurred_at, now, _raw_event_payload_json(e)),
+    )
+    return bool(cur.rowcount)
+
+
 def _db_ingest_raw_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, events: list[dict], now: str) -> dict:
     accepted = 0
     inserted = 0
@@ -3153,6 +3176,65 @@ def _db_ingest_events(path: Path, token: str, events: list[dict]) -> dict:
         raw = _db_ingest_raw_events_conn(conn, user, events, now)
         prompts = _db_ingest_legacy_prompt_events_conn(conn, user, events, now)
     return {"ok": True, "raw_events": raw, "prompt_events": prompts}
+
+
+def _db_watchdog(path: Path, token: str, payload: dict) -> dict:
+    """Mark active work sessions stale when they have no heartbeat/progress for too long."""
+    _db_init(path)
+    stale_minutes = max(1, int(payload.get("stale_minutes") or payload.get("minutes") or 10))
+    now_dt = _now_utc()
+    now = now_dt.isoformat()
+    cutoff = (now_dt - dt.timedelta(minutes=stale_minutes)).isoformat()
+    marked = []
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        where = ["ws.status = 'active'", "COALESCE(ws.last_seen_at, ws.started_at) < ?"]
+        args: list = [cutoff]
+        if user["role"] != "admin":
+            where.append("ws.user_id = ?")
+            args.append(int(user["id"]))
+        rows = conn.execute(f"""
+            SELECT ws.*, u.name AS user_name, p.project_key, p.name AS project_name,
+                   i.issue_key, wi.title AS work_title
+            FROM work_sessions ws
+            JOIN users u ON u.id = ws.user_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(where)}
+            ORDER BY COALESCE(ws.last_seen_at, ws.started_at)
+        """, tuple(args)).fetchall()
+        for r in rows:
+            last_seen = r["last_seen_at"] or r["started_at"]
+            event = {
+                "event_key": f"watchdog:session_stale:{r['session_uid']}:{last_seen}",
+                "event_type": "session_stale",
+                "work_session_uid": r["session_uid"],
+                "occurred_at_utc": now,
+                "tool_name": "aitrack-watchdog",
+                "payload": {
+                    "stale_minutes": stale_minutes,
+                    "cutoff": cutoff,
+                    "last_seen_at": last_seen,
+                    "previous_status": r["status"],
+                },
+            }
+            _db_insert_raw_event_conn(conn, int(r["user_id"]), event, now, work_session_id=int(r["id"]))
+            conn.execute("UPDATE work_sessions SET status = 'stale', result = COALESCE(NULLIF(result, ''), 'watchdog stale'), updated_at = ? WHERE id = ?",
+                         (now, int(r["id"])))
+            marked.append({
+                "work_session_id": int(r["id"]),
+                "work_session_uid": r["session_uid"],
+                "user": r["user_name"],
+                "project_key": r["project_key"],
+                "issue_key": r["issue_key"] or "",
+                "tool": r["tool"],
+                "summary": r["summary"] or r["work_title"],
+                "last_seen_at": last_seen,
+                "status": "stale",
+            })
+    return {"ok": True, "stale_minutes": stale_minutes, "cutoff": cutoff,
+            "marked_count": len(marked), "sessions": marked}
 
 
 def _db_export_work_sessions(path: Path, token: str, q: dict) -> dict:
@@ -5244,6 +5326,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 events = data.get("events") if isinstance(data.get("events"), list) else []
                 self._json(_db_ingest_events(self._db_path(), self._token(data=data), events))
                 return
+            if u.path == "/api/watchdog" and self._server_mode():
+                self._json(_db_watchdog(self._db_path(), self._token(data=data), data))
+                return
             if u.path == "/api/work/start" and self._server_mode():
                 self._json(_db_work_start(self._db_path(), self._token(data=data), data))
                 return
@@ -5513,6 +5598,17 @@ def _select_local_session(args) -> dict:
     if not matches:
         raise SystemExit("Aktiivset work_session'it ei leitud. Vaata: aitrack work status")
     raise SystemExit("Mitu aktiivset sessiooni sobib. Anna --session-id.")
+
+
+def cmd_watchdog(args, cfg):
+    _require_server_cfg(cfg)
+    payload = {"stale_minutes": int(getattr(args, "stale_minutes", 10) or 10)}
+    body = _server_post("watchdog", payload, cfg)
+    if not body or not body.get("ok"):
+        raise SystemExit(f"watchdog ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+    print(f"Watchdog: stale_minutes={body.get('stale_minutes')} marked={body.get('marked_count', 0)}")
+    for s in body.get("sessions", []):
+        print(f"  {s.get('work_session_uid')}  {s.get('user')}  {s.get('project_key')}  {s.get('summary')}  last_seen={s.get('last_seen_at')}")
 
 
 def cmd_tick(args, cfg):
