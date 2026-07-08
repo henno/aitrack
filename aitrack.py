@@ -2383,6 +2383,54 @@ def _db_work_session_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
     return sorted(out, key=lambda r: (r[1], r[7]))
 
 
+def _safe_day_prompt_snippet(text: str, limit: int = 140) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    s = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-[redacted]", s)
+    s = re.sub(r"(?i)\b(token|password|secret|api[_-]?key)\s*[:=]\s*\S+", r"\1=[redacted]", s)
+    return s[:limit - 1] + "…" if len(s) > limit else s
+
+
+def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
+                              existing_rows: list[list], cfg: dict | None = None) -> list[list]:
+    tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg)
+    target = dt.date.fromisoformat(date)
+    start_utc = dt.datetime.combine(target, dt.time.min, tzinfo=dt.timezone.utc) - dt.timedelta(hours=14)
+    end_utc = dt.datetime.combine(target + dt.timedelta(days=1), dt.time.min, tzinfo=dt.timezone.utc) + dt.timedelta(hours=14)
+    rows = conn.execute("""
+        SELECT pe.*, p.project_key, p.name AS project_name
+        FROM prompt_events pe
+        LEFT JOIN projects p ON p.id = pe.project_id
+        WHERE pe.user_id = ? AND pe.started_at >= ? AND pe.started_at < ?
+        ORDER BY pe.started_at
+    """, (int(user["id"]), start_utc.isoformat(), end_utc.isoformat())).fetchall()
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        started = parse_iso(r["started_at"])
+        if not started:
+            continue
+        local = hour_floor(started.astimezone(tz))
+        if local.date() != target:
+            continue
+        hour = _hour_label_from_local(local)
+        g = grouped.setdefault(hour, {"date": date, "hour": hour, "projects": [], "prompts": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
+        project = r["project_name"] or r["project_key"] or r["project"] or "(promptid)"
+        if project and project not in g["projects"]:
+            g["projects"].append(project)
+        snippet = _safe_day_prompt_snippet(r["prompt_text"])
+        if snippet and snippet not in g["prompts"] and len(g["prompts"]) < 8:
+            g["prompts"].append(snippet)
+        tool = str(r["tool"] or "").strip()
+        if tool and tool not in g["tools"]:
+            g["tools"].append(tool)
+    out = []
+    for g in grouped.values():
+        key = f"k:{g['utc'].isoformat()}|__prompt_event__"
+        prompts = "; ".join(g["prompts"])
+        out.append([g["date"], g["hour"], "; ".join(g["projects"]), f"Promptid: {prompts}" if prompts else "",
+                    _NA, _NA, ", ".join(g["tools"]), key])
+    return sorted(out, key=lambda r: (r[1], r[7]))
+
+
 def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) -> list[list]:
     by_hour = {r[1]: r for r in rows}
     for d in derived:
@@ -2410,8 +2458,10 @@ def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None)
         ).fetchall()
         rows = [[r["date"], r["hour"], r["objekt"], r["saavutus"], r["takistus"],
                  r["teadmine"], r["tool"], r["row_key"]] for r in rows_db]
-        derived = _db_work_session_day_rows(conn, user, date, rows, cfg)
-    return _merge_day_rows_with_work_sessions(rows, derived)
+        derived_work = _db_work_session_day_rows(conn, user, date, rows, cfg)
+        rows = _merge_day_rows_with_work_sessions(rows, derived_work)
+        derived_prompts = _db_prompt_event_day_rows(conn, user, date, rows, cfg)
+    return _merge_day_rows_with_work_sessions(rows, derived_prompts)
 
 
 def _db_days(path: Path, token: str) -> list[str]:

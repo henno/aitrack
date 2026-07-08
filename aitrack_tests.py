@@ -565,9 +565,13 @@ A._db_ingest_rows(sdb, tok, [["2026-06-16", "10:00–11:00", "obj", "saav", "tak
 check("server keys sisaldab ingestitud võtit", A._db_keys(sdb, tok) == {"k:server:1"})
 check("server day row loetav", A._db_rows_for_day(sdb, tok, "2026-06-16")[0][2] == "obj")
 A._db_ingest_events(sdb, tok, [{"event_key": "e1", "tool": "Pi", "project": "/proj", "prompt_text": "tee", "started_at": HFL(10).isoformat(), "ended_at": HFL(10).isoformat(), "duration_seconds": 60}])
+A._db_ingest_rows(sdb, tok, [["2026-06-16", "11:00–12:00", "(1 prompt, automaatkokkuvõte puudub)", "(1 prompt, automaatkokkuvõte puudub)", "Ei olnud", "Ei olnud", "Pi"]], ["k:2026-06-16T11:00:00+00:00|__hour__"])
+A._db_ingest_events(sdb, tok, [{"event_key": "e2", "tool": "Pi", "project": "/proj", "prompt_text": "tee nähtav päevavaate kokkuvõte", "started_at": HFL(11).isoformat(), "ended_at": HFL(11).isoformat(), "duration_seconds": 60}])
+prompt_day_rows = A._db_rows_for_day(sdb, tok, "2026-06-16")
 with A._db_connect(sdb) as conn:
     ev_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
-check("server salvestas prompt-eventi", ev_count == 1)
+check("server salvestas prompt-eventi", ev_count == 2)
+check("serveri päevavaade asendab prompt placeholderi prompt-eventi tekstiga", any("tee nähtav päevavaate kokkuvõte" in r[3] for r in prompt_day_rows))
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
 print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")
