@@ -643,6 +643,7 @@ start_page = A._start_page_html()
 check("activity leht kutsub /api/activity endpointi", "/api/activity" in activity_page and "work_session_uid" in activity_page)
 check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in activity_page and "class=\"small path\"" in activity_page)
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
+check("activity leht sisaldab raw event timeline'i", "Raw eventid" in activity_page and "renderRawEvents" in activity_page and "raw_events" in activity_page)
 server_start_page = A._start_page_html(server_mode=True)
 check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server token" not in server_start_page and "credentials:'same-origin'" in server_start_page and "const SERVER_MODE = true" in server_start_page)
 check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)
@@ -721,6 +722,7 @@ raw_event = {
 raw_res1 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_res2 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_export = A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["before_tool_call"]})
+raw_activity = A._db_activity_log(rdb, rtok, {"period": ["2026-06"]})
 with A._db_connect(rdb) as conn:
     raw_count = conn.execute("SELECT COUNT(*) AS c FROM raw_events").fetchone()["c"]
     prompt_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
@@ -728,6 +730,7 @@ exported_raw = raw_export["events"][0] if raw_export["events"] else {}
 check("raw event sisestus on idempotentne", raw_res1["raw_events"]["inserted"] == 1 and raw_res2["raw_events"]["inserted"] == 0 and raw_count == 1)
 check("raw event ei tekita legacy prompt-eventi", prompt_count == 0)
 check("raw export leiab sündmuse ja seob work_session_uid-ga", raw_export["count"] == 1 and exported_raw.get("work_session_uid") == rstart["work_session_uid"] and exported_raw.get("work_session_id") == rstart["work_session_id"])
+check("activity helper tagastab raw event timeline'i", len(raw_activity.get("raw_events", [])) == 1 and any(x.get("type") == "raw_event" for x in raw_activity.get("activity", [])))
 check("raw payload on piiratud ja saladus redigeeritud", "SALA" not in exported_raw.get("payload_json", "") and len(exported_raw.get("payload_json", "")) <= A.RAW_EVENT_PAYLOAD_MAX_BYTES)
 check("raw export filter töötab", A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["after_tool_call"]})["count"] == 0)
 

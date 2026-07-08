@@ -2242,11 +2242,15 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         session_args: list = [end_iso, start_iso]
         prompt_where = ["pe.started_at >= ?", "pe.started_at < ?"]
         prompt_args: list = [start_iso, end_iso]
+        raw_where = ["re.occurred_at_utc >= ?", "re.occurred_at_utc < ?"]
+        raw_args: list = [start_iso, end_iso]
         if user["role"] != "admin":
             session_where.append("ws.user_id = ?")
             session_args.append(int(user["id"]))
             prompt_where.append("pe.user_id = ?")
             prompt_args.append(int(user["id"]))
+            raw_where.append("re.user_id = ?")
+            raw_args.append(int(user["id"]))
         sessions = conn.execute(f"""
             SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
                    wi.title AS work_title, p.project_key, p.name AS project_name,
@@ -2274,6 +2278,20 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             ORDER BY pe.started_at DESC
             LIMIT ?
         """, (*prompt_args, limit)).fetchall()
+        raw_rows = conn.execute(f"""
+            SELECT re.*, u.name AS user_name, ws.session_uid AS linked_session_uid,
+                   ws.local_path AS session_local_path, ws.cwd AS session_cwd,
+                   p.project_key, p.name AS project_name, i.issue_key
+            FROM raw_events re
+            JOIN users u ON u.id = re.user_id
+            LEFT JOIN work_sessions ws ON ws.id = re.work_session_id
+            LEFT JOIN work_items wi ON wi.id = ws.work_item_id
+            LEFT JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(raw_where)}
+            ORDER BY re.occurred_at_utc DESC, re.id DESC
+            LIMIT ?
+        """, (*raw_args, limit)).fetchall()
     session_items = []
     activity = []
     for r in sessions:
@@ -2328,9 +2346,38 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         }
         prompt_items.append(item)
         activity.append({**item, "at": r["started_at"], "label": "prompt_event"})
+    raw_items = []
+    for r in raw_rows:
+        item = {
+            "type": "raw_event",
+            "id": int(r["id"]),
+            "user": r["user_name"],
+            "event_type": r["event_type"],
+            "tool": r["tool_name"] or "",
+            "tool_name": r["tool_name"] or "",
+            "tool_call_id": r["tool_call_id"] or "",
+            "event_key": r["event_key"] or "",
+            "agent_uid": r["agent_uid"] or "",
+            "parent_agent_uid": r["parent_agent_uid"] or "",
+            "work_session_uid": r["work_session_uid"] or r["linked_session_uid"] or "",
+            "work_session_id": int(r["work_session_id"]) if r["work_session_id"] is not None else None,
+            "project": r["project_name"] or "",
+            "project_key": r["project_key"] or "",
+            "issue": f"#{r['issue_key']}" if r["issue_key"] else "",
+            "issue_key": r["issue_key"] or "",
+            "occurred_at_utc": r["occurred_at_utc"],
+            "received_at_utc": r["received_at_utc"],
+            "local_path": r["session_local_path"] or "",
+            "cwd": r["session_cwd"] or "",
+            "payload_json": r["payload_json"],
+            "summary": r["event_type"],
+        }
+        raw_items.append(item)
+        activity.append({**item, "at": r["occurred_at_utc"], "label": "raw_event"})
     activity.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
     return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
-            "sessions": session_items, "prompt_events": prompt_items, "activity": activity[:limit]}
+            "sessions": session_items, "prompt_events": prompt_items, "raw_events": raw_items,
+            "activity": activity[:limit]}
 
 
 def _hour_label_from_local(local: dt.datetime) -> str:
@@ -4254,6 +4301,10 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
     <h2>Prompt-eventid</h2>
     <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Kestus</th><th>Prompt</th></tr></thead><tbody id="promptsBody"></tbody></table>
   </section>
+  <section class="panel">
+    <h2>Raw eventid</h2>
+    <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Event</th><th>Agent/tool</th><th>Session</th><th>Payload</th></tr></thead><tbody id="rawEventsBody"></tbody></table>
+  </section>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -4279,6 +4330,7 @@ function renderMetrics(data) {
   $('metrics').innerHTML = `
     <div class="metric"><span class="small">Work session'id</span><b>${(data.sessions || []).length}</b></div>
     <div class="metric"><span class="small">Prompt-eventid</span><b>${(data.prompt_events || []).length}</b></div>
+    <div class="metric"><span class="small">Raw eventid</span><b>${(data.raw_events || []).length}</b></div>
     <div class="metric"><span class="small">Minutid</span><b>${minutes}</b></div>
     <div class="metric"><span class="small">Periood</span><b style="font-size:16px">${esc(data.period || '')}</b></div>`;
 }
@@ -4286,7 +4338,9 @@ function renderActivity(rows) {
   $('activityBody').innerHTML = rows.length ? rows.map(x => {
     const body = x.type === 'prompt_event'
       ? `<pre>${esc(x.prompt_text || '')}</pre>`
-      : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
+      : x.type === 'raw_event'
+        ? `${esc(x.event_type || '')}<div class="small">${esc(x.agent_uid || '')}</div>`
+        : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
     return `<tr><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td></tr>`;
   }).join('') : '<tr><td class="empty" colspan="6">Tegevusi pole.</td></tr>';
 }
@@ -4311,11 +4365,22 @@ function renderPrompts(rows) {
     <td data-label="Prompt"><pre>${esc(x.prompt_text || '')}</pre></td>
   </tr>`).join('') : '<tr><td class="empty" colspan="6">Prompt-evente pole.</td></tr>';
 }
+function renderRawEvents(rows) {
+  $('rawEventsBody').innerHTML = rows.length ? rows.map(x => `<tr>
+    <td data-label="Aeg">${fmtTime(x.occurred_at_utc)}</td>
+    <td data-label="Kasutaja">${esc(x.user || '')}</td>
+    <td data-label="Event"><span class="pill">${esc(x.event_type || '')}</span><div class="small">${esc(x.event_key || '')}</div></td>
+    <td data-label="Agent/tool">${esc(x.agent_uid || '')}<div class="small">${esc(x.tool_name || x.tool || '')}${x.tool_call_id ? ' · ' + esc(x.tool_call_id) : ''}</div></td>
+    <td data-label="Session"><code>${esc(x.work_session_uid || '')}</code></td>
+    <td data-label="Payload"><pre>${esc(x.payload_json || '')}</pre></td>
+  </tr>`).join('') : '<tr><td class="empty" colspan="6">Raw evente pole.</td></tr>';
+}
 function renderWaiting(message) {
   $('metrics').innerHTML = '';
   $('activityBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
   $('sessionsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
   $('promptsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
+  $('rawEventsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
 }
 async function loadActivity() {
   const date = $('dateInput').value;
@@ -4323,7 +4388,7 @@ async function loadActivity() {
   setStatus('Laen…');
   try {
     const data = await api('/api/activity?date=' + encodeURIComponent(date) + '&limit=' + encodeURIComponent(limit));
-    renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []);
+    renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []); renderRawEvents(data.raw_events || []);
     setStatus('Laetud');
   } catch (e) {
     renderWaiting(e.message || 'Päring ebaõnnestus');
