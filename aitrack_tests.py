@@ -577,6 +577,9 @@ check("serveri päevavaade asendab prompt placeholderi tegevuslausega", any("Teg
 check("serveri päevavaade tuletab promptidest uued teadmised", any(r[5] != A._NA for r in prompt_day_rows if r[1] == "11:00–12:00"))
 check("praktikapäeviku heuristika täidab takistuse/teadmise", A._infer_takistus_from_texts(["paranda activity mittekuvamine"]) != A._NA and A._infer_teadmine_from_texts(["selgita heartbeat mudelit"]) != A._NA)
 check("praktikapäeviku takistuse heuristika ei pea failiteed/faili veaks", A._infer_takistus_from_texts(["näita activity vaates failitee issue all", "ava claude.md fail"]) == A._NA)
+learn_tail = A._infer_teadmine_from_texts(["kas tailscale töötab?", "kuidas ta saab minu võrku tulla?"])
+learn_gnome = A._infer_teadmine_from_texts(["mis gnome mul on?", "tõmba https://github.com/daveprowse/Draw-On-Gnome"])
+check("praktikapäeviku teadmise heuristika annab loetava teksti", "Selgus, kas" not in learn_tail and "Tailscale" in learn_tail and "https://" not in learn_gnome)
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
 print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")

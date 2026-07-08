@@ -2606,34 +2606,64 @@ def _unique_limited(items: list[str], limit: int) -> list[str]:
     return out
 
 
+def _domain_learning_sentences(texts: list[str]) -> list[str]:
+    """Tee promptide kobarast loetavad õpitu-laused, mitte toorpromptide parafraasid."""
+    combined = " ".join(_safe_day_prompt_snippet(t, 500).lower() for t in texts)
+    out: list[str] = []
+
+    def add(sentence: str) -> None:
+        if sentence not in out:
+            out.append(sentence)
+
+    if "tailscale" in combined:
+        add("Täpsustus Tailscale'i võrguühenduse ja võrgu jagamise kohta.")
+    if "gnome" in combined or "draw-on-gnome" in combined or "draw on gnome" in combined:
+        add("Selgus GNOME töökeskkond ning ekraanile joonistamise tööriista kasutus.")
+    if any(x in combined for x in ("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick")):
+        add("Täpsustus, kuidas aitrack seob promptid tööseansi, tickide ja heartbeat'idega.")
+    if any(x in combined for x in ("hook", "tool-call", "alam-agent", "subagent", "hangumise")):
+        add("Täpsustus alamagentide, hookide ja hangumise tuvastamise kohta.")
+    if any(x in combined for x in ("server token", "servertoken", "login", "parool", "rate limiter", "ip ban")):
+        add("Täpsustus serveri sisselogimise ja kaitsemehhanismide kohta.")
+    if any(x in combined for x in ("raw_events", "raw event", "activity", "päevavaade", "praktikapäeviku")):
+        add("Täpsustus aitracki tegevuslogi, activity-vaate ja praktikapäeviku vormingu kohta.")
+    return out
+
+
 def _learning_sentence_from_text(text: str) -> str:
     topic = _topic_from_work_text(text, 120)
     if not topic:
         return ""
     low = topic.lower()
+    if re.search(r"https?://", low) or low in {"ava", "installi see", "kuidas kasutada"}:
+        return ""
     prefix_map = [
         ("selgita", "Täpsustus"), ("aruta", "Täpsustusid valikud"),
-        ("täpsusta", "Täpsustus"), ("uuri", "Selgus"),
-        ("kontrolli", "Kontrolli käigus selgus"),
+        ("täpsusta", "Täpsustus"), ("uuri", "Selgitati välja"),
+        ("kontrolli", "Kontrolliti"),
     ]
     for prefix, lead in prefix_map:
         if low.startswith(prefix):
             rest = topic[len(prefix):].strip(" :,-") or topic
             return f"{lead}: {rest}."
-    for key, lead in (("kuidas", "Selgus, kuidas"), ("miks", "Selgus, miks"),
-                      ("mis", "Selgus, mis"), ("kas", "Selgus, kas")):
+    question_map = (("kuidas", "Täpsustus töövõtte kohta"), ("miks", "Täpsustus põhjuse kohta"),
+                    ("mis", "Selgitati välja"), ("kas", "Kontrolliti"))
+    for key, lead in question_map:
         if low.startswith(key + " "):
-            return f"{lead} {topic[len(key):].strip(' :,-')}."
+            return f"{lead}: {topic[len(key):].strip(' :,-')}."
         marker = f" {key} "
         if marker in low:
             rest = topic[low.index(marker) + len(marker):].strip(" :,-")
-            return f"{lead} {rest}."
+            return f"{lead}: {rest}."
     if any(low.startswith(v) for v in ("lisa", "paranda", "muuda", "koosta", "deploy", "paigalda", "installi")):
-        return f"Täpsustus praktiline lahenduskäik: {topic}."
-    return f"Töö käigus täpsustus: {topic}."
+        return ""
+    return f"Täpsustus: {topic}."
 
 
 def _infer_teadmine_from_texts(texts: list[str]) -> str:
+    domain = _unique_limited(_domain_learning_sentences(texts), 2)
+    if domain:
+        return _cell_safe("; ".join(domain)[:400])
     sentences = _unique_limited([_learning_sentence_from_text(t) for t in texts], 2)
     return _cell_safe("; ".join(sentences)[:400]) if sentences else _NA
 
