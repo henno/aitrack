@@ -2444,6 +2444,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         activity.append({**item, "at": r["started_at"], "label": "prompt_event"})
     raw_items = []
     for r in raw_rows:
+        payload_preview, payload_truncated, payload_bytes = _payload_preview_json(r["payload_json"])
         item = {
             "type": "raw_event",
             "id": int(r["id"]),
@@ -2465,7 +2466,9 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "received_at_utc": r["received_at_utc"],
             "local_path": r["session_local_path"] or "",
             "cwd": r["session_cwd"] or "",
-            "payload_json": r["payload_json"],
+            "payload_json": payload_preview,
+            "payload_truncated": payload_truncated,
+            "payload_bytes": payload_bytes,
             "summary": r["event_type"],
         }
         raw_items.append(item)
@@ -2760,9 +2763,9 @@ def _blocker_sentence_from_text(text: str) -> str:
     if "serveri url" in low or "token puudu" in low or "ligipääs hetzner" in low:
         return "Serveri ühenduse andmed ja ligipääs vajasid täpsustamist."
     if "hang" in low:
-        return "Tuli arvestada hangumise tuvastamise ja heartbeat'i usaldusväärsusega."
+        return "Tuli arvestada sellega, kuidas tuvastada seisma jäänud AI-abiprotsessi."
     if "failitee" in low and ("mittekuv" in low or "ei kuvat" in low):
-        return "Activity vaates ei kuvanud failitee õigesti."
+        return "Tegevuste vaates ei kuvanud failitee õigesti."
     if "mittekuv" in low or "ei kuvat" in low:
         return f"Kuvamise probleem vajas parandamist: {topic}."
     if low.startswith("paranda"):
@@ -3019,6 +3022,14 @@ def _raw_event_payload_json(e: dict) -> str:
         return text
     prefix = text.encode("utf-8")[:RAW_EVENT_PAYLOAD_MAX_BYTES // 2].decode("utf-8", "ignore")
     return json.dumps({"_truncated": True, "prefix": prefix}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _payload_preview_json(text: str, max_chars: int = 1200) -> tuple[str, bool, int]:
+    raw = str(text or "")
+    size = len(raw.encode("utf-8"))
+    if len(raw) <= max_chars:
+        return raw, False, size
+    return raw[:max_chars] + f"...[truncated {len(raw) - max_chars} chars]", True, size
 
 
 def _raw_event_dedup_key(e: dict, event_type: str, occurred_at: str, tool_call_id: str) -> str:
