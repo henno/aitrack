@@ -81,6 +81,10 @@ kõik ühe vooluga:
 | `aitrack tick` | Saada kõigi aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
 | `https://SERVER/activity` | Serveri veebivaade work session'ite, prompt-eventide ja tegevuste vaatamiseks. |
 | `aitrack install --minute-tracking` | Lisa tavapärase tunniajasti kõrvale OS-i iga-minuti tick timer. |
+| `aitrack install --pi-extension` | Paigalda globaalne Pi extension, mis saadab prompt/tool-call raw evente enne ja pärast tööriistu. |
+| `aitrack watchdog --stale-minutes N --stuck-minutes N` | Märgi progressita või liiga kaua tooli sees olevad sessioonid `stale`/`stuck` olekusse. |
+| `aitrack cleanup --older-than 90d [--apply]` | Retention cleanup: raw eventid ja rollupitud vanad minute tickid; vaikimisi dry-run. |
+| `aitrack events status/flush` | Lokaalse offline raw-event outboxi olek ja uuestisaatmine. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
@@ -174,10 +178,21 @@ liigsed päringud, korduvad valed login'id ja tüüpilised probe'id (`/.env`, `/
 saavad ajutise IP-ban'i.
 
 Harnessi/hookide jaoks salvestab server append-only `raw_events` ridu. Saada batch `POST /api/events`
-kaudu (`events: [...]`) ja ekspordi neid `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id
-piiratakse ning tüüpilised token/parool/saladuse võtmed redigeeritakse enne talletamist. Work-session'id ja
-sleep-gap'e arvestavad aktiivsed intervallid on eksporditavad `GET /api/export/work-sessions` ja
-`GET /api/export/active-intervals` endpointidest.
+kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/api/prompt/done`,
+`/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Ekspordi raw evente
+`GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id piiratakse ning tüüpilised token/parool/saladuse
+võtmed redigeeritakse enne talletamist. `before_tool_call` uuendab jooksva tooli välja ja watchdog saab
+näidata `stuck` sessioone. Work-session'id ja sleep-gap'e arvestavad aktiivsed intervallid on eksporditavad
+`GET /api/export/work-sessions` ja `GET /api/export/active-intervals` endpointidest; intervallid lõigatakse
+päringu perioodipiiride järgi.
+
+Pi automaatjälgimiseks:
+
+```bash
+aitrack connect --url https://aitrack.example.com --token TOKEN
+aitrack install --minute-tracking --pi-extension
+# Pi sees: /reload või ava uus pi session
+```
 
 Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 

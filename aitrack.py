@@ -669,6 +669,39 @@ def _local_update_work_session(ref, **fields) -> None:
         )
 
 
+def _process_start_time(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    if _platform() == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+            # /proc stat: starttime on 22. väli, aga comm võib sisaldada tühikuid; split pärast viimast ')'.
+            rest = stat.rsplit(")", 1)[1].strip().split()
+            return rest[19] if len(rest) > 19 else ""
+        except OSError:
+            return ""
+    try:
+        os.kill(pid, 0)
+        return "alive"
+    except OSError:
+        return ""
+
+
+def _owner_still_alive(session: dict) -> bool:
+    raw_pid = session.get("owner_pid")
+    if raw_pid in (None, ""):
+        return True
+    try:
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return False
+    current = _process_start_time(pid)
+    if not current:
+        return False
+    expected = str(session.get("owner_start") or "")
+    return not expected or expected == current or expected == "alive"
+
+
 # --- platvormiülene lukk (väldib paralleelseid run'e) -----------------------
 LOCK_STALE_SECONDS = 7200  # peab ületama halvima järelejõudmis-puhangu
 
@@ -1570,6 +1603,17 @@ def _db_init(path: Path) -> None:
           result TEXT NOT NULL DEFAULT '',
           billable INTEGER NOT NULL DEFAULT 1,
           summary TEXT NOT NULL DEFAULT '',
+          last_progress_at TEXT,
+          current_tool_name TEXT NOT NULL DEFAULT '',
+          current_tool_call_id TEXT NOT NULL DEFAULT '',
+          current_tool_started_at TEXT,
+          agent_uid TEXT NOT NULL DEFAULT '',
+          parent_agent_uid TEXT NOT NULL DEFAULT '',
+          owner_pid INTEGER,
+          owner_start TEXT NOT NULL DEFAULT '',
+          owner_command TEXT NOT NULL DEFAULT '',
+          owner_cli TEXT NOT NULL DEFAULT '',
+          status_detail TEXT NOT NULL DEFAULT '',
           minutes_final INTEGER,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
@@ -1670,6 +1714,17 @@ def _db_init(path: Path) -> None:
         _db_add_column_if_missing(conn, "work_sessions", "session_uid", "TEXT")
         conn.execute("UPDATE work_sessions SET session_uid = 'ws_legacy_' || id WHERE session_uid IS NULL OR session_uid = ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS work_sessions_session_uid_idx ON work_sessions(session_uid)")
+        _db_add_column_if_missing(conn, "work_sessions", "last_progress_at", "TEXT")
+        _db_add_column_if_missing(conn, "work_sessions", "current_tool_name", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "current_tool_call_id", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "current_tool_started_at", "TEXT")
+        _db_add_column_if_missing(conn, "work_sessions", "agent_uid", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "parent_agent_uid", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "owner_pid", "INTEGER")
+        _db_add_column_if_missing(conn, "work_sessions", "owner_start", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "owner_command", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "owner_cli", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "work_sessions", "status_detail", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "work_sessions", "rollup_finalized_at", "TEXT")
         _db_add_column_if_missing(conn, "prompt_events", "project_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "issue_id", "INTEGER REFERENCES issues(id) ON DELETE SET NULL")
@@ -1965,13 +2020,25 @@ def _db_work_start(path: Path, token: str, payload: dict) -> dict:
             checkout_id = hashlib.sha1(f"{graph['project_id']}|{local_path}".encode("utf-8", errors="replace")).hexdigest()[:16]
         summary = str(work.get("summary") or work.get("title") or payload.get("title") or "")
         billable = 1 if bool(work.get("billable", payload.get("billable", True))) else 0
+        owner_pid = session.get("owner_pid")
+        try:
+            owner_pid_i = int(owner_pid) if owner_pid not in (None, "") else None
+        except (TypeError, ValueError):
+            owner_pid_i = None
+        agent_uid = str(session.get("agent_uid") or payload.get("agent_uid") or "")
+        parent_agent_uid = str(session.get("parent_agent_uid") or payload.get("parent_agent_uid") or "")
+        owner_start = str(session.get("owner_start") or "")
+        owner_command = str(session.get("owner_command") or "")[:500]
+        owner_cli = str(session.get("owner_cli") or tool)
         session_uid = _new_work_session_uid()
         cur = conn.execute(
             "INSERT INTO work_sessions(session_uid, work_item_id, user_id, device_id, project_checkout_id, checkout_id, tool, "
-            "local_path, cwd, branch, started_at, last_seen_at, status, billable, summary, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            "local_path, cwd, branch, started_at, last_seen_at, last_progress_at, status, billable, summary, "
+            "agent_uid, parent_agent_uid, owner_pid, owner_start, owner_command, owner_cli, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_uid, graph["work_item_id"], int(user["id"]), graph["device_id"], graph["checkout_row_id"],
-             checkout_id, tool, local_path, cwd, branch, started_at, started_at, billable, summary, now, now),
+             checkout_id, tool, local_path, cwd, branch, started_at, started_at, started_at, billable, summary,
+             agent_uid, parent_agent_uid, owner_pid_i, owner_start, owner_command, owner_cli, now, now),
         )
         session_id = int(cur.lastrowid)
         return {"ok": True, "work_session_uid": session_uid, "work_session_id": session_id,
@@ -2017,7 +2084,7 @@ def _db_work_tick(path: Path, token: str, payload: dict) -> dict:
             (session_id, int(row["work_item_id"]), int(user["id"]), minute,
              str(payload.get("source") or "heartbeat"), now),
         )
-        conn.execute("UPDATE work_sessions SET last_seen_at = ?, updated_at = ? WHERE id = ?", (minute, now, session_id))
+        conn.execute("UPDATE work_sessions SET last_seen_at = ?, last_progress_at = ?, updated_at = ? WHERE id = ?", (minute, minute, now, session_id))
         return {"ok": True, "work_session_uid": session_uid, "work_session_id": session_id,
                 "minute_start_utc": minute}
 
@@ -2346,6 +2413,13 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     _db_init(path)
     start_iso, end_iso, label = _activity_bounds(q)
     limit = max(1, min(int(_qval(q, "limit") or 200), 1000))
+    user_filter = _qval(q, "user")
+    project_filter = _qval(q, "project_key") or _qval(q, "project")
+    issue_filter = _normalise_issue_key(_qval(q, "issue"))
+    tool_filter = _qval(q, "tool")
+    status_filter = _qval(q, "status")
+    agent_filter = _qval(q, "agent_uid") or _qval(q, "agent_id")
+    event_type_filter = _qval(q, "event_type")
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
         session_where = ["ws.started_at < ?", "COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ?"]
@@ -2361,6 +2435,47 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             prompt_args.append(int(user["id"]))
             raw_where.append("re.user_id = ?")
             raw_args.append(int(user["id"]))
+        elif user_filter:
+            session_where.append("u.name = ?")
+            session_args.append(user_filter)
+            prompt_where.append("u.name = ?")
+            prompt_args.append(user_filter)
+            raw_where.append("u.name = ?")
+            raw_args.append(user_filter)
+        if project_filter:
+            session_where.append("p.project_key = ?")
+            session_args.append(project_filter)
+            prompt_where.append("(p.project_key = ? OR pe.project = ?)")
+            prompt_args.extend([project_filter, project_filter])
+            raw_where.append("p.project_key = ?")
+            raw_args.append(project_filter)
+        if issue_filter:
+            session_where.append("i.issue_key = ?")
+            session_args.append(issue_filter)
+            prompt_where.append("i.issue_key = ?")
+            prompt_args.append(issue_filter)
+            raw_where.append("i.issue_key = ?")
+            raw_args.append(issue_filter)
+        if tool_filter:
+            session_where.append("ws.tool = ?")
+            session_args.append(tool_filter)
+            prompt_where.append("pe.tool = ?")
+            prompt_args.append(tool_filter)
+            raw_where.append("re.tool_name = ?")
+            raw_args.append(tool_filter)
+        if status_filter:
+            session_where.append("ws.status = ?")
+            session_args.append(status_filter)
+            raw_where.append("ws.status = ?")
+            raw_args.append(status_filter)
+        if agent_filter:
+            session_where.append("ws.agent_uid = ?")
+            session_args.append(agent_filter)
+            raw_where.append("re.agent_uid = ?")
+            raw_args.append(agent_filter)
+        if event_type_filter:
+            raw_where.append("re.event_type = ?")
+            raw_args.append(event_type_filter)
         sessions = conn.execute(f"""
             SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
                    wi.title AS work_title, p.project_key, p.name AS project_name,
@@ -2427,6 +2542,13 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
             "last_seen_at": r["last_seen_at"],
+            "last_progress_at": r["last_progress_at"] or "",
+            "current_tool_name": r["current_tool_name"] or "",
+            "current_tool_call_id": r["current_tool_call_id"] or "",
+            "current_tool_started_at": r["current_tool_started_at"] or "",
+            "status_detail": r["status_detail"] or "",
+            "agent_uid": r["agent_uid"] or "",
+            "parent_agent_uid": r["parent_agent_uid"] or "",
             "minutes": minutes,
             "tick_count": tick_count,
             "local_path": r["local_path"] or "",
@@ -3081,6 +3203,66 @@ def _raw_event_work_session_id(conn: sqlite3.Connection, user_id: int, work_sess
     return int(row["id"]) if row is not None else None
 
 
+_PROGRESS_EVENT_TYPES = {
+    "prompt_started", "prompt_finished", "agent_started", "agent_heartbeat", "agent_finished",
+    "before_tool_call", "after_tool_call", "tool_output", "tool_error", "subagent_started",
+    "subagent_heartbeat", "subagent_finished", "turn_start", "turn_end",
+}
+
+
+def _db_apply_raw_event_progress_conn(conn: sqlite3.Connection, work_session_id: int | None, event_type: str,
+                                      occurred_at: str, e: dict, now: str) -> None:
+    if work_session_id is None:
+        return
+    event_type = str(event_type or "")
+    tool_name = _event_text(e, "tool_name", "tool")
+    tool_call_id = _event_text(e, "tool_call_id", "call_id")
+    agent_uid = _event_text(e, "agent_uid", "agent_id")
+    parent_agent_uid = _event_text(e, "parent_agent_uid", "parent_agent_id")
+    updates: dict[str, object] = {"updated_at": now, "id": int(work_session_id)}
+    clauses = []
+    if event_type in _PROGRESS_EVENT_TYPES:
+        clauses.append("last_seen_at = CASE WHEN last_seen_at IS NULL OR last_seen_at < :occurred THEN :occurred ELSE last_seen_at END")
+        clauses.append("last_progress_at = CASE WHEN last_progress_at IS NULL OR last_progress_at < :occurred THEN :occurred ELSE last_progress_at END")
+        updates["occurred"] = occurred_at
+    if agent_uid:
+        clauses.append("agent_uid = CASE WHEN agent_uid = '' THEN :agent_uid ELSE agent_uid END")
+        updates["agent_uid"] = agent_uid
+    if parent_agent_uid:
+        clauses.append("parent_agent_uid = CASE WHEN parent_agent_uid = '' THEN :parent_agent_uid ELSE parent_agent_uid END")
+        updates["parent_agent_uid"] = parent_agent_uid
+    if event_type == "before_tool_call":
+        clauses.extend([
+            "current_tool_name = :tool_name",
+            "current_tool_call_id = :tool_call_id",
+            "current_tool_started_at = :occurred",
+            "status_detail = :status_detail",
+        ])
+        updates.update({"tool_name": tool_name, "tool_call_id": tool_call_id,
+                        "status_detail": f"tool_running:{tool_name}" if tool_name else "tool_running",
+                        "occurred": occurred_at})
+    elif event_type in {"after_tool_call", "tool_error"}:
+        clauses.extend(["current_tool_name = ''", "current_tool_call_id = ''", "current_tool_started_at = NULL"])
+        if event_type == "tool_error":
+            clauses.append("status_detail = :status_detail")
+            updates["status_detail"] = f"tool_error:{tool_name}" if tool_name else "tool_error"
+    elif event_type in {"session_orphaned", "session_marked_orphan"}:
+        clauses.extend(["status = 'orphan'", "status_detail = :status_detail"])
+        updates["status_detail"] = "owner process missing"
+    elif event_type in {"session_stale", "session_marked_stale"}:
+        clauses.extend(["status = 'stale'", "status_detail = :status_detail"])
+        updates["status_detail"] = "watchdog stale"
+    elif event_type in {"agent_marked_stuck", "subagent_stuck"}:
+        clauses.extend(["status = 'stuck'", "status_detail = :status_detail"])
+        updates["status_detail"] = f"tool stuck:{tool_name}" if tool_name else "stuck"
+    elif event_type == "agent_recovered":
+        clauses.extend(["status = CASE WHEN status IN ('stuck','stale','orphan') THEN 'active' ELSE status END",
+                        "status_detail = ''"])
+    if clauses:
+        clauses.append("updated_at = :updated_at")
+        conn.execute(f"UPDATE work_sessions SET {', '.join(clauses)} WHERE id = :id", updates)
+
+
 def _db_insert_raw_event_conn(conn: sqlite3.Connection, user_id: int, e: dict, now: str,
                               *, work_session_id: int | None = None) -> bool:
     event_type = _event_text(e, "event_type", "type", "name") or "event"
@@ -3101,7 +3283,10 @@ def _db_insert_raw_event_conn(conn: sqlite3.Connection, user_id: int, e: dict, n
          event_type, _event_text(e, "tool_name", "tool"), tool_call_id, event_key, dedup_key,
          occurred_at, now, _raw_event_payload_json(e)),
     )
-    return bool(cur.rowcount)
+    inserted = bool(cur.rowcount)
+    if inserted:
+        _db_apply_raw_event_progress_conn(conn, work_session_id, event_type, occurred_at, e, now)
+    return inserted
 
 
 def _db_ingest_raw_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, events: list[dict], now: str) -> dict:
@@ -3112,25 +3297,8 @@ def _db_ingest_raw_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, even
         if not isinstance(e, dict):
             ignored += 1
             continue
-        event_type = _event_text(e, "event_type", "type", "name") or "event"
-        occurred_at = _raw_event_occurred_at(e, now)
-        work_session_uid = _event_text(e, "work_session_uid", "session_uid")
-        tool_call_id = _event_text(e, "tool_call_id", "call_id")
-        event_key = _event_text(e, "event_key", "event_uid", "id")
-        dedup_key = _raw_event_dedup_key(e, event_type, occurred_at, tool_call_id)
-        work_session_id = _raw_event_work_session_id(conn, int(user["id"]), work_session_uid)
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO raw_events "
-            "(user_id, work_session_id, work_session_uid, agent_uid, parent_agent_uid, event_type, tool_name, "
-            "tool_call_id, event_key, dedup_key, occurred_at_utc, received_at_utc, payload_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (int(user["id"]), work_session_id, work_session_uid,
-             _event_text(e, "agent_uid", "agent_id"), _event_text(e, "parent_agent_uid", "parent_agent_id"),
-             event_type, _event_text(e, "tool_name", "tool"), tool_call_id, event_key, dedup_key,
-             occurred_at, now, _raw_event_payload_json(e)),
-        )
         accepted += 1
-        if cur.rowcount:
+        if _db_insert_raw_event_conn(conn, int(user["id"]), e, now):
             inserted += 1
         else:
             ignored += 1
@@ -3139,7 +3307,7 @@ def _db_ingest_raw_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, even
 
 def _looks_like_legacy_prompt_event(e: dict) -> bool:
     event_type = str(e.get("event_type") or "")
-    return "prompt_text" in e and event_type in ("", "prompt_event", "prompt_finished")
+    return "prompt_text" in e and event_type in ("", "prompt_event", "prompt_started", "prompt_finished")
 
 
 def _db_ingest_legacy_prompt_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, events: list[dict], now: str) -> dict:
@@ -3153,26 +3321,52 @@ def _db_ingest_legacy_prompt_events_conn(conn: sqlite3.Connection, user: sqlite3
         if not key:
             ignored += 1
             continue
+        user_id = int(user["id"])
         project_raw = str(e.get("project", ""))
-        ctx = _project_context(project_raw or ".")
-        project_id = _db_upsert_project(conn, {
-            "project_key": ctx["project_key"], "repo_url": ctx["repo_url"],
-            "name": ctx["name"], "local_path": ctx["local_path"],
-        }, now)
+        project_id = None
         issue_id = None
-        if ctx.get("issue_key"):
-            issue_id = _db_upsert_issue(conn, project_id, {
-                "provider": ctx.get("issue_provider") or "local", "issue_key": ctx.get("issue_key")
-            }, ctx.get("issue_provider") or "local", now)
+        work_item_id = None
+        work_session_id = _raw_event_work_session_id(conn, user_id, _event_text(e, "work_session_uid", "session_uid"))
+        if work_session_id is not None:
+            link = conn.execute(
+                "SELECT ws.work_item_id, wi.project_id, wi.issue_id FROM work_sessions ws "
+                "JOIN work_items wi ON wi.id = ws.work_item_id WHERE ws.id = ? AND ws.user_id = ?",
+                (work_session_id, user_id),
+            ).fetchone()
+            if link is not None:
+                work_item_id = int(link["work_item_id"])
+                project_id = int(link["project_id"])
+                issue_id = int(link["issue_id"]) if link["issue_id"] is not None else None
+        if project_id is None:
+            project_payload = e.get("project") if isinstance(e.get("project"), dict) else {}
+            if project_payload:
+                project_id = _db_upsert_project(conn, project_payload, now)
+                project_raw = str(project_payload.get("local_path") or project_payload.get("project_key") or project_raw)
+                issue_payload = e.get("issue") if isinstance(e.get("issue"), dict) else {}
+                issue_key = _normalise_issue_key(str(e.get("issue_key") or issue_payload.get("issue_key") or issue_payload.get("key") or ""))
+                if issue_key:
+                    issue_payload = {**issue_payload, "issue_key": issue_key}
+                default_provider = str(issue_payload.get("provider") or _issue_provider_for_project_key(str(project_payload.get("project_key") or "")))
+                issue_id = _db_upsert_issue(conn, project_id, issue_payload, default_provider, now)
+            else:
+                ctx = _project_context(project_raw or ".", str(e.get("issue_key") or ""))
+                project_id = _db_upsert_project(conn, {
+                    "project_key": ctx["project_key"], "repo_url": ctx["repo_url"],
+                    "name": ctx["name"], "local_path": ctx["local_path"],
+                }, now)
+                if ctx.get("issue_key"):
+                    issue_id = _db_upsert_issue(conn, project_id, {
+                        "provider": ctx.get("issue_provider") or "local", "issue_key": ctx.get("issue_key")
+                    }, ctx.get("issue_provider") or "local", now)
         cur = conn.execute(
             "INSERT OR IGNORE INTO prompt_events "
             "(user_id, event_key, tool, project, prompt_text, started_at, ended_at, duration_seconds, "
-            "created_at, project_id, issue_id, confidence, payload_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user["id"], key, str(e.get("tool", e.get("tool_name", ""))), project_raw,
-             str(e.get("prompt_text", "")), str(e.get("started_at", "")),
-             str(e.get("ended_at", "")), int(e.get("duration_seconds") or 0), now,
-             project_id, issue_id, float(e.get("confidence") or 0.5),
+            "created_at, project_id, issue_id, work_item_id, work_session_id, confidence, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, key, str(e.get("tool", e.get("tool_name", ""))), project_raw,
+             str(e.get("prompt_text", "")), str(e.get("started_at", e.get("occurred_at_utc", ""))),
+             str(e.get("ended_at", e.get("occurred_at_utc", ""))), int(e.get("duration_seconds") or 0), now,
+             project_id, issue_id, work_item_id, work_session_id, float(e.get("confidence") or 0.5),
              json.dumps(_raw_event_payload_value(e), ensure_ascii=False, sort_keys=True)),
         )
         accepted += 1
@@ -3193,63 +3387,180 @@ def _db_ingest_events(path: Path, token: str, events: list[dict]) -> dict:
     return {"ok": True, "raw_events": raw, "prompt_events": prompts}
 
 
+def _event_from_endpoint_payload(payload: dict, event_type: str) -> dict:
+    base = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+    event = {k: v for k, v in base.items() if k != "token"}
+    event["event_type"] = event_type
+    event.setdefault("occurred_at_utc", _now_utc().isoformat())
+    if "tool" in event and "tool_name" not in event:
+        event["tool_name"] = event.get("tool")
+    if event_type in {"prompt_started", "prompt_finished"} and "prompt_text" not in event:
+        prompt = str(event.get("prompt") or event.get("summary") or "")
+        if prompt:
+            event["prompt_text"] = _safe_day_prompt_snippet(prompt, 500)
+            event.setdefault("tool", event.get("tool_name") or event.get("tool") or "")
+            event.setdefault("project", event.get("cwd") or event.get("local_path") or "")
+            event.setdefault("started_at", event.get("occurred_at_utc"))
+            event.setdefault("ended_at", event.get("occurred_at_utc"))
+            event.setdefault("duration_seconds", 0)
+            event.setdefault("event_key", hashlib.sha1(
+                f"{event_type}|{event.get('work_session_uid','')}|{event.get('agent_uid','')}|{event.get('occurred_at_utc','')}".encode("utf-8", errors="replace")
+            ).hexdigest())
+    return event
+
+
+def _db_ingest_event_endpoint(path: Path, token: str, payload: dict, event_type: str) -> dict:
+    return _db_ingest_events(path, token, [_event_from_endpoint_payload(payload, event_type)])
+
+
 def _db_watchdog(path: Path, token: str, payload: dict) -> dict:
-    """Mark active work sessions stale when they have no heartbeat/progress for too long."""
+    """Mark active work sessions stale/stuck when heartbeat or tool progress disappears."""
     _db_init(path)
     stale_minutes = max(1, int(payload.get("stale_minutes") or payload.get("minutes") or 10))
+    stuck_minutes = max(1, int(payload.get("stuck_minutes") or 10))
     now_dt = _now_utc()
     now = now_dt.isoformat()
-    cutoff = (now_dt - dt.timedelta(minutes=stale_minutes)).isoformat()
+    stale_cutoff = (now_dt - dt.timedelta(minutes=stale_minutes)).isoformat()
+    stuck_cutoff = (now_dt - dt.timedelta(minutes=stuck_minutes)).isoformat()
     marked = []
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        where = ["ws.status = 'active'", "COALESCE(ws.last_seen_at, ws.started_at) < ?"]
-        args: list = [cutoff]
+        scope = []
+        scope_args: list = []
         if user["role"] != "admin":
-            where.append("ws.user_id = ?")
-            args.append(int(user["id"]))
-        rows = conn.execute(f"""
-            SELECT ws.*, u.name AS user_name, p.project_key, p.name AS project_name,
-                   i.issue_key, wi.title AS work_title
-            FROM work_sessions ws
-            JOIN users u ON u.id = ws.user_id
-            JOIN work_items wi ON wi.id = ws.work_item_id
-            JOIN projects p ON p.id = wi.project_id
-            LEFT JOIN issues i ON i.id = wi.issue_id
-            WHERE {' AND '.join(where)}
-            ORDER BY COALESCE(ws.last_seen_at, ws.started_at)
-        """, tuple(args)).fetchall()
-        for r in rows:
-            last_seen = r["last_seen_at"] or r["started_at"]
+            scope.append("ws.user_id = ?")
+            scope_args.append(int(user["id"]))
+
+        def select_rows(extra_where: list[str], args: list) -> list[sqlite3.Row]:
+            where = [*extra_where, *scope]
+            return conn.execute(f"""
+                SELECT ws.*, u.name AS user_name, p.project_key, p.name AS project_name,
+                       i.issue_key, wi.title AS work_title
+                FROM work_sessions ws
+                JOIN users u ON u.id = ws.user_id
+                JOIN work_items wi ON wi.id = ws.work_item_id
+                JOIN projects p ON p.id = wi.project_id
+                LEFT JOIN issues i ON i.id = wi.issue_id
+                WHERE {' AND '.join(where)}
+                ORDER BY COALESCE(ws.last_progress_at, ws.last_seen_at, ws.started_at)
+            """, tuple(args + scope_args)).fetchall()
+
+        candidates = []
+        candidates.extend(("stuck", r) for r in select_rows(
+            ["ws.status = 'active'", "ws.current_tool_started_at IS NOT NULL", "ws.current_tool_started_at < ?"],
+            [stuck_cutoff],
+        ))
+        candidates.extend(("stale", r) for r in select_rows(
+            ["ws.status = 'active'", "COALESCE(ws.last_progress_at, ws.last_seen_at, ws.started_at) < ?"],
+            [stale_cutoff],
+        ))
+        seen_ids: set[int] = set()
+        for kind, r in candidates:
+            rid = int(r["id"])
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            last_progress = r["last_progress_at"] or r["last_seen_at"] or r["started_at"]
+            event_type = "agent_marked_stuck" if kind == "stuck" else "session_stale"
+            detail = "watchdog stuck" if kind == "stuck" else "watchdog stale"
             event = {
-                "event_key": f"watchdog:session_stale:{r['session_uid']}:{last_seen}",
-                "event_type": "session_stale",
+                "event_key": f"watchdog:{event_type}:{r['session_uid']}:{last_progress}",
+                "event_type": event_type,
                 "work_session_uid": r["session_uid"],
+                "agent_uid": r["agent_uid"] or "",
+                "tool_name": r["current_tool_name"] or "aitrack-watchdog",
+                "tool_call_id": r["current_tool_call_id"] or "",
                 "occurred_at_utc": now,
-                "tool_name": "aitrack-watchdog",
                 "payload": {
                     "stale_minutes": stale_minutes,
-                    "cutoff": cutoff,
-                    "last_seen_at": last_seen,
+                    "stuck_minutes": stuck_minutes,
+                    "stale_cutoff": stale_cutoff,
+                    "stuck_cutoff": stuck_cutoff,
+                    "last_progress_at": last_progress,
+                    "current_tool_started_at": r["current_tool_started_at"],
                     "previous_status": r["status"],
                 },
             }
-            _db_insert_raw_event_conn(conn, int(r["user_id"]), event, now, work_session_id=int(r["id"]))
-            conn.execute("UPDATE work_sessions SET status = 'stale', result = COALESCE(NULLIF(result, ''), 'watchdog stale'), updated_at = ? WHERE id = ?",
-                         (now, int(r["id"])))
+            _db_insert_raw_event_conn(conn, int(r["user_id"]), event, now, work_session_id=rid)
+            conn.execute(
+                "UPDATE work_sessions SET status = ?, result = COALESCE(NULLIF(result, ''), ?), "
+                "status_detail = ?, updated_at = ? WHERE id = ?",
+                (kind, detail, detail, now, rid),
+            )
             marked.append({
-                "work_session_id": int(r["id"]),
+                "work_session_id": rid,
                 "work_session_uid": r["session_uid"],
                 "user": r["user_name"],
                 "project_key": r["project_key"],
                 "issue_key": r["issue_key"] or "",
                 "tool": r["tool"],
                 "summary": r["summary"] or r["work_title"],
-                "last_seen_at": last_seen,
-                "status": "stale",
+                "last_seen_at": r["last_seen_at"] or "",
+                "last_progress_at": last_progress,
+                "current_tool_name": r["current_tool_name"] or "",
+                "status": kind,
             })
-    return {"ok": True, "stale_minutes": stale_minutes, "cutoff": cutoff,
-            "marked_count": len(marked), "sessions": marked}
+    return {"ok": True, "stale_minutes": stale_minutes, "stuck_minutes": stuck_minutes,
+            "cutoff": stale_cutoff, "stale_cutoff": stale_cutoff, "stuck_cutoff": stuck_cutoff,
+            "marked_count": len(marked), "marked_stale_count": sum(1 for x in marked if x["status"] == "stale"),
+            "marked_stuck_count": sum(1 for x in marked if x["status"] == "stuck"), "sessions": marked}
+
+
+def _duration_to_days(value: str | int | None, default_days: int) -> int:
+    if isinstance(value, int):
+        return max(1, value)
+    text = str(value or "").strip().lower()
+    if not text:
+        return default_days
+    m = re.fullmatch(r"(\d+)\s*([dhm]?)", text)
+    if not m:
+        return default_days
+    n = int(m.group(1))
+    unit = m.group(2) or "d"
+    if unit == "m":
+        return max(1, (n + 1439) // 1440)
+    if unit == "h":
+        return max(1, (n + 23) // 24)
+    return max(1, n)
+
+
+def _db_cleanup(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    raw_days = _duration_to_days(payload.get("raw_older_than") or payload.get("older_than"), 180)
+    tick_days = _duration_to_days(payload.get("ticks_older_than") or payload.get("older_than"), 90)
+    apply = bool(payload.get("apply") or payload.get("confirm"))
+    now_dt = _now_utc()
+    raw_cutoff = (now_dt - dt.timedelta(days=raw_days)).isoformat()
+    tick_cutoff = (now_dt - dt.timedelta(days=tick_days)).isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        raw_where = ["occurred_at_utc < ?"]
+        raw_args: list = [raw_cutoff]
+        tick_where = ["mt.minute_start_utc < ?", "ws.rollup_finalized_at IS NOT NULL"]
+        tick_args: list = [tick_cutoff]
+        if user["role"] != "admin":
+            raw_where.append("user_id = ?")
+            raw_args.append(int(user["id"]))
+            tick_where.append("mt.user_id = ?")
+            tick_args.append(int(user["id"]))
+        raw_count = conn.execute(f"SELECT COUNT(*) AS c FROM raw_events WHERE {' AND '.join(raw_where)}", tuple(raw_args)).fetchone()["c"]
+        tick_count = conn.execute(f"""
+            SELECT COUNT(*) AS c FROM minute_ticks mt
+            JOIN work_sessions ws ON ws.id = mt.work_session_id
+            WHERE {' AND '.join(tick_where)}
+        """, tuple(tick_args)).fetchone()["c"]
+        if apply:
+            conn.execute(f"DELETE FROM raw_events WHERE {' AND '.join(raw_where)}", tuple(raw_args))
+            conn.execute(f"""
+                DELETE FROM minute_ticks
+                WHERE id IN (
+                  SELECT mt.id FROM minute_ticks mt
+                  JOIN work_sessions ws ON ws.id = mt.work_session_id
+                  WHERE {' AND '.join(tick_where)}
+                )
+            """, tuple(tick_args))
+    return {"ok": True, "dry_run": not apply, "raw_cutoff": raw_cutoff, "tick_cutoff": tick_cutoff,
+            "raw_events": int(raw_count or 0), "minute_ticks": int(tick_count or 0)}
 
 
 def _db_export_work_sessions(path: Path, token: str, q: dict) -> dict:
@@ -3315,6 +3626,13 @@ def _db_export_work_sessions(path: Path, token: str, q: dict) -> dict:
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
             "last_seen_at": r["last_seen_at"],
+            "last_progress_at": r["last_progress_at"] or "",
+            "current_tool_name": r["current_tool_name"] or "",
+            "current_tool_call_id": r["current_tool_call_id"] or "",
+            "current_tool_started_at": r["current_tool_started_at"] or "",
+            "agent_uid": r["agent_uid"] or "",
+            "parent_agent_uid": r["parent_agent_uid"] or "",
+            "status_detail": r["status_detail"] or "",
             "minutes": _work_session_minutes(r, tick_count),
             "tick_count": tick_count,
             "interval_minutes": int(r["interval_minutes"] or 0),
@@ -3360,7 +3678,14 @@ def _db_export_active_intervals(path: Path, token: str, q: dict) -> dict:
             LIMIT ?
         """, (*args, limit)).fetchall()
     intervals = []
+    bound_start = parse_iso(start_iso) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    bound_end = parse_iso(end_iso) or dt.datetime.max.replace(tzinfo=dt.timezone.utc)
     for r in rows:
+        raw_start = parse_iso(r["start_minute_utc"])
+        raw_end = parse_iso(r["end_minute_utc"])
+        clipped_start = max(raw_start or bound_start, bound_start)
+        clipped_end = min(raw_end or bound_end, bound_end)
+        clipped_minutes = max(0, int((clipped_end - clipped_start).total_seconds() // 60))
         intervals.append({
             "id": int(r["id"]),
             "work_session_id": int(r["work_session_id"]),
@@ -3374,9 +3699,11 @@ def _db_export_active_intervals(path: Path, token: str, q: dict) -> dict:
             "tool": r["tool"],
             "status": r["status"],
             "summary": r["summary"] or r["issue_title"] or "",
-            "start_minute_utc": r["start_minute_utc"],
-            "end_minute_utc": r["end_minute_utc"],
-            "minutes": int(r["minutes"] or 0),
+            "start_minute_utc": clipped_start.isoformat(),
+            "end_minute_utc": clipped_end.isoformat(),
+            "original_start_minute_utc": r["start_minute_utc"],
+            "original_end_minute_utc": r["end_minute_utc"],
+            "minutes": clipped_minutes,
             "source": r["source"],
         })
     return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
@@ -3480,6 +3807,78 @@ def _server_post(op: str, payload: dict, cfg: dict) -> dict | None:
     except Exception as e:  # noqa: BLE001
         log(f"server sink: POST /api/{op} ebaõnnestus: {e}")
         return None
+
+
+def _local_enqueue_events(events: list[dict], error: str = "") -> int:
+    if not events:
+        return 0
+    _local_db_init()
+    now = _now_utc().isoformat()
+    inserted = 0
+    with _local_db_connect() as conn:
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_uid = str(event.get("event_key") or event.get("event_uid") or event.get("id") or "")
+            if not event_uid:
+                raw = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+                event_uid = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
+                event["event_key"] = event_uid
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO local_event_outbox(event_uid, work_session_uid, event_type, occurred_at, payload_json, last_error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_uid, str(event.get("work_session_uid") or ""), str(event.get("event_type") or "event"),
+                 str(event.get("occurred_at_utc") or event.get("occurred_at") or now),
+                 json.dumps(event, ensure_ascii=False, sort_keys=True, default=str), error[:500], now, now),
+            )
+            inserted += int(bool(cur.rowcount))
+    return inserted
+
+
+def _flush_event_outbox(cfg: dict, *, limit: int = 100) -> dict:
+    _require_server_cfg(cfg)
+    _local_db_init()
+    with _local_db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM local_event_outbox WHERE ack_at IS NULL ORDER BY occurred_at, id LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()
+    if not rows:
+        return {"ok": True, "sent": 0, "remaining": 0}
+    events = []
+    ids = []
+    for r in rows:
+        try:
+            events.append(json.loads(r["payload_json"]))
+            ids.append(int(r["id"]))
+        except json.JSONDecodeError:
+            ids.append(int(r["id"]))
+    body = _server_post("events", {"events": events}, cfg) if events else {"ok": True}
+    now = _now_utc().isoformat()
+    if body and body.get("ok"):
+        with _local_db_connect() as conn:
+            conn.executemany("UPDATE local_event_outbox SET sent_at = ?, ack_at = ?, updated_at = ? WHERE id = ?",
+                             [(now, now, now, i) for i in ids])
+        with _local_db_connect() as conn:
+            remaining = conn.execute("SELECT COUNT(*) AS c FROM local_event_outbox WHERE ack_at IS NULL").fetchone()["c"]
+        return {"ok": True, "sent": len(ids), "remaining": int(remaining or 0)}
+    err = str(body.get("error") if isinstance(body, dict) else "server ei vastanud")
+    with _local_db_connect() as conn:
+        conn.executemany("UPDATE local_event_outbox SET retry_count = retry_count + 1, last_error = ?, updated_at = ? WHERE id = ?",
+                         [(err[:500], now, i) for i in ids])
+    return {"ok": False, "sent": 0, "remaining": len(ids), "error": err}
+
+
+def _post_events_or_enqueue(events: list[dict], cfg: dict) -> dict:
+    try:
+        _flush_event_outbox(cfg, limit=50)
+    except SystemExit:
+        pass
+    body = _server_post("events", {"events": events}, cfg)
+    if body and body.get("ok"):
+        return body
+    _local_enqueue_events(events, str(body.get("error") if isinstance(body, dict) else "server ei vastanud"))
+    return {"ok": False, "queued": len(events)}
 
 
 def _server_append_rows(rows: list[list], keys: list[str], cfg: dict) -> bool:
@@ -4872,6 +5271,11 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 <main>
   <section class="panel toolbar">
     <label>Kuupäev <input type="date" id="dateInput"></label>
+    <label>Projekt <input id="projectInput" placeholder="project_key"></label>
+    <label>Issue <input id="issueInput" placeholder="#123" style="width:90px"></label>
+    <label>Tool <input id="toolInput" placeholder="pi" style="width:90px"></label>
+    <label>Status <input id="statusInput" placeholder="active/stale" style="width:110px"></label>
+    <label>Agent <input id="agentInput" placeholder="agent_uid" style="width:130px"></label>
     <label>Piir <input type="number" id="limitInput" value="200" min="1" max="1000" style="width:90px"></label>
     <button onclick="loadActivity()">Ava</button>
     <span class="status" id="status"></span>
@@ -4938,9 +5342,9 @@ function renderSessions(rows) {
     <td data-label="Aeg">${fmtTime(x.started_at)}<div class="small">${x.ended_at ? fmtTime(x.ended_at) : 'aktiivne / lõpp puudub'}</div></td>
     <td data-label="Kasutaja">${esc(x.user || '')}<div class="small">${esc(x.device || '')}</div></td>
     <td data-label="Projekt">${projectLabel(x)}</td>
-    <td data-label="Staatus"><span class="pill">${esc(x.status || '')}</span><div class="small">${esc(x.result || '')}</div></td>
+    <td data-label="Staatus"><span class="pill">${esc(x.status || '')}</span><div class="small">${esc(x.status_detail || x.result || '')}</div></td>
     <td data-label="Min">${esc(x.minutes || 0)}<div class="small">ticke ${esc(x.tick_count || 0)}</div></td>
-    <td data-label="Kokkuvõte">${esc(x.summary || '')}</td>
+    <td data-label="Kokkuvõte">${esc(x.summary || '')}${x.current_tool_name ? '<div class="small">Tool: ' + esc(x.current_tool_name) + ' · ' + fmtTime(x.current_tool_started_at) + '</div>' : ''}${x.agent_uid ? '<div class="small">Agent: ' + esc(x.agent_uid) + '</div>' : ''}</td>
   </tr>`).join('') : '<tr><td class="empty" colspan="7">Sessioone pole.</td></tr>';
 }
 function renderPrompts(rows) {
@@ -4971,11 +5375,17 @@ function renderWaiting(message) {
   $('rawEventsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
 }
 async function loadActivity() {
-  const date = $('dateInput').value;
-  const limit = $('limitInput').value || '200';
+  const params = new URLSearchParams();
+  params.set('date', $('dateInput').value || '');
+  params.set('limit', $('limitInput').value || '200');
+  if ($('projectInput').value) params.set('project_key', $('projectInput').value);
+  if ($('issueInput').value) params.set('issue', $('issueInput').value);
+  if ($('toolInput').value) params.set('tool', $('toolInput').value);
+  if ($('statusInput').value) params.set('status', $('statusInput').value);
+  if ($('agentInput').value) params.set('agent_uid', $('agentInput').value);
   setStatus('Laen…');
   try {
-    const data = await api('/api/activity?date=' + encodeURIComponent(date) + '&limit=' + encodeURIComponent(limit));
+    const data = await api('/api/activity?' + params.toString());
     renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []); renderRawEvents(data.raw_events || []);
     setStatus('Laetud');
   } catch (e) {
@@ -5341,8 +5751,23 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 events = data.get("events") if isinstance(data.get("events"), list) else []
                 self._json(_db_ingest_events(self._db_path(), self._token(data=data), events))
                 return
+            event_endpoints = {
+                "/api/prompt/start": "prompt_started",
+                "/api/prompt/done": "prompt_finished",
+                "/api/agent/heartbeat": "agent_heartbeat",
+                "/api/agent/tool-start": "before_tool_call",
+                "/api/agent/tool-end": "after_tool_call",
+                "/api/agent/start": "agent_started",
+                "/api/agent/done": "agent_finished",
+            }
+            if u.path in event_endpoints and self._server_mode():
+                self._json(_db_ingest_event_endpoint(self._db_path(), self._token(data=data), data, event_endpoints[u.path]))
+                return
             if u.path == "/api/watchdog" and self._server_mode():
                 self._json(_db_watchdog(self._db_path(), self._token(data=data), data))
+                return
+            if u.path == "/api/cleanup" and self._server_mode():
+                self._json(_db_cleanup(self._db_path(), self._token(data=data), data))
                 return
             if u.path == "/api/work/start" and self._server_mode():
                 self._json(_db_work_start(self._db_path(), self._token(data=data), data))
@@ -5506,6 +5931,10 @@ def _work_payload_from_args(args, cfg: dict, *, summary: str = "") -> tuple[dict
         "platform": client.get("platform", _platform()), "checkout_id": ctx["checkout_id"],
         "tool": tool, "cwd": ctx["cwd"], "local_path": ctx["local_path"], "branch": ctx["branch"],
     }
+    for key in ("agent_uid", "parent_agent_uid", "owner_pid", "owner_start", "owner_command", "owner_cli"):
+        value = getattr(args, key, None)
+        if value not in (None, ""):
+            session[key] = value
     issue = {"provider": ctx.get("issue_provider") or "local", "issue_key": issue_key} if issue_key else {}
     payload = {"project": project, "issue": issue, "session": session,
                "work": {"title": title, "summary": title, "billable": not getattr(args, "non_billable", False)},
@@ -5551,6 +5980,8 @@ def cmd_work(args, cfg):
             "work_item_id": body.get("work_item_id"), "status": "active",
             "summary": summary, "project_key": ctx["project_key"], "issue_key": ctx.get("issue_key", ""),
             "checkout_id": ctx["checkout_id"], "tool": tool, "client_id": client["client_id"],
+            "owner_pid": payload["session"].get("owner_pid"), "owner_start": payload["session"].get("owner_start", ""),
+            "owner_command": payload["session"].get("owner_command", ""), "owner_cli": payload["session"].get("owner_cli", tool),
             "started_at": payload["started_at"], "state_key": _work_state_key(client["client_id"], ctx["checkout_id"], tool),
         })
         _save_work_state(state)
@@ -5617,13 +6048,142 @@ def _select_local_session(args) -> dict:
 
 def cmd_watchdog(args, cfg):
     _require_server_cfg(cfg)
-    payload = {"stale_minutes": int(getattr(args, "stale_minutes", 10) or 10)}
+    payload = {"stale_minutes": int(getattr(args, "stale_minutes", 10) or 10),
+               "stuck_minutes": int(getattr(args, "stuck_minutes", 10) or 10)}
     body = _server_post("watchdog", payload, cfg)
     if not body or not body.get("ok"):
         raise SystemExit(f"watchdog ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
-    print(f"Watchdog: stale_minutes={body.get('stale_minutes')} marked={body.get('marked_count', 0)}")
+    print(f"Watchdog: stale_minutes={body.get('stale_minutes')} stuck_minutes={body.get('stuck_minutes')} marked={body.get('marked_count', 0)}")
     for s in body.get("sessions", []):
-        print(f"  {s.get('work_session_uid')}  {s.get('user')}  {s.get('project_key')}  {s.get('summary')}  last_seen={s.get('last_seen_at')}")
+        print(f"  {s.get('work_session_uid')}  {s.get('status')}  {s.get('user')}  {s.get('project_key')}  {s.get('summary')}  last_progress={s.get('last_progress_at')}")
+
+
+def cmd_cleanup(args, cfg):
+    _require_server_cfg(cfg)
+    payload = {"older_than": getattr(args, "older_than", ""), "apply": bool(getattr(args, "apply", False))}
+    body = _server_post("cleanup", payload, cfg)
+    if not body or not body.get("ok"):
+        raise SystemExit(f"cleanup ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+    mode = "KUSTUTATUD" if not body.get("dry_run") else "dry-run"
+    print(f"Cleanup {mode}: raw_events={body.get('raw_events', 0)} minute_ticks={body.get('minute_ticks', 0)}")
+    if body.get("dry_run"):
+        print("Päris kustutamiseks lisa --apply")
+
+
+def cmd_events(args, cfg):
+    if args.events_cmd == "flush":
+        res = _flush_event_outbox(cfg, limit=getattr(args, "limit", 100))
+        print(f"Outbox flush: sent={res.get('sent', 0)} remaining={res.get('remaining', 0)}")
+        if not res.get("ok"):
+            raise SystemExit(res.get("error") or "flush ebaõnnestus")
+        return
+    if args.events_cmd == "status":
+        _local_db_init()
+        with _local_db_connect() as conn:
+            pending = conn.execute("SELECT COUNT(*) AS c FROM local_event_outbox WHERE ack_at IS NULL").fetchone()["c"]
+            failed = conn.execute("SELECT COUNT(*) AS c FROM local_event_outbox WHERE ack_at IS NULL AND retry_count > 0").fetchone()["c"]
+        print(f"Outbox: pending={pending} failed={failed}")
+        return
+
+
+def _hook_owner_start(owner_pid) -> str:
+    try:
+        pid = int(owner_pid)
+    except (TypeError, ValueError):
+        return ""
+    return _process_start_time(pid)
+
+
+def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tuple[dict | None, dict]:
+    _require_server_cfg(cfg)
+    ctx = _project_context(getattr(args, "cwd", None) or ".", getattr(args, "issue", None))
+    tool = _detect_cli(getattr(args, "tool", None) or "pi")
+    active = _active_work_sessions(tool=tool, checkout_id=ctx["checkout_id"])
+    if active:
+        return active[0], ctx
+    if not start_if_missing:
+        return None, ctx
+    summary = _safe_day_prompt_snippet(getattr(args, "summary", None) or getattr(args, "prompt", "") or "AI agenti töö", 180)
+    ns = argparse.Namespace(cwd=ctx["cwd"], issue=getattr(args, "issue", None), tool=tool,
+                            summary=[summary], non_billable=False,
+                            agent_uid=getattr(args, "agent_uid", ""), parent_agent_uid=getattr(args, "parent_agent_uid", ""),
+                            owner_pid=getattr(args, "owner_pid", None), owner_start=getattr(args, "owner_start", "") or _hook_owner_start(getattr(args, "owner_pid", None)),
+                            owner_command=getattr(args, "owner_command", ""), owner_cli=tool)
+    payload, ctx, client = _work_payload_from_args(ns, cfg, summary=summary)
+    body = _server_post("work/start", payload, cfg)
+    if not body or not body.get("ok"):
+        raise SystemExit(f"hook work start ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+    session_uid = str(body.get("work_session_uid") or body.get("work_session_id"))
+    session = {
+        "work_session_uid": session_uid, "work_session_id": body.get("work_session_id"),
+        "work_item_id": body.get("work_item_id"), "status": "active", "summary": summary,
+        "project_key": ctx["project_key"], "issue_key": ctx.get("issue_key", ""),
+        "checkout_id": ctx["checkout_id"], "tool": tool, "client_id": client["client_id"],
+        "owner_pid": payload["session"].get("owner_pid"), "owner_start": payload["session"].get("owner_start", ""),
+        "owner_command": payload["session"].get("owner_command", ""), "owner_cli": tool,
+        "started_at": payload["started_at"], "state_key": _work_state_key(client["client_id"], ctx["checkout_id"], tool),
+    }
+    state = _load_work_state()
+    state["sessions"] = [s for s in state.get("sessions", []) if not _session_ref_matches(s, session_uid)] + [session]
+    _save_work_state(state)
+    return session, ctx
+
+
+def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
+    now = _now_utc().isoformat()
+    session_uid = str((session or {}).get("work_session_uid") or getattr(args, "work_session_uid", "") or "")
+    tool_name = str(getattr(args, "tool_name", "") or getattr(args, "tool", "") or "pi")
+    tool_call_id = str(getattr(args, "tool_call_id", "") or "")
+    agent_uid = str(getattr(args, "agent_uid", "") or "")
+    event = {
+        "event_key": f"hook:{event_type}:{session_uid}:{agent_uid}:{tool_call_id}:{now}",
+        "event_type": event_type,
+        "work_session_uid": session_uid,
+        "agent_uid": agent_uid,
+        "parent_agent_uid": str(getattr(args, "parent_agent_uid", "") or ""),
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "occurred_at_utc": now,
+        "project": {"project_key": ctx.get("project_key", ""), "repo_url": ctx.get("repo_url", ""),
+                    "name": ctx.get("name", ""), "local_path": ctx.get("local_path", ""),
+                    "checkout_id": ctx.get("checkout_id", ""), "branch": ctx.get("branch", "")},
+        "issue_key": ctx.get("issue_key", ""),
+        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(getattr(args, "summary", "") or getattr(args, "prompt", "") or "", 300)},
+    }
+    if event_type in {"prompt_started", "prompt_finished"}:
+        event["prompt_text"] = _safe_day_prompt_snippet(getattr(args, "prompt", "") or getattr(args, "summary", "") or "", 500)
+        event["tool"] = tool_name
+        event["started_at"] = now
+        event["ended_at"] = now
+        event["duration_seconds"] = 0
+    return event
+
+
+def cmd_hook(args, cfg):
+    action = args.hook_cmd
+    start = action in {"prompt-start", "agent-start"}
+    session, ctx = _hook_get_or_start_session(args, cfg, start_if_missing=start)
+    event_map = {
+        "prompt-start": "prompt_started",
+        "agent-start": "agent_started",
+        "heartbeat": "agent_heartbeat",
+        "tool-start": "before_tool_call",
+        "tool-end": "tool_error" if getattr(args, "is_error", False) else "after_tool_call",
+        "agent-end": "agent_finished",
+        "prompt-done": "prompt_finished",
+        "session-shutdown": "session_shutdown",
+    }
+    event_type = event_map[action]
+    event = _hook_event(args, event_type, session, ctx)
+    res = _post_events_or_enqueue([event], cfg)
+    if action in {"prompt-start", "heartbeat", "tool-start"} and session:
+        tick_args = argparse.Namespace(session_id=session.get("work_session_uid"), tool=getattr(args, "tool", "pi"), cwd=ctx.get("cwd"), issue=ctx.get("issue_key"))
+        cmd_tick(tick_args, cfg)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": bool(res.get("ok") or res.get("queued")), "event_type": event_type,
+                          "work_session_uid": event.get("work_session_uid"), "queued": res.get("queued", 0)}, ensure_ascii=False))
+    else:
+        print(f"hook {event_type}: {event.get('work_session_uid') or '(session puudub)'}" + (" queued" if res.get("queued") else ""))
 
 
 def cmd_tick(args, cfg):
@@ -5637,6 +6197,18 @@ def cmd_tick(args, cfg):
     sent = 0
     for s in sessions:
         ref = _local_session_ref(s)
+        if not _owner_still_alive(s):
+            event = {
+                "event_key": f"local:session_orphaned:{ref}:{_now_utc().isoformat()}",
+                "event_type": "session_orphaned",
+                "work_session_uid": s.get("work_session_uid") or "",
+                "occurred_at_utc": _now_utc().isoformat(),
+                "tool_name": "aitrack",
+                "payload": {"owner_pid": s.get("owner_pid"), "owner_start": s.get("owner_start"), "owner_cli": s.get("owner_cli")},
+            }
+            _post_events_or_enqueue([event], cfg)
+            _local_update_work_session(ref, status="orphan", ended_at=_now_utc().isoformat())
+            continue
         payload = {"tick_at": _now_utc().isoformat(), "source": "heartbeat"}
         if s.get("work_session_uid"):
             payload["work_session_uid"] = s["work_session_uid"]
@@ -5725,6 +6297,92 @@ def cmd_init(args, cfg):
     print("  3. aitrack install             # seadista tunniajasti")
 
 
+def _pi_extension_text() -> str:
+    return r'''import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import process from "node:process";
+
+function runAitrack(args: string[], cwd: string) {
+  const res = spawnSync("aitrack", args, { cwd, encoding: "utf8", timeout: 8000, stdio: ["ignore", "pipe", "pipe"] });
+  if (res.error || res.status !== 0) {
+    // Ära katkesta kasutaja tool-call'i ainult tracking vea pärast.
+    const msg = String(res.error?.message || res.stderr || res.stdout || "aitrack hook failed").slice(0, 240);
+    console.warn(`[aitrack] ${msg}`);
+  }
+}
+
+function common(ctx: any, agentUid: string, prompt?: string): string[] {
+  return [
+    "--tool", "pi",
+    "--cwd", ctx.cwd || process.cwd(),
+    "--agent-uid", agentUid,
+    "--owner-pid", String(process.ppid || process.pid),
+    "--owner-command", process.argv.join(" ").slice(0, 500),
+    ...(prompt ? ["--prompt", prompt.slice(0, 500)] : []),
+  ];
+}
+
+export default function (pi: ExtensionAPI) {
+  let agentUid = `pi-${randomUUID()}`;
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    agentUid = `pi-${randomUUID()}`;
+    runAitrack(["hook", "prompt-start", ...common(ctx, agentUid, event.prompt)], ctx.cwd);
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    runAitrack(["hook", "agent-start", ...common(ctx, agentUid)], ctx.cwd);
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    runAitrack(["hook", "heartbeat", ...common(ctx, agentUid)], ctx.cwd);
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    // See hook jookseb enne päris tooli; aitrack event/tick saadetakse enne tööriista käivitamist.
+    runAitrack([
+      "hook", "tool-start",
+      ...common(ctx, agentUid),
+      "--tool-name", event.toolName || "",
+      "--tool-call-id", event.toolCallId || "",
+    ], ctx.cwd);
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    runAitrack([
+      "hook", "tool-end",
+      ...common(ctx, agentUid),
+      "--tool-name", event.toolName || "",
+      "--tool-call-id", event.toolCallId || "",
+      ...(event.isError ? ["--is-error"] : []),
+    ], ctx.cwd);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    runAitrack(["hook", "agent-end", ...common(ctx, agentUid)], ctx.cwd);
+    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid)], ctx.cwd);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    runAitrack(["hook", "session-shutdown", ...common(ctx, agentUid)], ctx.cwd);
+  });
+}
+'''
+
+
+def _install_pi_extension() -> Path:
+    ext_dir = HOME / ".pi" / "agent" / "extensions"
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    dst = ext_dir / "aitrack.ts"
+    dst.write_text(_pi_extension_text(), encoding="utf-8")
+    try:
+        os.chmod(dst, 0o600)
+    except OSError:
+        pass
+    return dst
+
+
 def cmd_install(args, cfg):
     if not CONFIG_FILE.exists():
         print("Hoiatus: config.json puudub. Jooksuta enne: aitrack init")
@@ -5737,6 +6395,10 @@ def cmd_install(args, cfg):
     elif eng == "none":
         log("install: HOIATUS — AI-CLI mootorit ei leitud; kokkuvõtted tulevad varurežiimis")
     install_scheduler(minute_tracking=getattr(args, "minute_tracking", False))
+    if getattr(args, "pi_extension", False):
+        dst = _install_pi_extension()
+        print(f"Pi extension paigaldatud: {dst}")
+        print("Pi sees käivita /reload või ava uus pi session.")
 
 
 def cmd_uninstall(args, cfg):
@@ -6013,9 +6675,55 @@ def main():
     tick.add_argument("--session-id", help="saada tick ainult sellele sessioonile (serveri ws_... id või legacy number)")
     tick.set_defaults(fn=cmd_tick)
 
-    wd = sub.add_parser("watchdog", help="märgi heartbeatita aktiivsed serveri sessioonid stale olekusse")
-    wd.add_argument("--stale-minutes", type=int, default=10, help="mitu minutit heartbeatita tähendab stale (vaikimisi 10)")
+    wd = sub.add_parser("watchdog", help="märgi heartbeatita aktiivsed serveri sessioonid stale/stuck olekusse")
+    wd.add_argument("--stale-minutes", type=int, default=10, help="mitu minutit progressita tähendab stale (vaikimisi 10)")
+    wd.add_argument("--stuck-minutes", type=int, default=10, help="mitu minutit pooleliolev tool tähendab stuck (vaikimisi 10)")
     wd.set_defaults(fn=cmd_watchdog)
+
+    cln = sub.add_parser("cleanup", help="retention cleanup raw_events/minute_ticks jaoks")
+    cln.add_argument("--older-than", default="90d", help="vanus, nt 90d/24h (vaikimisi 90d)")
+    cln.add_argument("--apply", action="store_true", help="tee kustutamine; vaikimisi ainult dry-run")
+    cln.set_defaults(fn=cmd_cleanup)
+
+    evs = sub.add_parser("events", help="lokaalse raw-event outboxi haldus")
+    evsub = evs.add_subparsers(dest="events_cmd", required=True)
+    evfl = evsub.add_parser("flush", help="saada pending eventid serverisse")
+    evfl.add_argument("--limit", type=int, default=100)
+    evfl.set_defaults(fn=cmd_events)
+    evst = evsub.add_parser("status", help="näita pending eventide arvu")
+    evst.set_defaults(fn=cmd_events)
+
+    hk = sub.add_parser("hook", help="harness hookide sisend (Pi/Claude adapterite jaoks)")
+    hksub = hk.add_subparsers(dest="hook_cmd", required=True)
+    def _hook_parser(name, help_text):
+        p = hksub.add_parser(name, help=help_text)
+        p.add_argument("--tool", default="pi")
+        p.add_argument("--cwd", default=".")
+        p.add_argument("--issue")
+        p.add_argument("--summary", default="")
+        p.add_argument("--prompt", default="")
+        p.add_argument("--agent-uid", dest="agent_uid", default="")
+        p.add_argument("--parent-agent-uid", dest="parent_agent_uid", default="")
+        p.add_argument("--tool-name", dest="tool_name", default="")
+        p.add_argument("--tool-call-id", dest="tool_call_id", default="")
+        p.add_argument("--owner-pid", dest="owner_pid")
+        p.add_argument("--owner-start", dest="owner_start", default="")
+        p.add_argument("--owner-command", dest="owner_command", default="")
+        p.add_argument("--is-error", action="store_true")
+        p.add_argument("--json", action="store_true")
+        p.set_defaults(fn=cmd_hook)
+        return p
+    for _name, _help in (
+        ("prompt-start", "prompt algas; loob vajadusel work_session'i"),
+        ("agent-start", "agent algas; loob vajadusel work_session'i"),
+        ("heartbeat", "agent heartbeat/progress"),
+        ("tool-start", "tool-call algab; saada enne tööriista"),
+        ("tool-end", "tool-call lõppes"),
+        ("agent-end", "agent lõppes"),
+        ("prompt-done", "prompt lõppes"),
+        ("session-shutdown", "harness session sulgus"),
+    ):
+        _hook_parser(_name, _help)
 
     wk = sub.add_parser("work", help="serveripõhine work_session ajamõõtmine")
     ws = wk.add_subparsers(dest="work_cmd", required=True)
@@ -6096,6 +6804,7 @@ def main():
 
     inst = sub.add_parser("install", help="seadista OS-i tunniajasti (systemd/launchd/Task Scheduler)")
     inst.add_argument("--minute-tracking", action="store_true", help="lisa ka aitrack tick iga minuti timer aktiivsete work_session'ite jaoks")
+    inst.add_argument("--pi-extension", action="store_true", help="paigalda globaalne Pi extension tool-call/raw-event trackinguks")
     inst.set_defaults(fn=cmd_install)
     sub.add_parser("uninstall", help="eemalda ajasti").set_defaults(fn=cmd_uninstall)
     sub.add_parser("status", help="näita seadistust ja tuvastatud logiallikaid").set_defaults(fn=cmd_status)

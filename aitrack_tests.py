@@ -795,5 +795,105 @@ check("watchdog lisab session_stale raw eventi", stale_events == 1 and stale_aga
 check("stale sessioon ei ole enam aktiivses work/status vaates", A._db_work_status(stdb, stok) == [])
 A._now_utc = lambda: dt.datetime.now(dt.timezone.utc)
 
+# ============ TEST 52: event endpointid seovad prompti ja tool progressi ==========
+print("TEST 52: event endpointid seovad prompti work_sessioniga ja uuendavad tool progressi")
+edb = CFG / "server-event-endpoint-test.db"
+edb.unlink(missing_ok=True)
+etok = A._db_add_user(edb, "eventuser")
+epayload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "event endpoint test", "summary": "events"},
+    "session": {"client_id": "client-event", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack", "agent_uid": "agent-a"},
+    "started_at": HFL(9).isoformat(),
+}
+estart = A._db_work_start(edb, etok, epayload)
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool": "pi", "prompt": "palun tee test", "occurred_at_utc": HFL(9).isoformat()}, "prompt_started")
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool_name": "read", "tool_call_id": "tc-1", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=3)).isoformat()}, "before_tool_call")
+activity_agent = A._db_activity_log(edb, etok, {"period": ["2026-06"], "agent_uid": ["agent-a"]})
+with A._db_connect(edb) as conn:
+    erow = conn.execute("SELECT current_tool_name, current_tool_call_id, agent_uid FROM work_sessions WHERE session_uid = ?", (estart["work_session_uid"],)).fetchone()
+    prompt_link = conn.execute("SELECT work_session_id FROM prompt_events WHERE event_key != ''").fetchone()
+check("prompt/start endpoint tekitab prompt_eventi ja seob sessiooniga", prompt_link is not None and prompt_link["work_session_id"] == estart["work_session_id"])
+check("tool-start endpoint uuendab jooksva tooli välja", erow["current_tool_name"] == "read" and erow["current_tool_call_id"] == "tc-1" and erow["agent_uid"] == "agent-a")
+check("activity agent filter leiab raw eventid", len(activity_agent.get("raw_events", [])) >= 2 and all(x.get("agent_uid") == "agent-a" for x in activity_agent.get("raw_events", [])))
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool_name": "read", "tool_call_id": "tc-1", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=4)).isoformat()}, "after_tool_call")
+with A._db_connect(edb) as conn:
+    cleared = conn.execute("SELECT current_tool_name FROM work_sessions WHERE session_uid = ?", (estart["work_session_uid"],)).fetchone()["current_tool_name"]
+check("tool-end endpoint puhastab jooksva tooli", cleared == "")
+
+# ============ TEST 53: watchdog tuvastab stuck tool-call'i ==========
+print("TEST 53: watchdog märgib pika poolelioleva tool-call'i stuck olekusse")
+sdb2 = CFG / "server-stuck-test.db"
+sdb2.unlink(missing_ok=True)
+stok2 = A._db_add_user(sdb2, "stuckuser")
+A._now_utc = lambda: HFL(8)
+spayload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "stuck test", "summary": "stuck"},
+    "session": {"client_id": "client-stuck", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(8).isoformat(),
+}
+sstart = A._db_work_start(sdb2, stok2, spayload)
+A._db_ingest_events(sdb2, stok2, [{"event_key": "stuck-tool-start", "event_type": "before_tool_call", "work_session_uid": sstart["work_session_uid"], "tool_name": "bash", "tool_call_id": "tc-stuck", "occurred_at_utc": HFL(8).isoformat()}])
+A._now_utc = lambda: HFL(8) + dt.timedelta(minutes=20)
+stuck = A._db_watchdog(sdb2, stok2, {"stale_minutes": 100, "stuck_minutes": 5})
+with A._db_connect(sdb2) as conn:
+    stuck_row = conn.execute("SELECT status FROM work_sessions WHERE session_uid = ?", (sstart["work_session_uid"],)).fetchone()
+    stuck_events = conn.execute("SELECT COUNT(*) AS c FROM raw_events WHERE event_type = 'agent_marked_stuck'").fetchone()["c"]
+check("watchdog märgib sessiooni stuck", stuck["marked_stuck_count"] == 1 and stuck_row["status"] == "stuck")
+check("watchdog lisab agent_marked_stuck raw eventi", stuck_events == 1)
+A._now_utc = lambda: dt.datetime.now(dt.timezone.utc)
+
+# ============ TEST 54: cleanup kustutab ainult lubatud retention andmed ==========
+print("TEST 54: cleanup dry-run/apply ja minute_ticks ainult pärast rollupit")
+cdb = CFG / "server-cleanup-test.db"
+cdb.unlink(missing_ok=True)
+ctok = A._db_add_user(cdb, "cleanupuser")
+A._now_utc = lambda: dt.datetime(2026, 7, 1, tzinfo=UTC)
+cpayload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "cleanup test", "summary": "cleanup"},
+    "session": {"client_id": "client-clean", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(7).isoformat(),
+}
+cstart = A._db_work_start(cdb, ctok, cpayload)
+old_minute = dt.datetime(2026, 1, 1, 8, 0, tzinfo=UTC).isoformat()
+with A._db_connect(cdb) as conn:
+    wsrow = conn.execute("SELECT work_item_id, user_id FROM work_sessions WHERE id = ?", (cstart["work_session_id"],)).fetchone()
+    conn.execute("INSERT INTO minute_ticks(work_session_id, work_item_id, user_id, minute_start_utc, source, created_at) VALUES (?, ?, ?, ?, 'test', ?)", (cstart["work_session_id"], wsrow["work_item_id"], wsrow["user_id"], old_minute, old_minute))
+    conn.execute("INSERT INTO raw_events(user_id, work_session_id, work_session_uid, event_type, dedup_key, occurred_at_utc, received_at_utc, payload_json) VALUES (?, ?, ?, 'old', 'old-clean', ?, ?, '{}')", (wsrow["user_id"], cstart["work_session_id"], cstart["work_session_uid"], old_minute, old_minute))
+dry = A._db_cleanup(cdb, ctok, {"older_than": "90d"})
+apply1 = A._db_cleanup(cdb, ctok, {"older_than": "90d", "apply": True})
+with A._db_connect(cdb) as conn:
+    left_ticks_before_rollup = conn.execute("SELECT COUNT(*) AS c FROM minute_ticks").fetchone()["c"]
+    conn.execute("UPDATE work_sessions SET rollup_finalized_at = ? WHERE id = ?", (A._now_utc().isoformat(), cstart["work_session_id"]))
+apply2 = A._db_cleanup(cdb, ctok, {"older_than": "90d", "apply": True})
+with A._db_connect(cdb) as conn:
+    left_ticks_after_rollup = conn.execute("SELECT COUNT(*) AS c FROM minute_ticks").fetchone()["c"]
+    left_raw = conn.execute("SELECT COUNT(*) AS c FROM raw_events").fetchone()["c"]
+check("cleanup dry-run loendab vanad read", dry["dry_run"] and dry["raw_events"] == 1 and dry["minute_ticks"] == 0)
+check("cleanup kustutab raw eventid, aga mitte rollupita ticke", apply1["raw_events"] == 1 and left_raw == 0 and left_ticks_before_rollup == 1)
+check("cleanup kustutab tickid pärast rollupit", apply2["minute_ticks"] == 1 and left_ticks_after_rollup == 0)
+A._now_utc = lambda: dt.datetime.now(dt.timezone.utc)
+
+# ============ TEST 55: active interval export lõikab perioodipiire ==========
+print("TEST 55: active interval export lõikab intervalli päeva piiridesse")
+clipdb = CFG / "server-clip-test.db"
+clipdb.unlink(missing_ok=True)
+cltok = A._db_add_user(clipdb, "clipuser")
+clip_payload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "clip test", "summary": "clip"},
+    "session": {"client_id": "client-clip", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": dt.datetime(2026, 6, 16, 23, 50, tzinfo=UTC).isoformat(),
+}
+clstart = A._db_work_start(clipdb, cltok, clip_payload)
+with A._db_connect(clipdb) as conn:
+    wsrow = conn.execute("SELECT work_item_id, user_id FROM work_sessions WHERE id = ?", (clstart["work_session_id"],)).fetchone()
+    conn.execute("INSERT INTO work_session_active_intervals(work_session_id, work_item_id, user_id, start_minute_utc, end_minute_utc, minutes, source, created_at) VALUES (?, ?, ?, ?, ?, 20, 'test', ?)", (clstart["work_session_id"], wsrow["work_item_id"], wsrow["user_id"], dt.datetime(2026, 6, 16, 23, 50, tzinfo=UTC).isoformat(), dt.datetime(2026, 6, 17, 0, 10, tzinfo=UTC).isoformat(), HFL(0).isoformat()))
+clip_export = A._db_export_active_intervals(clipdb, cltok, {"date": ["2026-06-17"]})
+clip_interval = clip_export["intervals"][0] if clip_export["intervals"] else {}
+check("interval export loeb ainult perioodi sisse jäävad minutid", clip_export["minutes"] == 10 and clip_interval.get("minutes") == 10 and clip_interval.get("start_minute_utc").startswith("2026-06-17T00:00:00"))
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
