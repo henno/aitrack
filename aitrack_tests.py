@@ -571,7 +571,7 @@ prompt_day_rows = A._db_rows_for_day(sdb, tok, "2026-06-16")
 with A._db_connect(sdb) as conn:
     ev_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
 check("server salvestas prompt-eventi", ev_count == 2)
-check("serveri päevavaade asendab prompt placeholderi prompt-eventi tekstiga", any("tee nähtav päevavaate kokkuvõte" in r[3] for r in prompt_day_rows))
+check("serveri päevavaade asendab prompt placeholderi tegevuslausega", any("Tegin nähtav päevavaate kokkuvõte" in r[3] and "Promptid:" not in r[3] for r in prompt_day_rows))
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
 print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")

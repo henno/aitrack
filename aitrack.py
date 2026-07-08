@@ -1160,8 +1160,13 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
 def _fallback_item(prompts: list[str]) -> dict:
     """Geneeriline — EI pane toorest promptisisu lehele (privaatsus)."""
     n = len(prompts)
-    objekt = f"({n} prompti, automaatkokkuvõte puudub)" if n else "(tegevus tuvastatud)"
-    return {"objekt": objekt, "saavutus": objekt, "takistus": _NA, "teadmine": _NA}
+    if n:
+        objekt = f"AI-toega tööülesannete lahendamine ({n} teemat)"
+        saavutus = f"Tegelesin AI-tööriista abil {n} tööteema uurimise ja lahendamisega."
+    else:
+        objekt = "Tuvastatud AI-toega töö"
+        saavutus = "Tegelesin AI-tööriista abil tööülesande lahendamisega."
+    return {"objekt": objekt, "saavutus": saavutus, "takistus": _NA, "teadmine": _NA}
 
 
 # --- sink: Google Sheets VÕI lokaalne CSV -----------------------------------
@@ -2334,7 +2339,13 @@ def _hour_label_from_local(local: dt.datetime) -> str:
 
 
 def _placeholder_day_text(value: str) -> bool:
-    return "automaatkokkuvõte puudub" in str(value or "")
+    text = str(value or "")
+    return any(marker in text for marker in (
+        "automaatkokkuvõte puudub",
+        "Promptid:",
+        "AI-tööriista abil",
+        "AI-toega tööülesannete lahendamine",
+    ))
 
 
 def _infer_fixed_tz_from_day_rows(rows: list[list], cfg: dict | None = None) -> dt.tzinfo:
@@ -2406,6 +2417,36 @@ def _safe_day_prompt_snippet(text: str, limit: int = 140) -> str:
     return s[:limit - 1] + "…" if len(s) > limit else s
 
 
+def _prompt_to_work_sentence(text: str) -> str:
+    """Muuda lühike kasutaja prompt praktikapäeviku tegevuslauseks, mitte ära kuva toorest prompti."""
+    s = _safe_day_prompt_snippet(text, 120).strip(" .?!")
+    if not s:
+        return "Tegelesin AI-toega tööülesande lahendamisega."
+    lowered = s.lower()
+    mappings = [
+        ("kas ", "Kontrollisin, kas "),
+        ("kuidas ", "Uurisin, kuidas "),
+        ("mis ", "Selgitasin välja, mis "),
+        ("miks ", "Uurisin, miks "),
+        ("ava", "Avasin ja kontrollisin vajalikku vaadet või tööriista"),
+        ("installi", "Paigaldasin vajaliku tööriista või komponendi"),
+        ("tõmba", "Laadisin alla ja valmistasin ette"),
+        ("lisa", "Lisasin"),
+        ("paranda", "Parandasin"),
+        ("muuda", "Muutsin"),
+        ("kontrolli", "Kontrollisin"),
+        ("selgita", "Selgitasin"),
+        ("tee", "Tegin"),
+        ("deploy", "Deploysin ja kontrollisin"),
+    ]
+    for prefix, replacement in mappings:
+        if lowered == prefix.strip() or lowered.startswith(prefix):
+            rest = s[len(prefix):].strip(" :,-") if prefix.endswith(" ") else s[len(prefix):].strip(" :,-")
+            sentence = f"{replacement}{(' ' + rest) if rest else ''}".strip()
+            return sentence.rstrip(".") + "."
+    return f"Tegelesin teemaga: {s}."
+
+
 def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
                               existing_rows: list[list], cfg: dict | None = None) -> list[list]:
     tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg)
@@ -2428,21 +2469,21 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         if local.date() != target:
             continue
         hour = _hour_label_from_local(local)
-        g = grouped.setdefault(hour, {"date": date, "hour": hour, "projects": [], "prompts": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
-        project = r["project_name"] or r["project_key"] or r["project"] or "(promptid)"
+        g = grouped.setdefault(hour, {"date": date, "hour": hour, "projects": [], "activities": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
+        project = r["project_name"] or r["project_key"] or r["project"] or "AI-toega töö"
         if project and project not in g["projects"]:
             g["projects"].append(project)
-        snippet = _safe_day_prompt_snippet(r["prompt_text"])
-        if snippet and snippet not in g["prompts"] and len(g["prompts"]) < 8:
-            g["prompts"].append(snippet)
+        activity = _prompt_to_work_sentence(r["prompt_text"])
+        if activity and activity not in g["activities"] and len(g["activities"]) < 8:
+            g["activities"].append(activity)
         tool = str(r["tool"] or "").strip()
         if tool and tool not in g["tools"]:
             g["tools"].append(tool)
     out = []
     for g in grouped.values():
         key = f"k:{g['utc'].isoformat()}|__prompt_event__"
-        prompts = "; ".join(g["prompts"])
-        out.append([g["date"], g["hour"], "; ".join(g["projects"]), f"Promptid: {prompts}" if prompts else "",
+        activities = "; ".join(g["activities"])
+        out.append([g["date"], g["hour"], "; ".join(g["projects"]), activities,
                     _NA, _NA, ", ".join(g["tools"]), key])
     return sorted(out, key=lambda r: (r[1], r[7]))
 
