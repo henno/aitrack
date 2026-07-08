@@ -197,9 +197,11 @@ check("kaks erinevat võtit (ei dedupitud)", len(SINK_KEYS) == 2)
 check("/a/web ja /b/web võtmed erinevad", A.bucket_key(HFL(11), "/a/web") != A.bucket_key(HFL(11), "/b/web"))
 
 # ============ TEST 14: _engine_cmd kuju (päris funktsioon, ilma monkeypatchita) ============
-print("TEST 14: _engine_cmd — claude stdin, codex/gemini argv")
+print("TEST 14: _engine_cmd — pi/claude stdin, codex/gemini argv")
 c_cmd, c_in = A._engine_cmd("claude", "/x/claude", "PROMPT", "")
 check("claude: prompt stdin-i, mitte argv", c_cmd == ["/x/claude", "-p"] and c_in == "PROMPT")
+p_cmd, p_in = A._engine_cmd("pi", "/x/pi", "PROMPT", "")
+check("pi: prompt stdin-i ja ilma tööriistadeta", p_cmd == ["/x/pi", "-p", "--no-tools", "--no-context-files", "--no-session"] and p_in == "PROMPT")
 x_cmd, x_in = A._engine_cmd("codex", "/x/codex", "PROMPT", "")
 check("codex: argv, stdin None", x_cmd == ["/x/codex", "exec", "PROMPT"] and x_in is None)
 g_cmd, g_in = A._engine_cmd("gemini", "/x/gemini", "PROMPT", "m")

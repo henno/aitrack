@@ -1030,7 +1030,7 @@ def collect_records(since: dt.datetime) -> list[Record]:
 
 
 # --- kokkuvõtja (mitme mootori automaattuvastus) ----------------------------
-SUMMARIZER_ENGINES = ["claude", "codex", "gemini"]  # eelistuse järjekord
+SUMMARIZER_ENGINES = ["pi", "claude", "codex", "gemini"]  # eelistuse järjekord: kasuta esmalt sama harnessit
 
 
 def _engine_cmd(engine: str, exe: str, prompt: str, model: str) -> tuple[list[str], str | None]:
@@ -1038,6 +1038,13 @@ def _engine_cmd(engine: str, exe: str, prompt: str, model: str) -> tuple[list[st
     argv pikkuse-limiiti (Windowsil ~32KB) ja prompti nähtavust 'ps'-is."""
     if engine == "claude":
         cmd = [exe, "-p"]
+        if model:
+            cmd += ["--model", model]
+        return cmd, prompt
+    if engine == "pi":
+        # Sama harness, millega kooditakse; ilma tööriistade ja projektikontekstita, et
+        # tunnikokkuvõte ei hakkaks ise faile lugema ega AGENTS.md reegleid kaasa võtma.
+        cmd = [exe, "-p", "--no-tools", "--no-context-files", "--no-session"]
         if model:
             cmd += ["--model", model]
         return cmd, prompt
