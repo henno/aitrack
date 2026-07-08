@@ -482,8 +482,8 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 <main>
   <section class="panel toolbar">
     <label>Kuupäev <input type="date" id="dateInput"></label>
-    <label>Projekt <input id="projectInput" placeholder="project_key / nimi"></label>
-    <label>Kasutaja <input id="userInput" placeholder="kasutajanimi" style="width:130px"></label>
+    <label>Projekt <input id="projectInput" list="projectOptions" placeholder="otsi projekti" autocomplete="off"><datalist id="projectOptions"></datalist></label>
+    <label>Kasutaja <input id="userInput" list="userOptions" placeholder="kasutajanimi" style="width:130px" autocomplete="off"><datalist id="userOptions"></datalist></label>
     <label>Issue <input id="issueInput" placeholder="#123" style="width:90px"></label>
     <label>Tool <input id="toolInput" placeholder="pi" style="width:90px"></label>
     <label>Status <input id="statusInput" placeholder="active/stale" style="width:110px"></label>
@@ -532,6 +532,17 @@ async function api(path, opts={}) {
   }
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data;
+}
+function renderFilterOptions(data) {
+  $('projectOptions').innerHTML = (data.projects || []).map(p => {
+    const value = esc(p.project_key || p.name || '');
+    const label = esc(p.name && p.name !== p.project_key ? p.name + ' · ' + p.project_key : p.project_key || p.name || '');
+    return `<option value="${value}" label="${label}"></option>`;
+  }).join('');
+  $('userOptions').innerHTML = (data.users || []).map(u => `<option value="${esc(u.name || '')}" label="${esc(u.role || '')}"></option>`).join('');
+}
+async function loadFilterOptions() {
+  try { renderFilterOptions(await api('/api/activity/filters')); } catch (_) {}
 }
 function renderMetrics(data) {
   const minutes = (data.sessions || []).reduce((a, s) => a + Number(s.minutes || 0), 0);
@@ -625,6 +636,7 @@ async function init() {
   $('dateInput').value = new Date().toISOString().slice(0, 10);
   const me = await api('/api/me');
   $('userInfo').textContent = me.user ? `(${me.user.name}, ${me.user.role})` : '';
+  await loadFilterOptions();
   loadActivity();
 }
 init().catch(e => { renderWaiting(e.message || 'login puudub'); setStatus(e.message || 'login puudub', true); });

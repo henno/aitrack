@@ -2685,19 +2685,21 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             raw_where.append("re.user_id = ?")
             raw_args.append(int(user["id"]))
         elif user_filter:
-            session_where.append("u.name = ?")
-            session_args.append(user_filter)
-            prompt_where.append("u.name = ?")
-            prompt_args.append(user_filter)
-            raw_where.append("u.name = ?")
-            raw_args.append(user_filter)
+            user_like = f"%{user_filter.lower()}%"
+            session_where.append("LOWER(u.name) LIKE ?")
+            session_args.append(user_like)
+            prompt_where.append("LOWER(u.name) LIKE ?")
+            prompt_args.append(user_like)
+            raw_where.append("LOWER(u.name) LIKE ?")
+            raw_args.append(user_like)
         if project_filter:
-            session_where.append("(p.project_key = ? OR p.name = ?)")
-            session_args.extend([project_filter, project_filter])
-            prompt_where.append("(p.project_key = ? OR p.name = ? OR pe.project = ?)")
-            prompt_args.extend([project_filter, project_filter, project_filter])
-            raw_where.append("(p.project_key = ? OR p.name = ?)")
-            raw_args.extend([project_filter, project_filter])
+            project_like = f"%{project_filter.lower()}%"
+            session_where.append("(LOWER(p.project_key) LIKE ? OR LOWER(p.name) LIKE ?)")
+            session_args.extend([project_like, project_like])
+            prompt_where.append("(LOWER(p.project_key) LIKE ? OR LOWER(p.name) LIKE ? OR LOWER(pe.project) LIKE ?)")
+            prompt_args.extend([project_like, project_like, project_like])
+            raw_where.append("(LOWER(p.project_key) LIKE ? OR LOWER(p.name) LIKE ?)")
+            raw_args.extend([project_like, project_like])
         if issue_filter:
             session_where.append("i.issue_key = ?")
             session_args.append(issue_filter)
@@ -2862,6 +2864,36 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
             "sessions": session_items, "prompt_events": prompt_items, "raw_events": raw_items,
             "agent_tree": _agent_tree_from_raw_items(raw_items), "activity": activity[:limit]}
+
+
+def _db_activity_filter_options(path: Path, token: str) -> dict:
+    """Autocomplete valikud activity vaate filtritele kasutaja õiguste piires."""
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        if user["role"] == "admin":
+            users = conn.execute("SELECT name, role FROM users ORDER BY name").fetchall()
+            projects = conn.execute("SELECT project_key, name FROM projects ORDER BY name, project_key").fetchall()
+        else:
+            users = [user]
+            projects = conn.execute("""
+                SELECT DISTINCT p.project_key, p.name
+                FROM projects p
+                WHERE EXISTS (
+                    SELECT 1 FROM work_sessions ws
+                    JOIN work_items wi ON wi.id = ws.work_item_id
+                    WHERE wi.project_id = p.id AND ws.user_id = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM prompt_events pe
+                    WHERE pe.project_id = p.id AND pe.user_id = ?
+                )
+                ORDER BY p.name, p.project_key
+            """, (int(user["id"]), int(user["id"]))).fetchall()
+    return {
+        "ok": True,
+        "users": [{"name": r["name"], "role": r["role"]} for r in users],
+        "projects": [{"project_key": r["project_key"], "name": r["name"]} for r in projects],
+    }
 
 
 def _hour_label_from_local(local: dt.datetime) -> str:
@@ -5364,6 +5396,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/work/status" and self._server_mode():
                 self._json({"ok": True, "sessions": _db_work_status(self._db_path(), self._token(q))})
+                return
+            if u.path == "/api/activity/filters" and self._server_mode():
+                self._json(_db_activity_filter_options(self._db_path(), self._token(q)))
                 return
             if u.path == "/api/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))

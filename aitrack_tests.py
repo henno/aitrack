@@ -735,6 +735,8 @@ raw_res1 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_res2 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_export = A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["before_tool_call"]})
 raw_activity = A._db_activity_log(rdb, rtok, {"period": ["2026-06"]})
+raw_activity_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "project": ["parkkarl"], "user": ["raw"]})
+raw_filter_options = A._db_activity_filter_options(rdb, rtok)
 with A._db_connect(rdb) as conn:
     raw_count = conn.execute("SELECT COUNT(*) AS c FROM raw_events").fetchone()["c"]
     prompt_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
@@ -743,6 +745,8 @@ check("raw event sisestus on idempotentne", raw_res1["raw_events"]["inserted"] =
 check("raw event ei tekita legacy prompt-eventi", prompt_count == 0)
 check("raw export leiab sündmuse ja seob work_session_uid-ga", raw_export["count"] == 1 and exported_raw.get("work_session_uid") == rstart["work_session_uid"] and exported_raw.get("work_session_id") == rstart["work_session_id"])
 check("activity helper tagastab raw event timeline'i", len(raw_activity.get("raw_events", [])) == 1 and any(x.get("type") == "raw_event" for x in raw_activity.get("activity", [])))
+check("activity filter otsib projekti ja kasutajat osalise tekstiga", len(raw_activity_filtered.get("raw_events", [])) == 1)
+check("activity autocomplete valikud sisaldavad projekti ja kasutajat", any("parkkarl" in p.get("project_key", "") for p in raw_filter_options.get("projects", [])) and any(u.get("name") == "rawuser" for u in raw_filter_options.get("users", [])))
 check("raw payload on piiratud ja saladus redigeeritud", "SALA" not in exported_raw.get("payload_json", "") and len(exported_raw.get("payload_json", "")) <= A.RAW_EVENT_PAYLOAD_MAX_BYTES)
 check("raw export filter töötab", A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["after_tool_call"]})["count"] == 0)
 
