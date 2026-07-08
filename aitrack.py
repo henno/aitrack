@@ -2491,6 +2491,19 @@ def _placeholder_day_text(value: str) -> bool:
     ))
 
 
+def _rawish_day_text(value: str) -> bool:
+    """Kas päevikuvaate lahter paistab toorpromptide/tehnilise fallbackina, mitte lõpptekstina."""
+    text = str(value or "").strip()
+    low = text.lower()
+    if low in {"praktika", "aitrack"}:
+        return True
+    markers = ("; aitrack ", "agents.md", "cookie-auth", "work start", "tool-call",
+               "raw_events", "prompt tracking", "heartbeat/minute", "server token")
+    if any(m in low for m in markers):
+        return True
+    return len(text) > 250 and text.count(";") >= 3
+
+
 def _infer_fixed_tz_from_day_rows(rows: list[list], cfg: dict | None = None) -> dt.tzinfo:
     for r in rows:
         if len(r) < 8:
@@ -2847,7 +2860,8 @@ def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) ->
             by_hour[d[1]] = d
             continue
         # Säilita käsitsi parandatud read; asenda automaatse varukokkuvõtte placeholder.
-        placeholder = _placeholder_day_text(existing[2]) or _placeholder_day_text(existing[3])
+        placeholder = (_placeholder_day_text(existing[2]) or _placeholder_day_text(existing[3])
+                       or _rawish_day_text(existing[2]) or _rawish_day_text(existing[3]))
         if placeholder:
             existing[2] = d[2] or existing[2]
             existing[3] = d[3] or existing[3]

@@ -582,6 +582,7 @@ learn_gnome = A._infer_teadmine_from_texts(["mis gnome mul on?", "tõmba https:/
 check("praktikapäeviku teadmise heuristika annab loetava teksti", "Selgus, kas" not in learn_tail and "Tailscale" in learn_tail and "https://" not in learn_gnome)
 plain = A._plain_day_summary_from_texts(["aitrack uuenda globaalseid agent juhiseid", "aitrack work start ja tick käsuahel", "server login kasutajatele"])
 check("praktikapäeviku fallback ei kuva toorprompti objektina", "aitrack uuenda" not in plain["objekt"] and "Praktika" in plain["objekt"])
+check("praktikapäeviku merge tunneb toorpromptliku lahtri ära", A._rawish_day_text("aitrack uuenda juhiseid; aitrack work start käsuahel"))
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
 print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")
