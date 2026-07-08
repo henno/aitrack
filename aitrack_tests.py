@@ -633,7 +633,8 @@ print("TEST 45: serveri tegevuste HTML leht ja link päevavaatest")
 activity_page = A._activity_page_html()
 start_page = A._start_page_html()
 check("activity leht kutsub /api/activity endpointi", "/api/activity" in activity_page and "work_session_uid" in activity_page)
-check("activity leht ei päri API-t enne tokenit", "Sisesta serveri token" in activity_page and "if (!tok)" in activity_page)
+check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
+check("login leht postitab /api/login endpointi", "/api/login" in A._login_page_html() and "password" in A._login_page_html())
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
 
 # ============ TEST 46: server client saadab explicit User-Agent ============
@@ -641,6 +642,19 @@ print("TEST 46: server client kasutab explicit User-Agent headerit")
 headers = A._server_headers({"Content-Type": "application/json"})
 check("server headerites on User-Agent", headers.get("User-Agent", "").startswith("aitrack/"))
 check("server headerid säilitavad Content-Type", headers.get("Content-Type") == "application/json")
+
+# ============ TEST 47: brauseri login parool ja web session ============
+print("TEST 47: serveri brauseri login loob sessiooni ilma API tokenit avaldamata")
+ldb = CFG / "server-login-test.db"
+ldb.unlink(missing_ok=True)
+ltok = A._db_add_user(ldb, "loginuser")
+A._db_set_user_password(ldb, "loginuser", "väga-salajane-123")
+login = A._db_login(ldb, "loginuser", "väga-salajane-123")
+with A._db_connect(ldb) as conn:
+    session_user = A._db_user_by_session(ldb, login["session_token"])
+check("õige parool loob web sessioni", login.get("ok") is True and login.get("user", {}).get("name") == "loginuser")
+check("web session mapib kasutaja tokenile", session_user is not None and session_user["token"] == ltok)
+check("vale parool ei valideeru", A._verify_password("vale", session_user["password_hash"]) is False)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

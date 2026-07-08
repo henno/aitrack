@@ -12,10 +12,13 @@ kokkuvõtete tegemiseks. Töötab Python 3.9+.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import csv
 import datetime as dt
+import getpass
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -32,6 +35,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections import Counter
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +56,9 @@ CLIENT_FILE = CONFIG_DIR / "client.json"  # selle arvuti püsiv client_id server
 LOCAL_DB = CONFIG_DIR / "local.db"  # lokaalse agendi SQLite DB (aktiivsed work_session'id + outbox)
 WORK_STATE_FILE = CONFIG_DIR / "work-state.json"  # legacy snapshot aktiivsetest work_session'idest
 SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack serve)
+WEB_SESSION_COOKIE = "aitrack_session"
+WEB_SESSION_DAYS = 30
+PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -1358,6 +1365,48 @@ def _db_add_column_if_missing(conn: sqlite3.Connection, table: str, column: str,
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _hash_password(password: str, *, salt: bytes | None = None, iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
+    if not password:
+        raise ValueError("parool puudub")
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${_b64(salt)}${_b64(digest)}"
+
+
+def _verify_password(password: str, stored_hash: str | None) -> bool:
+    if not password or not stored_hash:
+        return False
+    try:
+        algo, iterations_s, salt_s, digest_s = stored_hash.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_s)
+        salt = _unb64(salt_s)
+        expected = _unb64(digest_s)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(actual, expected)
+    except Exception:  # noqa: BLE001 - vigane hash tähendab vale parooli
+        return False
+
+
+def _session_hash(session_token: str) -> str:
+    return hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+
+
+def _public_user(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    return {"id": int(row["id"]), "name": row["name"], "role": row["role"]}
+
+
 def _db_init(path: Path) -> None:
     with _db_connect(path) as conn:
         conn.executescript("""
@@ -1366,8 +1415,19 @@ def _db_init(path: Path) -> None:
           name TEXT NOT NULL UNIQUE,
           token TEXT NOT NULL UNIQUE,
           role TEXT NOT NULL DEFAULT 'user',
+          password_hash TEXT,
+          password_updated_at TEXT,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS web_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_hash TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON web_sessions(user_id, expires_at);
         CREATE TABLE IF NOT EXISTS devices (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1519,8 +1579,10 @@ def _db_init(path: Path) -> None:
         );
         CREATE INDEX IF NOT EXISTS prompt_events_user_started_idx ON prompt_events(user_id, started_at);
         """)
-        # Vanade server.db failide kerge migratsioon: prompt_events jäi alles, aga saab nüüd
-        # viidata normaliseeritud projekti/töö/sessiooni ridadele.
+        # Vanade server.db failide kerge migratsioon.
+        _db_add_column_if_missing(conn, "users", "password_hash", "TEXT")
+        _db_add_column_if_missing(conn, "users", "password_updated_at", "TEXT")
+        # prompt_events jäi alles, aga saab nüüd viidata normaliseeritud projekti/töö/sessiooni ridadele.
         _db_add_column_if_missing(conn, "work_sessions", "session_uid", "TEXT")
         conn.execute("UPDATE work_sessions SET session_uid = 'ws_legacy_' || id WHERE session_uid IS NULL OR session_uid = ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS work_sessions_session_uid_idx ON work_sessions(session_uid)")
@@ -1541,14 +1603,69 @@ def _db_user_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
     return row
 
 
-def _db_add_user(path: Path, name: str, role: str = "user") -> str:
+def _db_add_user(path: Path, name: str, role: str = "user", password: str | None = None) -> str:
     _db_init(path)
     token = secrets.token_urlsafe(32)
     now = _now_utc().isoformat()
+    password_hash = _hash_password(password) if password else None
+    password_updated_at = now if password else None
     with _db_connect(path) as conn:
-        conn.execute("INSERT INTO users(name, token, role, created_at) VALUES (?, ?, ?, ?)",
-                     (name, token, role, now))
+        conn.execute("INSERT INTO users(name, token, role, password_hash, password_updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     (name, token, role, password_hash, password_updated_at, now))
     return token
+
+
+def _db_set_user_password(path: Path, name: str, password: str) -> None:
+    if len(password) < 8:
+        raise ValueError("parool peab olema vähemalt 8 märki")
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        cur = conn.execute("UPDATE users SET password_hash = ?, password_updated_at = ? WHERE name = ?",
+                           (_hash_password(password), now, name))
+        if cur.rowcount == 0:
+            raise ValueError(f"kasutajat ei leitud: {name}")
+
+
+def _db_login(path: Path, name: str, password: str) -> dict:
+    _db_init(path)
+    now_dt = _now_utc()
+    now = now_dt.isoformat()
+    expires = (now_dt + dt.timedelta(days=WEB_SESSION_DAYS)).isoformat()
+    with _db_connect(path) as conn:
+        row = conn.execute("SELECT * FROM users WHERE name = ?", (name,)).fetchone()
+        if row is None or not _verify_password(password, row["password_hash"]):
+            raise PermissionError("vale kasutajanimi või parool")
+        session_token = secrets.token_urlsafe(32)
+        conn.execute("DELETE FROM web_sessions WHERE expires_at <= ?", (now,))
+        conn.execute("INSERT INTO web_sessions(session_hash, user_id, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                     (_session_hash(session_token), int(row["id"]), now, now, expires))
+        return {"ok": True, "user": _public_user(row), "session_token": session_token, "expires_at": expires}
+
+
+def _db_user_by_session(path: Path, session_token: str) -> sqlite3.Row | None:
+    if not session_token:
+        return None
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        row = conn.execute("""
+            SELECT u.* FROM web_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.session_hash = ? AND s.expires_at > ?
+        """, (_session_hash(session_token), now)).fetchone()
+        if row is not None:
+            conn.execute("UPDATE web_sessions SET last_seen_at = ? WHERE session_hash = ?",
+                         (now, _session_hash(session_token)))
+        return row
+
+
+def _db_destroy_session(path: Path, session_token: str) -> None:
+    if not session_token:
+        return
+    _db_init(path)
+    with _db_connect(path) as conn:
+        conn.execute("DELETE FROM web_sessions WHERE session_hash = ?", (_session_hash(session_token),))
 
 
 def _db_one_id(conn: sqlite3.Connection, sql: str, args: tuple) -> int:
@@ -3445,6 +3562,71 @@ init().catch(e => setStatus(e.message, true));
 </html>"""
 
 
+def _login_page_html() -> str:
+    return r"""<!doctype html>
+<html lang="et">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitrack login</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --bad:#f97316; --line:#334155; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --bad:#c2410c; --line:#cbd5e1; } }
+* { box-sizing: border-box; }
+body { margin:0; min-height:100vh; display:grid; place-items:center; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); padding:20px; }
+.panel { width:min(420px,100%); background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:22px; box-shadow:0 12px 40px rgba(0,0,0,.18); }
+h1 { margin:0 0 6px; font-size:24px; }
+.small { color:var(--muted); font-size:13px; margin-bottom:18px; }
+label { display:block; margin:12px 0 6px; color:var(--muted); font-size:13px; }
+input, button { font:inherit; width:100%; border-radius:10px; padding:10px; }
+input { background:transparent; color:var(--text); border:1px solid var(--line); }
+button { margin-top:16px; border:1px solid var(--accent); background:var(--accent); color:white; cursor:pointer; }
+.status { min-height:20px; margin-top:12px; color:var(--muted); }
+.bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<main class="panel">
+  <h1>aitrack login</h1>
+  <div class="small">Logi serveri tegevuste ja päevavaate vaatamiseks sisse.</div>
+  <form id="loginForm">
+    <label for="name">Kasutaja</label>
+    <input id="name" name="name" autocomplete="username" required autofocus>
+    <label for="password">Parool</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Logi sisse</button>
+  </form>
+  <div id="status" class="status"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function nextUrl() {
+  const n = new URLSearchParams(location.search).get('next') || '/activity';
+  return n.startsWith('/') && !n.startsWith('//') ? n : '/activity';
+}
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('status').className = 'status';
+  $('status').textContent = 'Login…';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: $('name').value.trim(), password: $('password').value})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data.error || 'login ebaõnnestus');
+    location.href = nextUrl();
+  } catch (err) {
+    $('status').className = 'status bad';
+    $('status').textContent = err.message || 'login ebaõnnestus';
+  }
+});
+</script>
+</body>
+</html>"""
+
+
 def _activity_page_html() -> str:
     return r"""<!doctype html>
 <html lang="et">
@@ -3484,14 +3666,13 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 </head>
 <body>
 <header>
-  <div><h1>aitrack server tegevused</h1><div class="small">Work session'id, prompt-eventid ja tegevuste ajalugu tokeni õiguste piires.</div></div>
-  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="loadActivity()" class="primary">Värskenda</button></div>
+  <div><h1>aitrack server tegevused</h1><div class="small">Work session'id, prompt-eventid ja tegevuste ajalugu sisselogitud kasutaja õiguste piires. <span id="userInfo"></span></div></div>
+  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
 </header>
 <main>
   <section class="panel toolbar">
     <label>Kuupäev <input type="date" id="dateInput"></label>
     <label>Piir <input type="number" id="limitInput" value="200" min="1" max="1000" style="width:90px"></label>
-    <label>Server token <input id="tokenInput" type="password" placeholder="keskserveri token"></label>
     <button onclick="loadActivity()">Ava</button>
     <span class="status" id="status"></span>
   </section>
@@ -3512,14 +3693,16 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 <script>
 const $ = (id) => document.getElementById(id);
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
-function authToken() { return $('tokenInput').value.trim(); }
 function esc(s) { return String(s ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }
 function projectLabel(x) { return `${esc(x.project_key || x.project || '')}${x.issue ? ' <span class="pill">' + esc(x.issue) + '</span>' : ''}`; }
-async function api(path) {
-  const tok = authToken();
-  const res = await fetch(path, {headers: tok ? {'X-Aitrack-Token': tok} : {}});
+async function api(path, opts={}) {
+  const res = await fetch(path, {credentials: 'same-origin', ...opts});
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 || res.status === 403) {
+    location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
+    throw new Error(data.error || 'login puudub');
+  }
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data;
 }
@@ -3567,14 +3750,6 @@ function renderWaiting(message) {
   $('promptsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
 }
 async function loadActivity() {
-  const tok = authToken();
-  localStorage.setItem('aitrackToken', tok);
-  if (!tok) {
-    renderWaiting('Sisesta serveri token ja vajuta “Ava”.');
-    setStatus('token puudub', true);
-    $('tokenInput').focus();
-    return;
-  }
   const date = $('dateInput').value;
   const limit = $('limitInput').value || '200';
   setStatus('Laen…');
@@ -3587,13 +3762,17 @@ async function loadActivity() {
     setStatus(e.message, true);
   }
 }
-function init() {
+async function logout() {
+  await fetch('/api/logout', {method:'POST', credentials:'same-origin'}).catch(() => {});
+  location.href = '/login?next=/activity';
+}
+async function init() {
   $('dateInput').value = new Date().toISOString().slice(0, 10);
-  $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
-  $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
+  const me = await api('/api/me');
+  $('userInfo').textContent = me.user ? `(${me.user.name}, ${me.user.role})` : '';
   loadActivity();
 }
-init();
+init().catch(e => { renderWaiting(e.message || 'login puudub'); setStatus(e.message || 'login puudub', true); });
 </script>
 </body>
 </html>"""
@@ -3605,21 +3784,30 @@ class _AitrackHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # vaiksem server; olulised vead lähevad vastusesse
         return
 
-    def _json(self, obj, status: int = 200) -> None:
+    def _json(self, obj, status: int = 200, headers: dict | None = None) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self, text: str) -> None:
+    def _html(self, text: str, status: int = 200, headers: dict | None = None) -> None:
         data = text.encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
+
+    def _redirect(self, location: str, status: int = 302) -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.end_headers()
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -3630,12 +3818,41 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _cookie_value(self, name: str) -> str:
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return ""
+        try:
+            cookie = SimpleCookie(raw)
+            morsel = cookie.get(name)
+            return morsel.value if morsel else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _session_cookie_header(self, session_token: str, *, clear: bool = False) -> str:
+        cookie = SimpleCookie()
+        cookie[WEB_SESSION_COOKIE] = "" if clear else session_token
+        cookie[WEB_SESSION_COOKIE]["path"] = "/"
+        cookie[WEB_SESSION_COOKIE]["httponly"] = True
+        cookie[WEB_SESSION_COOKIE]["samesite"] = "Lax"
+        cookie[WEB_SESSION_COOKIE]["max-age"] = 0 if clear else WEB_SESSION_DAYS * 24 * 60 * 60
+        return cookie.output(header="").strip()
+
+    def _cookie_user(self) -> sqlite3.Row | None:
+        if not self._server_mode():
+            return None
+        return _db_user_by_session(self._db_path(), self._cookie_value(WEB_SESSION_COOKIE))
+
     def _token(self, q: dict | None = None, data: dict | None = None) -> str:
         if data and data.get("token"):
             return str(data.get("token"))
         if q and q.get("token"):
             return str(q.get("token", [""])[0])
-        return self.headers.get("X-Aitrack-Token", "")
+        header_token = self.headers.get("X-Aitrack-Token", "")
+        if header_token:
+            return header_token
+        user = self._cookie_user()
+        return str(user["token"]) if user is not None else ""
 
     def _server_mode(self) -> bool:
         return bool(self.cfg.get("_server_mode"))
@@ -3645,7 +3862,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:  # noqa: N802 (http.server API)
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html", "/activity"):
+        if path in ("/", "/index.html", "/activity", "/login"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -3664,7 +3881,13 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path in ("/", "/index.html"):
                 self._html(_start_page_html())
                 return
+            if u.path == "/login":
+                self._html(_login_page_html())
+                return
             if u.path == "/activity":
+                if self._server_mode() and self._cookie_user() is None:
+                    self._redirect("/login?next=/activity")
+                    return
                 self._html(_activity_page_html())
                 return
             if u.path == "/favicon.ico":
@@ -3715,6 +3938,13 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     html, text = _html_table_for_day(date, full)
                 self._json({"ok": True, "html": html, "text": text})
                 return
+            if u.path == "/api/me" and self._server_mode():
+                user = self._cookie_user()
+                if user is None:
+                    self._json({"ok": False, "error": "login puudub"}, 401)
+                    return
+                self._json({"ok": True, "user": _public_user(user)})
+                return
             if u.path == "/api/work/status" and self._server_mode():
                 self._json({"ok": True, "sessions": _db_work_status(self._db_path(), self._token(q))})
                 return
@@ -3737,6 +3967,15 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         try:
             u = urllib.parse.urlparse(self.path)
             data = self._read_json()
+            if u.path == "/api/login" and self._server_mode():
+                result = _db_login(self._db_path(), str(data.get("name") or ""), str(data.get("password") or ""))
+                session_token = str(result.pop("session_token"))
+                self._json(result, headers={"Set-Cookie": self._session_cookie_header(session_token)})
+                return
+            if u.path == "/api/logout" and self._server_mode():
+                _db_destroy_session(self._db_path(), self._cookie_value(WEB_SESSION_COOKIE))
+                self._json({"ok": True}, headers={"Set-Cookie": self._session_cookie_header("", clear=True)})
+                return
             if u.path == "/api/keys" and self._server_mode():
                 keys = sorted(_db_keys(self._db_path(), self._token(data=data)))
                 self._json({"ok": True, "keys": keys})
@@ -3858,14 +4097,30 @@ def cmd_user(args, cfg):
         print("Kliendis seadista:")
         print(f"  aitrack connect --url http://SERVER:8765 --token {token}")
         return
+    if args.user_cmd == "password":
+        password = getattr(args, "password", None)
+        if getattr(args, "password_stdin", False):
+            password = sys.stdin.read().splitlines()[0].strip() if not password else password
+        if not password:
+            if not sys.stdin.isatty():
+                raise SystemExit("Anna parool --password-stdin kaudu või käivita interaktiivselt.")
+            p1 = getpass.getpass("Uus parool: ")
+            p2 = getpass.getpass("Korda parooli: ")
+            if p1 != p2:
+                raise SystemExit("Paroolid ei klapi")
+            password = p1
+        _db_set_user_password(db_path, args.name, password)
+        print(f"Parool seatud kasutajale: {args.name}")
+        return
     if args.user_cmd == "list":
         with _db_connect(db_path) as conn:
-            rows = conn.execute("SELECT id, name, role, created_at FROM users ORDER BY id").fetchall()
+            rows = conn.execute("SELECT id, name, role, created_at, password_hash FROM users ORDER BY id").fetchall()
         if not rows:
             print("Kasutajaid pole. Lisa: aitrack user add <nimi>")
             return
         for r in rows:
-            print(f"{r['id']:3d}  {r['name']:20s}  {r['role']:8s}  {r['created_at']}")
+            login = "login" if r["password_hash"] else "token-only"
+            print(f"{r['id']:3d}  {r['name']:20s}  {r['role']:8s}  {login:10s}  {r['created_at']}")
 
 
 def cmd_connect(args, cfg):
@@ -4192,12 +4447,14 @@ Põhikäsud
   { _cli_base_cmd() } day {date_hint}        prindi päeva D–G väljund terminali
   { _cli_base_cmd() } start                  ava brauseris visuaalne päevavaade/editor
   { _cli_base_cmd() } serve                  käivita keskserver SQLite andmebaasiga
+  { _cli_base_cmd() } user password NIMI     sea brauseri login'i parool
   { _cli_base_cmd() } connect --url URL --token TOKEN  ühenda klient keskserveriga
   { _cli_base_cmd() } project-id             näita repo URL-il põhinevat ühist project_key'd
   { _cli_base_cmd() } work start --issue 662 "töö"  alusta serveris work_session'it
   { _cli_base_cmd() } tick                   saada kõigi aktiivsete work_session'ite minut
   { _cli_base_cmd() } install --minute-tracking  lisa OS-i iga-minuti tick timer
   { _cli_base_cmd() } work done "kokkuvõte"  lõpeta aktiivne work_session
+  https://SERVER/activity       serveri activity/log vaade login'iga
   { _cli_base_cmd() } note "tekst"           lisa käsitsi märge praegusele tunnile
   { _cli_base_cmd() } note                   näita käsitsi märkmeid
   { _cli_base_cmd() } preview --hours 8      vaata, mida tracker leiaks
@@ -4442,6 +4699,12 @@ def main():
     ua.add_argument("--role", default="user", choices=["user", "admin"])
     ua.add_argument("--db", default=str(SERVER_DB))
     ua.set_defaults(fn=cmd_user)
+    upw = us.add_parser("password", help="sea brauseri login'i parool")
+    upw.add_argument("name")
+    upw.add_argument("--db", default=str(SERVER_DB))
+    upw.add_argument("--password", help="uus parool (väldi shell historys; eelista --password-stdin)")
+    upw.add_argument("--password-stdin", action="store_true", help="loe uus parool stdin'i esimeselt realt")
+    upw.set_defaults(fn=cmd_user)
     ul = us.add_parser("list", help="näita kasutajaid")
     ul.add_argument("--db", default=str(SERVER_DB))
     ul.set_defaults(fn=cmd_user)

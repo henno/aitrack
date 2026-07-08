@@ -74,7 +74,7 @@ kõik ühe vooluga:
 | `aitrack help` / `aitrack --help` | Näita praktilist abi ja sinu OS-iga sobivaid kopeerimiskäske Google Sheetsi jaoks. |
 | `aitrack start` | Ava lokaalne brauseri-UI, kus saad tänaseid ja varasemaid päevi vaadata, muuta, ridu lisada ning ühe nupuga Sheetsi kopeerida. |
 | `aitrack serve` | Käivita keskserver SQLite andmebaasiga mitme kasutaja jaoks. |
-| `aitrack user add/list` | Lisa/listi keskserveri kasutajaid ja token'eid. |
+| `aitrack user add/list/password` | Lisa/listi keskserveri kasutajaid, API token'eid ja brauseri login'i paroole. |
 | `aitrack connect --url ... --token ...` | Ühenda klient keskserveriga; `aitrack run` saadab tunniread ja prompt-eventid serverisse. |
 | `aitrack project-id` | Näita serveri ühist projektivõtit: Git repo korral normaliseeritud remote URL, muidu `local:<kaust>`. |
 | `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; mitu kasutajat/agentit võivad sama issue all paralleelselt töötada. |
@@ -136,10 +136,11 @@ Google Sheetsi jaoks. Kõik muudatused salvestatakse `~/.config/aitrack/hours.cs
 päevavaade renderdatakse uuesti.
 
 **Mitme kasutaja server:** `aitrack serve --host 0.0.0.0 --port 8765 --db /data/server.db` käivitab
-SQLite-põhise keskserveri. Serveris loo kasutaja `aitrack user add karl --db /data/server.db`, kliendis
-seadista `aitrack connect --url https://aitrack.example.com --token TOKEN`. Seejärel saadab kliendi
-`aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta repo juures
-`docker compose up -d --build` (vaikimisi seob `127.0.0.1:3103`).
+SQLite-põhise keskserveri. Serveris loo kasutaja `aitrack user add karl --db /data/server.db` ja sea
+brauseri login'i parool `aitrack user password karl --db /data/server.db` (või turvalises skriptis
+`--password-stdin`). Kliendis seadista API jaoks `aitrack connect --url https://aitrack.example.com --token TOKEN`.
+Seejärel saadab kliendi `aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta
+repo juures `docker compose up -d --build` (vaikimisi seob `127.0.0.1:3103`).
 
 **Normaliseeritud work tracking:** serveri DB hoiab projektid/issue'd/sessioonid/minutitickid 3NF-laadselt
 eraldi tabelites (`projects`, `project_remotes`, `issues`, `work_items`, `work_sessions`, `minute_ticks`).
@@ -165,8 +166,10 @@ aitrack tick
 aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 ```
 
-Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Sama tokeniga näeb kasutaja enda
-work session'eid, prompt-evente ja tegevuste ajalugu; admin-token näeb kõigi kasutajate tegevusi.
+Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser suunatakse vajadusel
+`/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.
+Tavakasutaja näeb enda work session'eid, prompt-evente ja tegevuste ajalugu; admin näeb kõiki kasutajaid.
+API/CLI jaoks jääb token-põhine autentimine alles.
 
 Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 
