@@ -2635,13 +2635,13 @@ def _domain_learning_sentences(texts: list[str]) -> list[str]:
     if "gnome" in combined or "draw-on-gnome" in combined or "draw on gnome" in combined:
         add("Selgus GNOME töökeskkond ning ekraanile joonistamise tööriista kasutus.")
     if any(x in combined for x in ("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick")):
-        add("Täpsustus, kuidas aitrack seob promptid tööseansi, tickide ja heartbeat'idega.")
+        add("Selgus, kuidas süsteem saab töö alguse ja töö jätkumise automaatselt kirja panna.")
     if any(x in combined for x in ("hook", "tool-call", "alam-agent", "subagent", "hangumise")):
-        add("Täpsustus alamagentide, hookide ja hangumise tuvastamise kohta.")
+        add("Selgus, kuidas märgata, kui AI-abiprotsess jääb seisma või ei tööta enam.")
     if any(x in combined for x in ("server token", "servertoken", "login", "parool", "rate limiter", "ip ban")):
-        add("Täpsustus serveri sisselogimise ja kaitsemehhanismide kohta.")
+        add("Täpsustus kasutajate sisselogimise ja serveri turvalisuse korraldamise kohta.")
     if any(x in combined for x in ("raw_events", "raw event", "activity", "päevavaade", "praktikapäeviku")):
-        add("Täpsustus aitracki tegevuslogi, activity-vaate ja praktikapäeviku vormingu kohta.")
+        add("Selgus, kuidas tegevuste logi ja päevikuvaade aitavad tehtud tööd hiljem kontrollida.")
     return out
 
 
@@ -2681,13 +2681,13 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
         }
     if has("raw_events", "raw event", "active interval", "export"):
         return {
-            "objekt": "Praktika – aitracki tegevuslogide ja ekspordi arendamine.",
-            "saavutus": "Lisati ja kontrolliti detailsemat tegevuste salvestamist ning andmete eksportimist hilisemaks aruandluseks.",
+            "objekt": "Praktika – tegevuste salvestamise ja aruandluse arendamine.",
+            "saavutus": "Lisati ja kontrolliti täpsemat tegevuste salvestamist, et tehtud tööd saaks hiljem aruandes kasutada.",
         }
     if has("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick", "hook", "alam-agent", "subagent"):
         return {
             "objekt": "Praktika – AI-tööpäeviku tööaja jälgimise arendamine.",
-            "saavutus": "Täpsustati, kuidas töö alustamine, minutipõhine jälgimine ja AI-agentide tegevus serverisse jõuavad.",
+            "saavutus": "Täpsustati, kuidas töö algus ja töö jätkumine automaatselt serverisse kirja saavad.",
         }
     if has("server token", "servertoken", "login", "parool", "rate limiter", "ip ban", "kasutaja"):
         return {
