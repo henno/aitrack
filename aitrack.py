@@ -1476,6 +1476,28 @@ def _public_user(row: sqlite3.Row | dict | None) -> dict | None:
     return {"id": int(row["id"]), "name": row["name"], "role": row["role"]}
 
 
+def _db_record_security_event_conn(conn: sqlite3.Connection, user_id: int | None, event_type: str,
+                                   *, ip: str = "", path: str = "", success: bool = False,
+                                   detail: str = "", created_at: str | None = None) -> None:
+    conn.execute(
+        "INSERT INTO security_events(user_id, event_type, ip, path, success, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, str(event_type)[:80], str(ip or "")[:120], str(path or "")[:300], 1 if success else 0,
+         str(detail or "")[:1000], created_at or _now_utc().isoformat()),
+    )
+
+
+def _db_record_security_event(path: Path, user_id: int | None, event_type: str,
+                              *, ip: str = "", req_path: str = "", success: bool = False,
+                              detail: str = "") -> None:
+    try:
+        _db_init(path)
+        with _db_connect(path) as conn:
+            _db_record_security_event_conn(conn, user_id, event_type, ip=ip, path=req_path,
+                                           success=success, detail=detail)
+    except Exception:  # noqa: BLE001 - audit ei tohi põhivoogu murda
+        pass
+
+
 def _normalise_request_ip(value: str | None) -> str:
     raw = (value or "").split(",", 1)[0].strip()
     if not raw or len(raw) > 80 or any(c in raw for c in "\r\n\t "):
@@ -1516,6 +1538,19 @@ def _db_init(path: Path) -> None:
           expires_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON web_sessions(user_id, expires_at);
+        CREATE TABLE IF NOT EXISTS security_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          event_type TEXT NOT NULL,
+          ip TEXT NOT NULL DEFAULT '',
+          path TEXT NOT NULL DEFAULT '',
+          success INTEGER NOT NULL DEFAULT 0,
+          detail TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS security_events_created_idx ON security_events(created_at);
+        CREATE INDEX IF NOT EXISTS security_events_type_idx ON security_events(event_type, created_at);
+        CREATE INDEX IF NOT EXISTS security_events_user_idx ON security_events(user_id, created_at);
         CREATE TABLE IF NOT EXISTS devices (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1761,6 +1796,13 @@ def _db_user_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
     return row
 
 
+def _db_admin_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
+    user = _db_user_by_token(conn, token)
+    if user["role"] != "admin":
+        raise PermissionError("admini õigus puudub")
+    return user
+
+
 def _db_add_user(path: Path, name: str, role: str = "user", password: str | None = None) -> str:
     _db_init(path)
     token = secrets.token_urlsafe(32)
@@ -1840,6 +1882,189 @@ def _db_destroy_session(path: Path, session_token: str) -> None:
     _db_init(path)
     with _db_connect(path) as conn:
         conn.execute("DELETE FROM web_sessions WHERE session_hash = ?", (_session_hash(session_token),))
+
+
+def _db_admin_users(path: Path, token: str) -> dict:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        _db_admin_by_token(conn, token)
+        rows = conn.execute("""
+            SELECT u.id, u.name, u.role, u.created_at, u.password_updated_at,
+                   (SELECT COUNT(*) FROM web_sessions s WHERE s.user_id = u.id AND s.expires_at > ?) AS active_web_sessions,
+                   (SELECT COUNT(*) FROM work_sessions ws WHERE ws.user_id = u.id) AS work_sessions,
+                   (SELECT COUNT(*) FROM work_sessions ws WHERE ws.user_id = u.id AND ws.status = 'active') AS active_work_sessions
+            FROM users u ORDER BY u.name
+        """, (_now_utc().isoformat(),)).fetchall()
+    return {"ok": True, "users": [dict(r) for r in rows]}
+
+
+def _db_admin_add_user(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    name = str(payload.get("name") or "").strip()
+    role = str(payload.get("role") or "user").strip()
+    password = str(payload.get("password") or "")
+    if not name:
+        raise ValueError("kasutajanimi puudub")
+    if role not in {"user", "admin"}:
+        raise ValueError("vigane roll")
+    now = _now_utc().isoformat()
+    api_token = secrets.token_urlsafe(32)
+    with _db_connect(path) as conn:
+        admin = _db_admin_by_token(conn, token)
+        conn.execute(
+            "INSERT INTO users(name, token, role, password_hash, password_updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, api_token, role, _hash_password(password) if password else None, now if password else None, now),
+        )
+        uid = conn.execute("SELECT id FROM users WHERE name = ?", (name,)).fetchone()["id"]
+        _db_record_security_event_conn(conn, int(admin["id"]), "admin_user_created", success=True,
+                                       detail=f"created user {name} role={role}", created_at=now)
+    return {"ok": True, "user": {"id": int(uid), "name": name, "role": role}, "token": api_token}
+
+
+def _db_admin_set_user_password(path: Path, token: str, payload: dict) -> dict:
+    name = str(payload.get("name") or "").strip()
+    password = str(payload.get("password") or "")
+    if not name:
+        raise ValueError("kasutajanimi puudub")
+    if len(password) < 8:
+        raise ValueError("parool peab olema vähemalt 8 märki")
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        admin = _db_admin_by_token(conn, token)
+        cur = conn.execute("UPDATE users SET password_hash = ?, password_updated_at = ? WHERE name = ?",
+                           (_hash_password(password), now, name))
+        if cur.rowcount == 0:
+            raise ValueError(f"kasutajat ei leitud: {name}")
+        _db_record_security_event_conn(conn, int(admin["id"]), "admin_password_set", success=True,
+                                       detail=f"password set for {name}", created_at=now)
+    return {"ok": True, "password_updated_at": now}
+
+
+def _db_admin_revoke_user_sessions(path: Path, token: str, payload: dict) -> dict:
+    name = str(payload.get("name") or "").strip()
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        admin = _db_admin_by_token(conn, token)
+        row = conn.execute("SELECT id FROM users WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise ValueError(f"kasutajat ei leitud: {name}")
+        cur = conn.execute("DELETE FROM web_sessions WHERE user_id = ?", (int(row["id"]),))
+        _db_record_security_event_conn(conn, int(admin["id"]), "admin_sessions_revoked", success=True,
+                                       detail=f"revoked {cur.rowcount} sessions for {name}", created_at=now)
+    return {"ok": True, "revoked": int(cur.rowcount or 0)}
+
+
+def _db_admin_security_events(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _activity_bounds(q)
+    limit = max(1, min(int(_qval(q, "limit") or 200), 1000))
+    event_type = _qval(q, "event_type") or _qval(q, "type")
+    with _db_connect(path) as conn:
+        _db_admin_by_token(conn, token)
+        where = ["se.created_at >= ?", "se.created_at < ?"]
+        args: list = [start_iso, end_iso]
+        if event_type:
+            where.append("se.event_type = ?")
+            args.append(event_type)
+        rows = conn.execute(f"""
+            SELECT se.*, u.name AS user_name
+            FROM security_events se
+            LEFT JOIN users u ON u.id = se.user_id
+            WHERE {' AND '.join(where)}
+            ORDER BY se.created_at DESC, se.id DESC
+            LIMIT ?
+        """, (*args, limit)).fetchall()
+    return {"ok": True, "period": label, "count": len(rows), "events": [{
+        "id": int(r["id"]), "user": r["user_name"] or "", "user_id": int(r["user_id"]) if r["user_id"] is not None else None,
+        "event_type": r["event_type"], "ip": r["ip"], "path": r["path"], "success": bool(r["success"]),
+        "detail": r["detail"], "created_at": r["created_at"],
+    } for r in rows]}
+
+
+def _db_customer_add(path: Path, name: str, external_key: str = "") -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        conn.execute("INSERT OR IGNORE INTO customers(name, external_key, created_at) VALUES (?, NULLIF(?, ''), ?)",
+                     (name.strip(), external_key.strip(), now))
+        row = conn.execute("SELECT * FROM customers WHERE name = ?", (name.strip(),)).fetchone()
+    return {"ok": True, "customer": dict(row)}
+
+
+def _db_customer_list(path: Path) -> dict:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        rows = conn.execute("SELECT c.*, (SELECT COUNT(*) FROM projects p WHERE p.customer_id = c.id) AS projects FROM customers c ORDER BY name").fetchall()
+    return {"ok": True, "customers": [dict(r) for r in rows]}
+
+
+def _db_project_assign_customer_direct(path: Path, project_key: str, customer_name: str) -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        cust = conn.execute("SELECT id, name FROM customers WHERE name = ?", (customer_name,)).fetchone()
+        if cust is None:
+            raise ValueError(f"customer puudub: {customer_name}")
+        cur = conn.execute("UPDATE projects SET customer_id = ?, updated_at = ? WHERE project_key = ?",
+                           (int(cust["id"]), now, project_key))
+        if cur.rowcount == 0:
+            raise ValueError(f"projekti ei leitud: {project_key}")
+    return {"ok": True, "project_key": project_key, "customer": cust["name"]}
+
+
+def _db_contract_add(path: Path, customer_name: str, name: str, currency: str = "EUR") -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        cust = conn.execute("SELECT id, name FROM customers WHERE name = ?", (customer_name,)).fetchone()
+        if cust is None:
+            raise ValueError(f"customer puudub: {customer_name}")
+        cur = conn.execute("INSERT INTO contracts(customer_id, name, currency, active, created_at) VALUES (?, ?, ?, 1, ?)",
+                           (int(cust["id"]), name.strip(), currency.strip() or "EUR", now))
+        cid = int(cur.lastrowid)
+    return {"ok": True, "contract": {"id": cid, "customer": customer_name, "name": name, "currency": currency or "EUR"}}
+
+
+def _db_contract_list(path: Path) -> dict:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        rows = conn.execute("""
+            SELECT co.*, c.name AS customer_name,
+                   (SELECT COUNT(*) FROM contract_rates r WHERE r.contract_id = co.id) AS rates
+            FROM contracts co JOIN customers c ON c.id = co.customer_id ORDER BY c.name, co.name
+        """).fetchall()
+    return {"ok": True, "contracts": [dict(r) for r in rows]}
+
+
+def _db_rate_add(path: Path, contract_id: int, valid_from: str, hourly_rate: float, valid_to: str = "") -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        if conn.execute("SELECT id FROM contracts WHERE id = ?", (int(contract_id),)).fetchone() is None:
+            raise ValueError(f"contract puudub: {contract_id}")
+        cur = conn.execute("INSERT INTO contract_rates(contract_id, valid_from, valid_to, hourly_rate, created_at) VALUES (?, ?, NULLIF(?, ''), ?, ?)",
+                           (int(contract_id), valid_from, valid_to or "", float(hourly_rate), now))
+        rid = int(cur.lastrowid)
+    return {"ok": True, "rate": {"id": rid, "contract_id": int(contract_id), "valid_from": valid_from,
+                                   "valid_to": valid_to or "", "hourly_rate": float(hourly_rate)}}
+
+
+def _db_rate_list(path: Path, contract_id: int | None = None) -> dict:
+    _db_init(path)
+    where = "WHERE r.contract_id = ?" if contract_id else ""
+    args = (int(contract_id),) if contract_id else ()
+    with _db_connect(path) as conn:
+        rows = conn.execute(f"""
+            SELECT r.*, co.name AS contract_name, c.name AS customer_name
+            FROM contract_rates r
+            JOIN contracts co ON co.id = r.contract_id
+            JOIN customers c ON c.id = co.customer_id
+            {where}
+            ORDER BY r.valid_from DESC, r.id DESC
+        """, args).fetchall()
+    return {"ok": True, "rates": [dict(r) for r in rows]}
 
 
 def _db_one_id(conn: sqlite3.Connection, sql: str, args: tuple) -> int:
@@ -2246,27 +2471,48 @@ def _qval(q: dict, key: str, default: str = "") -> str:
     return str(val) if val is not None else default
 
 
+def _query_tzinfo(q: dict) -> dt.tzinfo:
+    name = _qval(q, "timezone") or _qval(q, "tz")
+    if not name:
+        return dt.timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        return dt.timezone.utc
+
+
+def _query_bound(value: str, tz: dt.tzinfo, *, end_of_date: bool = False) -> dt.datetime | None:
+    if not value:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        d = dt.date.fromisoformat(value)
+        if end_of_date:
+            d = d + dt.timedelta(days=1)
+        return dt.datetime.combine(d, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+    return parse_iso(value)
+
+
 def _period_bounds(q: dict) -> tuple[str, str, str]:
+    tz = _query_tzinfo(q)
     period = _qval(q, "period")
     if re.fullmatch(r"\d{4}-\d{2}", period):
         y, m = map(int, period.split("-"))
-        start = dt.datetime(y, m, 1, tzinfo=dt.timezone.utc)
-        end = dt.datetime(y + (m // 12), 1 if m == 12 else m + 1, 1, tzinfo=dt.timezone.utc)
-        return start.isoformat(), end.isoformat(), period
+        start_local = dt.datetime(y, m, 1, tzinfo=tz)
+        end_local = dt.datetime(y + (m // 12), 1 if m == 12 else m + 1, 1, tzinfo=tz)
+        return start_local.astimezone(dt.timezone.utc).isoformat(), end_local.astimezone(dt.timezone.utc).isoformat(), period
     from_s = _qval(q, "from") or _qval(q, "start")
     to_s = _qval(q, "to") or _qval(q, "end")
     now = _now_utc()
-    start = parse_iso(from_s) if from_s else dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
+    now_local = now.astimezone(tz)
+    start = _query_bound(from_s, tz) if from_s else dt.datetime(now_local.year, now_local.month, 1, tzinfo=tz).astimezone(dt.timezone.utc)
     if to_s:
-        end = parse_iso(to_s)
-        if end and re.fullmatch(r"\d{4}-\d{2}-\d{2}", to_s):
-            end = end + dt.timedelta(days=1)
+        end = _query_bound(to_s, tz, end_of_date=True)
     else:
-        end = dt.datetime(now.year + (now.month // 12), 1 if now.month == 12 else now.month + 1, 1,
-                          tzinfo=dt.timezone.utc)
+        end = dt.datetime(now_local.year + (now_local.month // 12), 1 if now_local.month == 12 else now_local.month + 1, 1,
+                          tzinfo=tz).astimezone(dt.timezone.utc)
     start = start or dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
     end = end or now
-    label = f"{start.date()}..{end.date()}"
+    label = f"{start.astimezone(tz).date()}..{end.astimezone(tz).date()}"
     return start.isoformat(), end.isoformat(), label
 
 
@@ -2352,7 +2598,9 @@ def _db_invoice_lines(path: Path, token: str, q: dict) -> dict:
         if hourly_rate is not None:
             line["amount"] = round((mins / 60.0) * hourly_rate, 2)
         lines.append(line)
-    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+    return {"ok": True, "deprecated": True,
+            "deprecation_notice": "Kasuta /api/export/work-sessions ja /api/export/active-intervals; arve renderdamine jääb välisesse kihti.",
+            "period": label, "from": start_iso, "to": end_iso,
             "currency": "EUR", "hourly_rate": hourly_rate, "lines": lines}
 
 
@@ -2402,10 +2650,39 @@ def _db_practice_summary(path: Path, token: str, q: dict) -> dict:
 def _activity_bounds(q: dict) -> tuple[str, str, str]:
     date_s = _qval(q, "date")
     if _valid_date(date_s):
-        start = dt.datetime.fromisoformat(date_s).replace(tzinfo=dt.timezone.utc)
-        end = start + dt.timedelta(days=1)
+        tz = _query_tzinfo(q)
+        d = dt.date.fromisoformat(date_s)
+        start = dt.datetime.combine(d, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+        end = dt.datetime.combine(d + dt.timedelta(days=1), dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
         return start.isoformat(), end.isoformat(), date_s
     return _period_bounds(q)
+
+
+def _agent_tree_from_raw_items(raw_items: list[dict]) -> list[dict]:
+    nodes: dict[str, dict] = {}
+    for item in raw_items:
+        uid = str(item.get("agent_uid") or "")
+        if not uid:
+            continue
+        node = nodes.setdefault(uid, {"agent_uid": uid, "parent_agent_uid": str(item.get("parent_agent_uid") or ""),
+                                      "events": 0, "tools": set(), "children": []})
+        node["events"] += 1
+        if item.get("tool_name"):
+            node["tools"].add(str(item.get("tool_name")))
+        if item.get("parent_agent_uid") and not node.get("parent_agent_uid"):
+            node["parent_agent_uid"] = str(item.get("parent_agent_uid"))
+    roots = []
+    for uid, node in nodes.items():
+        parent = str(node.get("parent_agent_uid") or "")
+        if parent and parent in nodes and parent != uid:
+            nodes[parent]["children"].append(node)
+        else:
+            roots.append(node)
+    def clean(n: dict) -> dict:
+        return {"agent_uid": n["agent_uid"], "parent_agent_uid": n.get("parent_agent_uid", ""),
+                "events": int(n.get("events") or 0), "tools": sorted(n.get("tools") or []),
+                "children": [clean(c) for c in sorted(n.get("children") or [], key=lambda x: x["agent_uid"])]}
+    return [clean(r) for r in sorted(roots, key=lambda x: x["agent_uid"])]
 
 
 def _db_activity_log(path: Path, token: str, q: dict) -> dict:
@@ -2612,7 +2889,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     activity.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
     return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
             "sessions": session_items, "prompt_events": prompt_items, "raw_events": raw_items,
-            "activity": activity[:limit]}
+            "agent_tree": _agent_tree_from_raw_items(raw_items), "activity": activity[:limit]}
 
 
 def _hour_label_from_local(local: dt.datetime) -> str:
@@ -5162,7 +5439,7 @@ input { width:min(420px,100%); background:transparent; color:var(--text); border
 <body>
 <header>
   <div><h1>Kasutaja seaded</h1><div class="small">Parool ja tulevikus muud kasutaja seaded. <span id="userInfo"></span></div></div>
-  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="logout()">Logi välja</button></div>
+  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="location.href='/admin'">Admin</button><button onclick="logout()">Logi välja</button></div>
 </header>
 <main>
   <section class="panel">
@@ -5225,6 +5502,45 @@ init().catch(e => setStatus(e.message || 'login puudub', 'bad'));
 </html>"""
 
 
+def _admin_page_html() -> str:
+    return r"""<!doctype html>
+<html lang="et">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitrack admin</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --bad:#f97316; --line:#334155; --ok:#22c55e; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#fff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --bad:#c2410c; --line:#cbd5e1; --ok:#15803d; } }
+*{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--text)}
+header{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+main{padding:18px 22px 40px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:16px;box-shadow:0 8px 30px rgba(0,0,0,.12)}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}button,input,select{font:inherit}button{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:10px;padding:8px 11px;cursor:pointer}button.primary{background:var(--accent);color:white;border-color:var(--accent)}
+input,select{background:transparent;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:8px}.small{color:var(--muted);font-size:13px}.status{min-height:20px;color:var(--muted)}.bad{color:var(--bad)}.ok{color:var(--ok)}
+table{width:100%;border-collapse:collapse}th,td{border-top:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{color:var(--muted);font-size:13px}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted);font-size:12px}code{user-select:all}
+</style>
+</head>
+<body>
+<header><div><h1>aitrack admin</h1><div class="small">Kasutajad ja turvaaudit. Token kuvatakse ainult uue kasutaja loomisel.</div></div><div class="toolbar"><button onclick="location.href='/activity'">Tegevused</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="logout()">Logi välja</button></div></header>
+<main>
+<section class="panel"><h2>Kasutajad</h2><div class="toolbar"><input id="newName" placeholder="kasutajanimi"><select id="newRole"><option>user</option><option>admin</option></select><input id="newPassword" type="password" placeholder="algparool (valikuline)"><button class="primary" onclick="addUser()">Lisa kasutaja</button><button onclick="loadUsers()">Värskenda</button></div><div id="userStatus" class="status"></div><table><thead><tr><th>Nimi</th><th>Roll</th><th>Web sessioonid</th><th>Work session'id</th><th>Tegevus</th></tr></thead><tbody id="usersBody"></tbody></table></section>
+<section class="panel"><h2>Turvaaudit</h2><div class="toolbar"><input type="date" id="auditDate"><input id="auditType" placeholder="event_type"><button onclick="loadSecurity()">Ava</button></div><table><thead><tr><th>Aeg</th><th>Event</th><th>Kasutaja</th><th>IP/path</th><th>Detail</th></tr></thead><tbody id="auditBody"></tbody></table></section>
+</main>
+<script>
+const $=id=>document.getElementById(id); const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
+async function api(path,opts={}){const res=await fetch(path,{credentials:'same-origin',...opts});const data=await res.json().catch(()=>({}));if(res.status===401||res.status===403){if(data.error==='admini õigus puudub') throw new Error(data.error); location.href='/login?next=/admin'; throw new Error(data.error||'login puudub')}if(!res.ok||data.ok===false)throw new Error(data.error||res.statusText);return data}
+function fmt(s){if(!s)return'';const d=new Date(s);return isNaN(d)?esc(s):d.toLocaleString()}
+async function loadUsers(){const data=await api('/api/admin/users');$('usersBody').innerHTML=(data.users||[]).map(u=>`<tr><td>${esc(u.name)}</td><td><span class="pill">${esc(u.role)}</span></td><td>${esc(u.active_web_sessions)}</td><td>${esc(u.work_sessions)}<div class="small">aktiivseid ${esc(u.active_work_sessions)}</div></td><td><button onclick="setPw('${esc(u.name)}')">Sea parool</button> <button onclick="revoke('${esc(u.name)}')">Tühista web sessioonid</button></td></tr>`).join('')||'<tr><td colspan="5">Kasutajaid pole.</td></tr>'}
+async function addUser(){try{const body={name:$('newName').value.trim(),role:$('newRole').value,password:$('newPassword').value};const data=await api('/api/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('userStatus').className='status ok';$('userStatus').innerHTML='Kasutaja loodud. API token (kopeeri nüüd): <code>'+esc(data.token)+'</code>';$('newPassword').value='';await loadUsers()}catch(e){$('userStatus').className='status bad';$('userStatus').textContent=e.message}}
+async function setPw(name){const pw=prompt('Uus parool kasutajale '+name+' (vähemalt 8 märki)');if(!pw)return;await api('/api/admin/users/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,password:pw})});await loadUsers()}
+async function revoke(name){if(!confirm('Tühistan web sessioonid: '+name+'?'))return;await api('/api/admin/users/revoke-sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});await loadUsers()}
+async function loadSecurity(){const q=new URLSearchParams();if($('auditDate').value)q.set('date',$('auditDate').value);if($('auditType').value)q.set('event_type',$('auditType').value);q.set('limit','200');const data=await api('/api/admin/security-events?'+q.toString());$('auditBody').innerHTML=(data.events||[]).map(e=>`<tr><td>${fmt(e.created_at)}</td><td><span class="pill">${esc(e.event_type)}</span></td><td>${esc(e.user||'')}</td><td>${esc(e.ip)}<div class="small">${esc(e.path)}</div></td><td>${esc(e.detail||'')}</td></tr>`).join('')||'<tr><td colspan="5">Auditit pole.</td></tr>'}
+async function logout(){await fetch('/api/logout',{method:'POST',credentials:'same-origin'}).catch(()=>{});location.href='/login?next=/admin'}
+async function init(){ $('auditDate').value=new Date().toISOString().slice(0,10); await loadUsers(); await loadSecurity(); }
+init().catch(e=>{$('userStatus').className='status bad';$('userStatus').textContent=e.message});
+</script>
+</body></html>"""
+
+
 def _activity_page_html() -> str:
     return r"""<!doctype html>
 <html lang="et">
@@ -5266,7 +5582,7 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 <body>
 <header>
   <div><h1>aitrack server tegevused</h1><div class="small">Work session'id, prompt-eventid ja tegevuste ajalugu sisselogitud kasutaja õiguste piires. <span id="userInfo"></span></div></div>
-  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
+  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="location.href='/admin'">Admin</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -5292,6 +5608,10 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
   <section class="panel">
     <h2>Prompt-eventid</h2>
     <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Kestus</th><th>Prompt</th></tr></thead><tbody id="promptsBody"></tbody></table>
+  </section>
+  <section class="panel">
+    <h2>Agent/subagent tree</h2>
+    <div id="agentTree" class="small">Laen…</div>
   </section>
   <section class="panel">
     <h2>Raw eventid</h2>
@@ -5357,6 +5677,12 @@ function renderPrompts(rows) {
     <td data-label="Prompt"><pre>${esc(x.prompt_text || '')}</pre></td>
   </tr>`).join('') : '<tr><td class="empty" colspan="6">Prompt-evente pole.</td></tr>';
 }
+function renderAgentNode(x, depth=0) {
+  return `<div style="margin-left:${depth * 18}px">${depth ? '↳ ' : ''}<code>${esc(x.agent_uid || '')}</code> <span class="pill">${esc(x.events || 0)} event</span> ${esc((x.tools || []).join(', '))}</div>${(x.children || []).map(c => renderAgentNode(c, depth + 1)).join('')}`;
+}
+function renderAgentTree(rows) {
+  $('agentTree').innerHTML = rows && rows.length ? rows.map(x => renderAgentNode(x, 0)).join('') : 'Agent/subagent seoseid pole.';
+}
 function renderRawEvents(rows) {
   $('rawEventsBody').innerHTML = rows.length ? rows.map(x => `<tr>
     <td data-label="Aeg">${fmtTime(x.occurred_at_utc)}</td>
@@ -5372,6 +5698,7 @@ function renderWaiting(message) {
   $('activityBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
   $('sessionsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
   $('promptsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
+  $('agentTree').textContent = message;
   $('rawEventsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
 }
 async function loadActivity() {
@@ -5386,7 +5713,7 @@ async function loadActivity() {
   setStatus('Laen…');
   try {
     const data = await api('/api/activity?' + params.toString());
-    renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []); renderRawEvents(data.raw_events || []);
+    renderMetrics(data); renderActivity(data.activity || []); renderSessions(data.sessions || []); renderPrompts(data.prompt_events || []); renderAgentTree(data.agent_tree || []); renderRawEvents(data.raw_events || []);
     setStatus('Laetud');
   } catch (e) {
     renderWaiting(e.message || 'Päring ebaõnnestus');
@@ -5489,6 +5816,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if _is_suspicious_request_path(path):
                 self.__class__._banned_until[ip] = now + BAN_SECONDS
                 log(f"security: suspicious path {ip} {path}")
+                if self._server_mode():
+                    _db_record_security_event(self._db_path(), None, "suspicious_path", ip=ip, req_path=path, detail="auto ban")
                 self._reject(403, "kahtlane päring")
                 return False
             hits = [t for t in self.__class__._rate_hits.get(ip, []) if now - t < RATE_WINDOW_SECONDS]
@@ -5497,6 +5826,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if len(hits) > RATE_MAX_REQUESTS:
                 self.__class__._banned_until[ip] = now + BAN_SECONDS
                 log(f"security: rate limit ban {ip} hits={len(hits)}")
+                if self._server_mode():
+                    _db_record_security_event(self._db_path(), None, "rate_limit_ban", ip=ip, req_path=path, detail=f"hits={len(hits)}")
                 self._reject(429, "liiga palju päringuid", retry_after=BAN_SECONDS)
                 return False
         return True
@@ -5573,7 +5904,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         if not self._allow_request():
             return
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html", "/activity", "/account", "/login"):
+        if path in ("/", "/index.html", "/activity", "/account", "/admin", "/login"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -5614,6 +5945,19 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._redirect("/login?next=/account")
                     return
                 self._html(_account_page_html())
+                return
+            if u.path == "/admin":
+                if not self._server_mode():
+                    self._redirect("/")
+                    return
+                user = self._cookie_user()
+                if user is None:
+                    self._redirect("/login?next=/admin")
+                    return
+                if user["role"] != "admin":
+                    self._json({"ok": False, "error": "admini õigus puudub"}, 403)
+                    return
+                self._html(_admin_page_html())
                 return
             if u.path == "/favicon.ico":
                 self.send_response(204)
@@ -5679,6 +6023,12 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/export/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))
                 return
+            if u.path == "/api/admin/users" and self._server_mode():
+                self._json(_db_admin_users(self._db_path(), self._token(q)))
+                return
+            if u.path == "/api/admin/security-events" and self._server_mode():
+                self._json(_db_admin_security_events(self._db_path(), self._token(q), q))
+                return
             if u.path == "/api/export/raw-events" and self._server_mode():
                 self._json(_db_export_raw_events(self._db_path(), self._token(q), q))
                 return
@@ -5707,10 +6057,13 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             u = urllib.parse.urlparse(self.path)
             data = self._read_json()
             if u.path == "/api/login" and self._server_mode():
+                login_name = str(data.get("name") or "")
                 try:
-                    result = _db_login(self._db_path(), str(data.get("name") or ""), str(data.get("password") or ""))
+                    result = _db_login(self._db_path(), login_name, str(data.get("password") or ""))
                 except PermissionError as e:
                     banned = self._record_login_failure()
+                    _db_record_security_event(self._db_path(), None, "login_failed", ip=self._client_ip(), req_path=u.path,
+                                              detail=f"name={login_name} banned={banned}")
                     status = 429 if banned else 403
                     retry = BAN_SECONDS if banned else None
                     self._json({"ok": False, "error": "liiga palju ebaõnnestunud logineid" if banned else str(e)},
@@ -5718,10 +6071,16 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     return
                 self._record_login_success()
                 session_token = str(result.pop("session_token"))
+                uid = int(result.get("user", {}).get("id") or 0) or None
+                _db_record_security_event(self._db_path(), uid, "login_success", ip=self._client_ip(), req_path=u.path,
+                                          success=True, detail=f"name={login_name}")
                 self._json(result, headers={"Set-Cookie": self._session_cookie_header(session_token)})
                 return
             if u.path == "/api/logout" and self._server_mode():
+                user = self._cookie_user()
                 _db_destroy_session(self._db_path(), self._cookie_value(WEB_SESSION_COOKIE))
+                _db_record_security_event(self._db_path(), int(user["id"]) if user is not None else None,
+                                          "logout", ip=self._client_ip(), req_path=u.path, success=True)
                 self._json({"ok": True}, headers={"Set-Cookie": self._session_cookie_header("", clear=True)})
                 return
             if u.path == "/api/me/password" and self._server_mode():
@@ -5730,12 +6089,26 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": "login puudub"}, 401)
                     return
                 try:
-                    self._json(_db_change_user_password(
+                    result = _db_change_user_password(
                         self._db_path(), int(user["id"]),
                         str(data.get("current_password") or ""), str(data.get("new_password") or ""),
-                    ))
+                    )
+                    _db_record_security_event(self._db_path(), int(user["id"]), "password_changed",
+                                              ip=self._client_ip(), req_path=u.path, success=True)
+                    self._json(result)
                 except (PermissionError, ValueError) as e:
+                    _db_record_security_event(self._db_path(), int(user["id"]), "password_change_failed",
+                                              ip=self._client_ip(), req_path=u.path, detail=str(e))
                     self._json({"ok": False, "error": str(e)}, 400)
+                return
+            if u.path == "/api/admin/users" and self._server_mode():
+                self._json(_db_admin_add_user(self._db_path(), self._token(data=data), data))
+                return
+            if u.path == "/api/admin/users/password" and self._server_mode():
+                self._json(_db_admin_set_user_password(self._db_path(), self._token(data=data), data))
+                return
+            if u.path == "/api/admin/users/revoke-sessions" and self._server_mode():
+                self._json(_db_admin_revoke_user_sessions(self._db_path(), self._token(data=data), data))
                 return
             if u.path == "/api/keys" and self._server_mode():
                 keys = sorted(_db_keys(self._db_path(), self._token(data=data)))
@@ -5899,6 +6272,54 @@ def cmd_user(args, cfg):
         for r in rows:
             login = "login" if r["password_hash"] else "token-only"
             print(f"{r['id']:3d}  {r['name']:20s}  {r['role']:8s}  {login:10s}  {r['created_at']}")
+
+
+def cmd_customer(args, cfg):
+    db_path = _server_db_path(args.db)
+    if args.customer_cmd == "add":
+        res = _db_customer_add(db_path, args.name, getattr(args, "external_key", "") or "")
+        c = res["customer"]
+        print(f"Customer {c['id']}: {c['name']}")
+        return
+    if args.customer_cmd == "list":
+        for c in _db_customer_list(db_path)["customers"]:
+            print(f"{c['id']:3d}  {c['name']:30s}  projects={c['projects']}")
+        return
+
+
+def cmd_project(args, cfg):
+    db_path = _server_db_path(args.db)
+    if args.project_cmd == "assign-customer":
+        res = _db_project_assign_customer_direct(db_path, args.project_key, args.customer)
+        print(f"Projekt {res['project_key']} → customer {res['customer']}")
+        return
+
+
+def cmd_contract(args, cfg):
+    db_path = _server_db_path(args.db)
+    if args.contract_cmd == "add":
+        res = _db_contract_add(db_path, args.customer, args.name, args.currency)
+        c = res["contract"]
+        print(f"Contract {c['id']}: {c['customer']} / {c['name']} ({c['currency']})")
+        return
+    if args.contract_cmd == "list":
+        for c in _db_contract_list(db_path)["contracts"]:
+            active = "active" if c["active"] else "inactive"
+            print(f"{c['id']:3d}  {c['customer_name']:24s}  {c['name']:30s}  {c['currency']}  {active}  rates={c['rates']}")
+        return
+
+
+def cmd_rate(args, cfg):
+    db_path = _server_db_path(args.db)
+    if args.rate_cmd == "add":
+        res = _db_rate_add(db_path, args.contract_id, args.valid_from, args.hourly_rate, args.valid_to or "")
+        r = res["rate"]
+        print(f"Rate {r['id']}: contract={r['contract_id']} {r['hourly_rate']} alates {r['valid_from']}")
+        return
+    if args.rate_cmd == "list":
+        for r in _db_rate_list(db_path, getattr(args, "contract_id", None))["rates"]:
+            print(f"{r['id']:3d}  contract={r['contract_id']:3d}  {r['customer_name']} / {r['contract_name']}  {r['hourly_rate']}  {r['valid_from']}..{r['valid_to'] or ''}")
+        return
 
 
 def cmd_connect(args, cfg):
@@ -6784,6 +7205,32 @@ def main():
     ul = us.add_parser("list", help="näita kasutajaid")
     ul.add_argument("--db", default=str(SERVER_DB))
     ul.set_defaults(fn=cmd_user)
+
+    cust = sub.add_parser("customer", help="halda kliente serveri DB-s")
+    cus = cust.add_subparsers(dest="customer_cmd", required=True)
+    ca = cus.add_parser("add", help="lisa klient")
+    ca.add_argument("name"); ca.add_argument("--external-key", default=""); ca.add_argument("--db", default=str(SERVER_DB)); ca.set_defaults(fn=cmd_customer)
+    cl = cus.add_parser("list", help="näita kliente")
+    cl.add_argument("--db", default=str(SERVER_DB)); cl.set_defaults(fn=cmd_customer)
+
+    prj = sub.add_parser("project", help="projekti admin-käsud")
+    prs = prj.add_subparsers(dest="project_cmd", required=True)
+    pac = prs.add_parser("assign-customer", help="seo olemasolev project_key kliendiga")
+    pac.add_argument("project_key"); pac.add_argument("customer"); pac.add_argument("--db", default=str(SERVER_DB)); pac.set_defaults(fn=cmd_project)
+
+    con = sub.add_parser("contract", help="halda lepinguid serveri DB-s")
+    cos = con.add_subparsers(dest="contract_cmd", required=True)
+    coa = cos.add_parser("add", help="lisa leping kliendile")
+    coa.add_argument("customer"); coa.add_argument("name"); coa.add_argument("--currency", default="EUR"); coa.add_argument("--db", default=str(SERVER_DB)); coa.set_defaults(fn=cmd_contract)
+    col = cos.add_parser("list", help="näita lepinguid")
+    col.add_argument("--db", default=str(SERVER_DB)); col.set_defaults(fn=cmd_contract)
+
+    rate = sub.add_parser("rate", help="halda lepingute tunnihindu")
+    ras = rate.add_subparsers(dest="rate_cmd", required=True)
+    raa = ras.add_parser("add", help="lisa tunnihind")
+    raa.add_argument("contract_id", type=int); raa.add_argument("hourly_rate", type=float); raa.add_argument("--valid-from", required=True); raa.add_argument("--valid-to", default=""); raa.add_argument("--db", default=str(SERVER_DB)); raa.set_defaults(fn=cmd_rate)
+    ral = ras.add_parser("list", help="näita hindu")
+    ral.add_argument("--contract-id", type=int); ral.add_argument("--db", default=str(SERVER_DB)); ral.set_defaults(fn=cmd_rate)
 
     sub.add_parser("setup", help="interaktiivne seadistus algusest lõpuni (soovitatav)").set_defaults(fn=cmd_setup)
 

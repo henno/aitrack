@@ -85,6 +85,8 @@ kõik ühe vooluga:
 | `aitrack watchdog --stale-minutes N --stuck-minutes N` | Märgi progressita või liiga kaua tooli sees olevad sessioonid `stale`/`stuck` olekusse. |
 | `aitrack cleanup --older-than 90d [--apply]` | Retention cleanup: raw eventid ja rollupitud vanad minute tickid; vaikimisi dry-run. |
 | `aitrack events status/flush` | Lokaalse offline raw-event outboxi olek ja uuestisaatmine. |
+| `aitrack customer/contract/rate ...` | Kliendi, lepingu ja tunnihinna baastöövoog serveri DB jaoks. |
+| `aitrack project assign-customer PROJECT_KEY CUSTOMER` | Seo olemasolev projekt kliendiga. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
@@ -173,6 +175,9 @@ aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser suunatakse vajadusel
 `/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.
 Tavakasutaja näeb enda work session'eid, prompt-evente ja tegevuste ajalugu; admin näeb kõiki kasutajaid.
+Admini kasutajavaade on `https://aitrack.example.com/admin`: seal saab kasutajaid lisada, paroole seada,
+web-sessioone tühistada ja turvaauditit vaadata. Loginid, ebaõnnestunud loginid, paroolimuudatused,
+admin-toimingud, rate-limit ban'id ja kahtlased probe'id lähevad `security_events` tabelisse.
 API/CLI jaoks jääb token-põhine autentimine alles. Server rakendab lihtsat mälupõhist rate limiterit;
 liigsed päringud, korduvad valed login'id ja tüüpilised probe'id (`/.env`, `/.git`, `wp-login.php` jne)
 saavad ajutise IP-ban'i.
@@ -194,7 +199,10 @@ aitrack install --minute-tracking --pi-extension
 # Pi sees: /reload või ava uus pi session
 ```
 
-Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
+Arve jaoks server dokumenti ei tee, vaid annab export-andmed välisele arvegeneraatorile. Vana
+`/api/billing/invoice-lines` endpoint jääb ühilduvuseks alles, kuid vastuses on `deprecated: true`;
+eelista `/api/export/work-sessions` ja `/api/export/active-intervals`. Admin-token näeb kõigi kasutajate ridu;
+tavakasutaja token ainult enda omi.
 
 ```bash
 curl -H "X-Aitrack-Token: TOKEN" \
@@ -229,6 +237,7 @@ curl -H "X-Aitrack-Token: TOKEN" \
 - **Windowsis (või kui kuvaajad on valed)** määra tsoon selgelt:
   `python3 aitrack.py init --timezone Europe/Tallinn`
   (Windowsil võib vaja minna `pip install tzdata`.)
+- Serveri export/activity päringutes saab anda `timezone=Europe/Tallinn` või `tz=Europe/Tallinn`; kuupäeva- ja kuupiirid lõigatakse siis kohaliku päeva/kuu järgi, DB-s jäävad ajatemplid UTC-sse.
 
 ## Veaotsing
 - Logi: `~/.config/aitrack/aitrack.log` ja `aitrack status`

@@ -895,5 +895,68 @@ clip_export = A._db_export_active_intervals(clipdb, cltok, {"date": ["2026-06-17
 clip_interval = clip_export["intervals"][0] if clip_export["intervals"] else {}
 check("interval export loeb ainult perioodi sisse jäävad minutid", clip_export["minutes"] == 10 and clip_interval.get("minutes") == 10 and clip_interval.get("start_minute_utc").startswith("2026-06-17T00:00:00"))
 
+# ============ TEST 56: timezone bounds lõikavad kohaliku päeva järgi ==========
+print("TEST 56: timezone query bounds kasutavad kohalikku päeva/perioodi")
+tz_start, tz_end, _ = A._activity_bounds({"date": ["2026-06-17"], "timezone": ["Europe/Tallinn"]})
+month_start, month_end, _ = A._period_bounds({"period": ["2026-06"], "timezone": ["Europe/Tallinn"]})
+check("Tallinna päev algab UTC-s eelmisel õhtul", tz_start.startswith("2026-06-16T21:00:00") and tz_end.startswith("2026-06-17T21:00:00"))
+check("Tallinna kuu piirid teisenduvad UTC-sse", month_start.startswith("2026-05-31T21:00:00") and month_end.startswith("2026-06-30T21:00:00"))
+
+# ============ TEST 57: admin kasutajahaldus ja security_events ==========
+print("TEST 57: admin API helperid haldavad kasutajaid ja auditit")
+adb = CFG / "server-admin-test.db"
+adb.unlink(missing_ok=True)
+admintok = A._db_add_user(adb, "root", role="admin", password="rootpass123")
+new_user = A._db_admin_add_user(adb, admintok, {"name": "worker", "role": "user", "password": "workerpass123"})
+A._db_admin_set_user_password(adb, admintok, {"name": "worker", "password": "newpass123"})
+login_res = A._db_login(adb, "worker", "newpass123")
+revoked = A._db_admin_revoke_user_sessions(adb, admintok, {"name": "worker"})
+users = A._db_admin_users(adb, admintok)
+security = A._db_admin_security_events(adb, admintok, {})
+check("admin saab kasutaja lisada ja parooli seada", new_user["user"]["name"] == "worker" and login_res["ok"])
+check("admin saab web sessioonid tühistada", revoked["revoked"] == 1)
+check("admin user list sisaldab uut kasutajat", any(u["name"] == "worker" for u in users["users"]))
+check("security_events salvestab admin toimingud", security["count"] >= 2 and any(e["event_type"] == "admin_user_created" for e in security["events"]))
+
+# ============ TEST 58: customer/contract/rate workflow ==========
+print("TEST 58: customer, contract ja rate workflow")
+wdb = CFG / "server-workflow-test.db"
+wdb.unlink(missing_ok=True)
+wtok = A._db_add_user(wdb, "workflow")
+wstart = A._db_work_start(wdb, wtok, {
+    "project": {"project_key": "github.com/example/acme", "name": "acme", "local_path": "/tmp/acme"},
+    "work": {"title": "workflow", "summary": "workflow"},
+    "session": {"client_id": "client-workflow", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/acme", "cwd": "/tmp/acme"},
+    "started_at": HFL(6).isoformat(),
+})
+A._db_work_tick(wdb, wtok, {"work_session_uid": wstart["work_session_uid"], "tick_at": HFL(6).isoformat()})
+customer = A._db_customer_add(wdb, "Acme OÜ")
+assigned = A._db_project_assign_customer_direct(wdb, "github.com/example/acme", "Acme OÜ")
+contract = A._db_contract_add(wdb, "Acme OÜ", "Põhileping")
+rate = A._db_rate_add(wdb, contract["contract"]["id"], "2026-06-01", 82.0)
+invoice = A._db_invoice_lines(wdb, wtok, {"period": ["2026-06"], "customer_id": [str(customer["customer"]["id"])]})
+check("project assign-customer seob projekti kliendiga", assigned["customer"] == "Acme OÜ")
+check("contract ja rate lisanduvad", contract["contract"]["id"] > 0 and rate["rate"]["hourly_rate"] == 82.0)
+check("invoice endpoint on deprecate märgisega ja customer filter töötab", invoice.get("deprecated") is True and invoice["lines"] and invoice["lines"][0]["customer"] == "Acme OÜ")
+
+# ============ TEST 59: agent tree raw eventidest ==========
+print("TEST 59: activity tagastab agent/subagent tree")
+treedb = CFG / "server-agent-tree-test.db"
+treedb.unlink(missing_ok=True)
+treetok = A._db_add_user(treedb, "treeuser")
+tstart = A._db_work_start(treedb, treetok, {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "tree", "summary": "tree"},
+    "session": {"client_id": "client-tree", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(5).isoformat(),
+})
+A._db_ingest_events(treedb, treetok, [
+    {"event_key": "root-agent-event", "event_type": "agent_started", "work_session_uid": tstart["work_session_uid"], "agent_uid": "root-agent", "occurred_at_utc": HFL(5).isoformat()},
+    {"event_key": "child-agent-event", "event_type": "subagent_started", "work_session_uid": tstart["work_session_uid"], "agent_uid": "child-agent", "parent_agent_uid": "root-agent", "tool_name": "subagent", "occurred_at_utc": HFL(5).isoformat()},
+])
+tree_activity = A._db_activity_log(treedb, treetok, {"period": ["2026-06"]})
+root = tree_activity.get("agent_tree", [{}])[0]
+check("agent tree sisaldab parent-child seost", root.get("agent_uid") == "root-agent" and root.get("children") and root["children"][0].get("agent_uid") == "child-agent")
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
