@@ -2246,13 +2246,20 @@ def _server_url(cfg: dict, op: str) -> str:
     return f"{base}/api/{op}"
 
 
+def _server_headers(extra: dict | None = None) -> dict:
+    headers = {"User-Agent": "aitrack/1.0", "Accept": "application/json"}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def _server_get(op: str, params: dict, cfg: dict) -> dict | None:
     sink = cfg.get("sink", {})
     params = {"token": sink.get("token", ""), **params}
     qs = urllib.parse.urlencode(params)
     url = _server_url(cfg, op) + (f"?{qs}" if qs else "")
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        req = urllib.request.Request(url, headers=_server_headers(), method="GET")
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
@@ -2266,7 +2273,7 @@ def _server_post(op: str, payload: dict, cfg: dict) -> dict | None:
     data = json.dumps(payload).encode("utf-8")
     try:
         req = urllib.request.Request(_server_url(cfg, op), data=data,
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers=_server_headers({"Content-Type": "application/json"}), method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001

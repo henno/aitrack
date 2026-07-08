@@ -636,5 +636,11 @@ check("activity leht kutsub /api/activity endpointi", "/api/activity" in activit
 check("activity leht ei päri API-t enne tokenit", "Sisesta serveri token" in activity_page and "if (!tok)" in activity_page)
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
 
+# ============ TEST 46: server client saadab explicit User-Agent ============
+print("TEST 46: server client kasutab explicit User-Agent headerit")
+headers = A._server_headers({"Content-Type": "application/json"})
+check("server headerites on User-Agent", headers.get("User-Agent", "").startswith("aitrack/"))
+check("server headerid säilitavad Content-Type", headers.get("Content-Type") == "application/json")
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
