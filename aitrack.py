@@ -2447,7 +2447,7 @@ def _prompt_to_work_sentence(text: str) -> str:
             sep = "" if replacement.endswith(" ") or not rest else " "
             sentence = f"{replacement}{sep}{rest}".strip()
             return sentence.rstrip(".") + "."
-    return f"Tegelesin teemaga: {s}."
+    return "Tegelesin vastava tööteema uurimise ja lahendamisega."
 
 
 def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
