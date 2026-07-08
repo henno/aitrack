@@ -635,7 +635,7 @@ function renderActivity(rows) {
     const body = x.type === 'prompt_event'
       ? `<pre>${esc(x.prompt_text || '')}</pre>`
       : x.type === 'raw_event'
-        ? `${esc(x.event_type || '')}<div class="small">${esc(x.agent_uid || '')}</div>`
+        ? `${x.summary && x.summary !== x.event_type ? '<pre>' + esc(x.summary) + '</pre>' : esc(x.event_type || '')}<div class="small">${esc(x.event_type || '')}${x.agent_uid ? ' · ' + esc(x.agent_uid) : ''}</div>`
         : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
     return `<tr><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td><td data-label="Toorandmed">${detailButton(x)}</td></tr>`;
   }).join('') : '<tr><td class="empty" colspan="7">Tegevusi pole.</td></tr>';

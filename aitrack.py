@@ -2835,6 +2835,13 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     raw_items = []
     for r in raw_rows:
         payload_preview, payload_truncated, payload_bytes = _payload_preview_json(r["payload_json"])
+        payload_summary = ""
+        try:
+            payload_value = json.loads(r["payload_json"] or "{}")
+            if isinstance(payload_value, dict):
+                payload_summary = _event_summary_text(payload_value, limit=500)
+        except (TypeError, json.JSONDecodeError):
+            payload_summary = ""
         item = {
             "type": "raw_event",
             "id": int(r["id"]),
@@ -2859,7 +2866,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "payload_json": payload_preview,
             "payload_truncated": payload_truncated,
             "payload_bytes": payload_bytes,
-            "summary": r["event_type"],
+            "summary": payload_summary or r["event_type"],
         }
         raw_items.append(item)
         activity.append({**item, "at": r["occurred_at_utc"], "label": "raw_event"})
@@ -3520,6 +3527,14 @@ def _event_text(e: dict, *keys: str) -> str:
     return ""
 
 
+def _event_summary_text(e: dict, *, limit: int = 1000) -> str:
+    summary = _event_text(e, "summary", "done_summary", "change_summary", "changes", "result_summary", "prompt_text")
+    payload = e.get("payload")
+    if not summary and isinstance(payload, dict):
+        summary = _event_text(payload, "summary", "done_summary", "change_summary", "changes", "result_summary")
+    return _safe_day_prompt_snippet(summary, limit) if summary else ""
+
+
 def _raw_event_occurred_at(e: dict, now: str) -> str:
     raw = _event_text(e, "occurred_at_utc", "occurred_at", "timestamp", "started_at", "created_at")
     parsed = parse_iso(raw)
@@ -3607,6 +3622,7 @@ def _db_apply_raw_event_progress_conn(conn: sqlite3.Connection, work_session_id:
     tool_call_id = _event_text(e, "tool_call_id", "call_id")
     agent_uid = _event_text(e, "agent_uid", "agent_id")
     parent_agent_uid = _event_text(e, "parent_agent_uid", "parent_agent_id")
+    done_summary = _event_summary_text(e)
     updates: dict[str, object] = {"updated_at": now, "id": int(work_session_id)}
     clauses = []
     if event_type in _PROGRESS_EVENT_TYPES:
@@ -3634,6 +3650,12 @@ def _db_apply_raw_event_progress_conn(conn: sqlite3.Connection, work_session_id:
         if event_type == "tool_error":
             clauses.append("status_detail = :status_detail")
             updates["status_detail"] = f"tool_error:{tool_name}" if tool_name else "tool_error"
+    elif event_type in {"prompt_finished", "agent_finished"}:
+        clauses.extend(["current_tool_name = ''", "current_tool_call_id = ''", "current_tool_started_at = NULL"])
+        if done_summary:
+            clauses.extend(["summary = :done_summary", "status_detail = :status_detail"])
+            updates["done_summary"] = done_summary
+            updates["status_detail"] = "done:" + done_summary[:120]
     elif event_type in {"session_orphaned", "session_marked_orphan"}:
         clauses.extend(["status = 'orphan'", "status_detail = :status_detail"])
         updates["status_detail"] = "owner process missing"
@@ -6049,6 +6071,7 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
     tool_name = str(getattr(args, "tool_name", "") or getattr(args, "tool", "") or "pi")
     tool_call_id = str(getattr(args, "tool_call_id", "") or "")
     agent_uid = str(getattr(args, "agent_uid", "") or "")
+    summary_text = _safe_day_prompt_snippet(getattr(args, "summary", "") or getattr(args, "prompt", "") or "", 1000)
     event = {
         "event_key": f"hook:{event_type}:{session_uid}:{agent_uid}:{tool_call_id}:{now}",
         "event_type": event_type,
@@ -6058,11 +6081,12 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
         "tool_name": tool_name,
         "tool_call_id": tool_call_id,
         "occurred_at_utc": now,
+        "summary": summary_text,
         "project": {"project_key": ctx.get("project_key", ""), "repo_url": ctx.get("repo_url", ""),
                     "name": ctx.get("name", ""), "local_path": ctx.get("local_path", ""),
                     "checkout_id": ctx.get("checkout_id", ""), "branch": ctx.get("branch", "")},
         "issue_key": ctx.get("issue_key", ""),
-        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(getattr(args, "summary", "") or getattr(args, "prompt", "") or "", 300)},
+        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 500)},
     }
     if event_type in {"prompt_started", "prompt_finished"}:
         event["prompt_text"] = _safe_day_prompt_snippet(getattr(args, "prompt", "") or getattr(args, "summary", "") or "", 500)
@@ -6226,7 +6250,7 @@ function runAitrack(args: string[], cwd: string) {
   }
 }
 
-function common(ctx: any, agentUid: string, prompt?: string): string[] {
+function common(ctx: any, agentUid: string, prompt?: string, summary?: string): string[] {
   return [
     "--tool", "pi",
     "--cwd", ctx.cwd || process.cwd(),
@@ -6234,7 +6258,40 @@ function common(ctx: any, agentUid: string, prompt?: string): string[] {
     "--owner-pid", String(process.ppid || process.pid),
     "--owner-command", process.argv.join(" ").slice(0, 500),
     ...(prompt ? ["--prompt", prompt.slice(0, 500)] : []),
+    ...(summary ? ["--summary", summary.slice(0, 1000)] : []),
   ];
+}
+
+type ContentBlock = { type?: string; text?: string; name?: string; arguments?: Record<string, unknown> };
+
+function textParts(content: unknown): string[] {
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((part) => {
+    const block = part as ContentBlock;
+    return block && block.type === "text" && typeof block.text === "string" ? [block.text] : [];
+  });
+}
+
+function doneSummary(event: any): string {
+  const messages = Array.isArray(event?.messages) ? event.messages : [];
+  const assistantTexts: string[] = [];
+  const changedFiles = new Set<string>();
+  for (const entry of messages) {
+    const message = entry?.message || entry;
+    if (message?.role !== "assistant") continue;
+    assistantTexts.push(...textParts(message.content).map((x) => x.trim()).filter(Boolean));
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      const block = part as ContentBlock;
+      const name = String(block?.name || "");
+      const args = (block?.arguments || {}) as Record<string, unknown>;
+      if (["edit", "write"].includes(name) && typeof args.path === "string") changedFiles.add(args.path);
+    }
+  }
+  const finalText = assistantTexts.length ? assistantTexts[assistantTexts.length - 1] : "";
+  const fileText = changedFiles.size ? `Muudetud failid: ${Array.from(changedFiles).join(", ")}` : "";
+  return [finalText, fileText].filter(Boolean).join("\n").slice(0, 1000);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -6273,9 +6330,10 @@ export default function (pi: ExtensionAPI) {
     ], ctx.cwd);
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
-    runAitrack(["hook", "agent-end", ...common(ctx, agentUid)], ctx.cwd);
-    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid)], ctx.cwd);
+  pi.on("agent_end", async (event, ctx) => {
+    const summary = doneSummary(event);
+    runAitrack(["hook", "agent-end", ...common(ctx, agentUid, undefined, summary)], ctx.cwd);
+    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid, undefined, summary)], ctx.cwd);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {

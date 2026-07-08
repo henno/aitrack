@@ -825,9 +825,16 @@ check("prompt/start endpoint tekitab prompt_eventi ja seob sessiooniga", prompt_
 check("tool-start endpoint uuendab jooksva tooli välja", erow["current_tool_name"] == "read" and erow["current_tool_call_id"] == "tc-1" and erow["agent_uid"] == "agent-a")
 check("activity agent filter leiab raw eventid", len(activity_agent.get("raw_events", [])) >= 2 and all(x.get("agent_uid") == "agent-a" for x in activity_agent.get("raw_events", [])))
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool_name": "read", "tool_call_id": "tc-1", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=4)).isoformat()}, "after_tool_call")
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "summary": "muudatused valmis", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=5)).isoformat()}, "agent_finished")
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "summary": "prompti kokkuvõte", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=6)).isoformat()}, "prompt_finished")
+activity_done = A._db_activity_log(edb, etok, {"period": ["2026-06"], "agent_uid": ["agent-a"]})
 with A._db_connect(edb) as conn:
-    cleared = conn.execute("SELECT current_tool_name FROM work_sessions WHERE session_uid = ?", (estart["work_session_uid"],)).fetchone()["current_tool_name"]
-check("tool-end endpoint puhastab jooksva tooli", cleared == "")
+    done_row = conn.execute("SELECT current_tool_name, summary, status_detail FROM work_sessions WHERE session_uid = ?", (estart["work_session_uid"],)).fetchone()
+    done_prompt = conn.execute("SELECT prompt_text FROM prompt_events WHERE prompt_text = 'prompti kokkuvõte'").fetchone()
+check("tool-end endpoint puhastab jooksva tooli", done_row["current_tool_name"] == "")
+check("done event uuendab sessiooni kokkuvõtte", done_row["summary"] == "prompti kokkuvõte" and str(done_row["status_detail"]).startswith("done:"))
+check("prompt-done event salvestab tehtu kokkuvõtte prompt-eventina", done_prompt is not None)
+check("activity raw done event näitab kokkuvõtet", any(x.get("event_type") == "agent_finished" and x.get("summary") == "muudatused valmis" for x in activity_done.get("raw_events", [])))
 
 # ============ TEST 53: watchdog tuvastab stuck tool-call'i ==========
 print("TEST 53: watchdog märgib pika poolelioleva tool-call'i stuck olekusse")
