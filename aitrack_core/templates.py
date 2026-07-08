@@ -484,7 +484,7 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
     <label>Kuupäev <input type="date" id="dateInput"></label>
     <label>Projekt <input id="projectInput" list="projectOptions" placeholder="otsi projekti" autocomplete="off"><datalist id="projectOptions"></datalist></label>
     <label>Kasutaja <input id="userInput" list="userOptions" placeholder="kasutajanimi" style="width:130px" autocomplete="off"><datalist id="userOptions"></datalist></label>
-    <label>Issue <input id="issueInput" placeholder="#123" style="width:90px"></label>
+    <label>Issue <input id="issueInput" list="issueOptions" placeholder="issue nr / pealkiri" style="width:220px" autocomplete="off"><datalist id="issueOptions"></datalist></label>
     <label>Tool <input id="toolInput" placeholder="pi" style="width:90px"></label>
     <label>Status <input id="statusInput" placeholder="active/stale" style="width:110px"></label>
     <label>Agent <input id="agentInput" placeholder="agent_uid" style="width:130px"></label>
@@ -533,6 +533,15 @@ async function api(path, opts={}) {
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data;
 }
+function renderIssueOptions(issues) {
+  $('issueOptions').innerHTML = (issues || []).map(i => {
+    const key = String(i.issue_key || '').replace(/^#/, '');
+    const title = String(i.title || '').trim();
+    const value = esc(title ? `${key} - ${title}` : key);
+    const label = esc(i.project_key || i.project_name || '');
+    return `<option value="${value}" label="${label}"></option>`;
+  }).join('');
+}
 function renderFilterOptions(data) {
   $('projectOptions').innerHTML = (data.projects || []).map(p => {
     const value = esc(p.project_key || p.name || '');
@@ -540,9 +549,20 @@ function renderFilterOptions(data) {
     return `<option value="${value}" label="${label}"></option>`;
   }).join('');
   $('userOptions').innerHTML = (data.users || []).map(u => `<option value="${esc(u.name || '')}" label="${esc(u.role || '')}"></option>`).join('');
+  renderIssueOptions(data.issues || []);
 }
 async function loadFilterOptions() {
   try { renderFilterOptions(await api('/api/activity/filters')); } catch (_) {}
+}
+async function loadIssueOptions() {
+  const params = new URLSearchParams();
+  if ($('projectInput').value) params.set('project_key', $('projectInput').value);
+  try { renderIssueOptions((await api('/api/activity/filters?' + params.toString())).issues || []); } catch (_) {}
+}
+let issueOptionsTimer = null;
+function scheduleIssueOptions() {
+  clearTimeout(issueOptionsTimer);
+  issueOptionsTimer = setTimeout(loadIssueOptions, 200);
 }
 function renderMetrics(data) {
   const minutes = (data.sessions || []).reduce((a, s) => a + Number(s.minutes || 0), 0);
@@ -634,6 +654,8 @@ async function logout() {
 }
 async function init() {
   $('dateInput').value = new Date().toISOString().slice(0, 10);
+  $('projectInput').addEventListener('input', scheduleIssueOptions);
+  $('projectInput').addEventListener('change', loadIssueOptions);
   const me = await api('/api/me');
   $('userInfo').textContent = me.user ? `(${me.user.name}, ${me.user.role})` : '';
   await loadFilterOptions();

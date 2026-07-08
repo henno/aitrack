@@ -591,6 +591,7 @@ check("SSH ja HTTPS URL normaliseeruvad samaks",
       A._normalise_repo_url("https://github.com/Puhastusproff/pp-finar.git") ==
       "github.com/puhastusproff/pp-finar")
 check("branchist leitakse issue number", A._issue_from_branch("fix/662-asendaja-puhadetasu") == "662")
+check("issue combobox labelist leitakse issue number", A._normalise_issue_key("662 - Asendaja pühadetasu") == "662")
 
 # ============ TEST 43: 3NF work_session + invoice/practice vaated ============
 print("TEST 43: serveri normaliseeritud work_session'id toidavad arve- ja praktikavaadet")
@@ -715,6 +716,7 @@ rdb.unlink(missing_ok=True)
 rtok = A._db_add_user(rdb, "rawuser")
 rpayload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "issue": {"provider": "github", "issue_key": "662", "title": "Asendaja pühadetasu"},
     "work": {"title": "raw events test", "summary": "raw events"},
     "session": {"client_id": "client-raw", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
     "started_at": HFL(12).isoformat(),
@@ -736,7 +738,8 @@ raw_res2 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_export = A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["before_tool_call"]})
 raw_activity = A._db_activity_log(rdb, rtok, {"period": ["2026-06"]})
 raw_activity_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "project": ["parkkarl"], "user": ["raw"]})
-raw_filter_options = A._db_activity_filter_options(rdb, rtok)
+raw_activity_issue_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "issue": ["662 - Asendaja pühadetasu"]})
+raw_filter_options = A._db_activity_filter_options(rdb, rtok, {"project": ["parkkarl"]})
 with A._db_connect(rdb) as conn:
     raw_count = conn.execute("SELECT COUNT(*) AS c FROM raw_events").fetchone()["c"]
     prompt_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
@@ -746,7 +749,8 @@ check("raw event ei tekita legacy prompt-eventi", prompt_count == 0)
 check("raw export leiab sündmuse ja seob work_session_uid-ga", raw_export["count"] == 1 and exported_raw.get("work_session_uid") == rstart["work_session_uid"] and exported_raw.get("work_session_id") == rstart["work_session_id"])
 check("activity helper tagastab raw event timeline'i", len(raw_activity.get("raw_events", [])) == 1 and any(x.get("type") == "raw_event" for x in raw_activity.get("activity", [])))
 check("activity filter otsib projekti ja kasutajat osalise tekstiga", len(raw_activity_filtered.get("raw_events", [])) == 1)
-check("activity autocomplete valikud sisaldavad projekti ja kasutajat", any("parkkarl" in p.get("project_key", "") for p in raw_filter_options.get("projects", [])) and any(u.get("name") == "rawuser" for u in raw_filter_options.get("users", [])))
+check("activity issue filter oskab combobox labelit kasutada", len(raw_activity_issue_filtered.get("raw_events", [])) == 1)
+check("activity autocomplete valikud sisaldavad projekti, kasutajat ja issue pealkirja", any("parkkarl" in p.get("project_key", "") for p in raw_filter_options.get("projects", [])) and any(u.get("name") == "rawuser" for u in raw_filter_options.get("users", [])) and any(i.get("issue_key") == "662" and "Asendaja" in i.get("title", "") for i in raw_filter_options.get("issues", [])))
 check("raw payload on piiratud ja saladus redigeeritud", "SALA" not in exported_raw.get("payload_json", "") and len(exported_raw.get("payload_json", "")) <= A.RAW_EVENT_PAYLOAD_MAX_BYTES)
 check("raw export filter töötab", A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["after_tool_call"]})["count"] == 0)
 

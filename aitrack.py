@@ -380,7 +380,10 @@ def _normalise_issue_key(value: str | None) -> str:
     if not v:
         return ""
     v = re.sub(r"^issue[:#\s-]*", "", v, flags=re.I)
-    v = v.lstrip("#")
+    v = v.lstrip("#").strip()
+    label_match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._/-]*?)\s+[–—-]\s+.+$", v)
+    if label_match:
+        v = label_match.group(1)
     return v.strip()
 
 
@@ -2866,9 +2869,17 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "agent_tree": _agent_tree_from_raw_items(raw_items), "activity": activity[:limit]}
 
 
-def _db_activity_filter_options(path: Path, token: str) -> dict:
+def _db_activity_filter_options(path: Path, token: str, q: dict | None = None) -> dict:
     """Autocomplete valikud activity vaate filtritele kasutaja õiguste piires."""
     _db_init(path)
+    q = q or {}
+    project_filter = _qval(q, "project_key") or _qval(q, "project")
+    issue_where: list[str] = []
+    issue_args: list = []
+    if project_filter:
+        project_like = f"%{project_filter.lower()}%"
+        issue_where.append("(LOWER(p.project_key) LIKE ? OR LOWER(p.name) LIKE ?)")
+        issue_args.extend([project_like, project_like])
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
         if user["role"] == "admin":
@@ -2889,10 +2900,28 @@ def _db_activity_filter_options(path: Path, token: str) -> dict:
                 )
                 ORDER BY p.name, p.project_key
             """, (int(user["id"]), int(user["id"]))).fetchall()
+            issue_where.append("(EXISTS (SELECT 1 FROM work_sessions ws JOIN work_items wi ON wi.id = ws.work_item_id WHERE wi.issue_id = i.id AND ws.user_id = ?) OR EXISTS (SELECT 1 FROM prompt_events pe WHERE pe.issue_id = i.id AND pe.user_id = ?))")
+            issue_args.extend([int(user["id"]), int(user["id"])])
+        issues_sql_where = ("WHERE " + " AND ".join(issue_where)) if issue_where else ""
+        issues = conn.execute(f"""
+            SELECT i.issue_key, i.provider,
+                   COALESCE(NULLIF(i.title, ''), (
+                       SELECT wi2.title FROM work_items wi2
+                       WHERE wi2.issue_id = i.id AND TRIM(COALESCE(wi2.title, '')) <> ''
+                       ORDER BY wi2.updated_at DESC, wi2.id DESC LIMIT 1
+                   ), '') AS title,
+                   p.project_key, p.name AS project_name
+            FROM issues i
+            JOIN projects p ON p.id = i.project_id
+            {issues_sql_where}
+            ORDER BY i.updated_at DESC, i.issue_key DESC
+            LIMIT 500
+        """, tuple(issue_args)).fetchall()
     return {
         "ok": True,
         "users": [{"name": r["name"], "role": r["role"]} for r in users],
         "projects": [{"project_key": r["project_key"], "name": r["name"]} for r in projects],
+        "issues": [{"issue_key": r["issue_key"], "title": r["title"] or "", "provider": r["provider"] or "", "project_key": r["project_key"], "project_name": r["project_name"]} for r in issues],
     }
 
 
@@ -5398,7 +5427,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "sessions": _db_work_status(self._db_path(), self._token(q))})
                 return
             if u.path == "/api/activity/filters" and self._server_mode():
-                self._json(_db_activity_filter_options(self._db_path(), self._token(q)))
+                self._json(_db_activity_filter_options(self._db_path(), self._token(q), q))
                 return
             if u.path == "/api/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))
