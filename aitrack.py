@@ -2869,6 +2869,84 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "agent_tree": _agent_tree_from_raw_items(raw_items), "activity": activity[:limit]}
 
 
+def _db_event_detail(path: Path, token: str, q: dict) -> dict:
+    """Return one activity/detail row with full stored JSON, scoped by auth."""
+    _db_init(path)
+    kind = (_qval(q, "type") or _qval(q, "kind") or "").strip()
+    row_id = _qval(q, "id")
+    session_uid = _qval(q, "work_session_uid") or _qval(q, "session_uid")
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        is_admin = user["role"] == "admin"
+        if kind == "raw_event":
+            where = ["re.id = ?"]
+            args: list = [int(row_id)]
+            if not is_admin:
+                where.append("re.user_id = ?")
+                args.append(int(user["id"]))
+            row = conn.execute(f"""
+                SELECT re.*, u.name AS user_name, ws.status AS work_session_status,
+                       ws.local_path AS session_local_path, ws.cwd AS session_cwd,
+                       p.project_key, p.name AS project_name, i.issue_key, i.provider AS issue_provider
+                FROM raw_events re
+                JOIN users u ON u.id = re.user_id
+                LEFT JOIN work_sessions ws ON ws.id = re.work_session_id
+                LEFT JOIN work_items wi ON wi.id = ws.work_item_id
+                LEFT JOIN projects p ON p.id = wi.project_id
+                LEFT JOIN issues i ON i.id = wi.issue_id
+                WHERE {' AND '.join(where)}
+            """, tuple(args)).fetchone()
+        elif kind == "prompt_event":
+            where = ["pe.id = ?"]
+            args = [int(row_id)]
+            if not is_admin:
+                where.append("pe.user_id = ?")
+                args.append(int(user["id"]))
+            row = conn.execute(f"""
+                SELECT pe.*, u.name AS user_name, p.project_key, p.name AS project_name,
+                       i.issue_key, i.provider AS issue_provider, ws.session_uid AS work_session_uid,
+                       ws.local_path AS session_local_path, ws.cwd AS session_cwd
+                FROM prompt_events pe
+                JOIN users u ON u.id = pe.user_id
+                LEFT JOIN projects p ON p.id = pe.project_id
+                LEFT JOIN issues i ON i.id = pe.issue_id
+                LEFT JOIN work_sessions ws ON ws.id = pe.work_session_id
+                WHERE {' AND '.join(where)}
+            """, tuple(args)).fetchone()
+        elif kind == "work_session":
+            where = ["1 = 1"]
+            args = []
+            if session_uid:
+                where.append("ws.session_uid = ?")
+                args.append(session_uid)
+            else:
+                where.append("ws.id = ?")
+                args.append(int(row_id))
+            if not is_admin:
+                where.append("ws.user_id = ?")
+                args.append(int(user["id"]))
+            row = conn.execute(f"""
+                SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
+                       wi.title AS work_title, p.project_key, p.name AS project_name,
+                       i.issue_key, i.provider AS issue_provider, i.title AS issue_title,
+                       (SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count,
+                       (SELECT COALESCE(SUM(minutes), 0) FROM work_session_active_intervals wai WHERE wai.work_session_id = ws.id) AS interval_minutes
+                FROM work_sessions ws
+                JOIN users u ON u.id = ws.user_id
+                JOIN devices d ON d.id = ws.device_id
+                JOIN work_items wi ON wi.id = ws.work_item_id
+                JOIN projects p ON p.id = wi.project_id
+                LEFT JOIN issues i ON i.id = wi.issue_id
+                WHERE {' AND '.join(where)}
+            """, tuple(args)).fetchone()
+        else:
+            raise ValueError("tundmatu detaili tüüp")
+    if row is None:
+        raise PermissionError("sündmust ei leitud või puudub õigus")
+    detail = {k: row[k] for k in row.keys()}
+    return {"ok": True, "type": kind, "detail": detail}
+
+
 def _db_activity_filter_options(path: Path, token: str, q: dict | None = None) -> dict:
     """Autocomplete valikud activity vaate filtritele kasutaja õiguste piires."""
     _db_init(path)
@@ -5431,6 +5509,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))
+                return
+            if u.path == "/api/event-detail" and self._server_mode():
+                self._json(_db_event_detail(self._db_path(), self._token(q), q))
                 return
             if u.path == "/api/export/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))

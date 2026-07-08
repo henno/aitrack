@@ -457,6 +457,7 @@ button, input, select { font:inherit; }
 button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:8px 11px; cursor:pointer; }
 button.primary { background:var(--accent); color:white; border-color:var(--accent); }
 button:hover { filter:brightness(1.08); }
+button.icon { padding:4px 8px; border-radius:8px; color:var(--muted); }
 input, select { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
 .small { color:var(--muted); font-size:13px; }
 .status { color:var(--muted); min-height:20px; }
@@ -471,6 +472,12 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
 .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; }
 .metric { border:1px solid var(--line); border-radius:12px; padding:10px; }
 .metric b { display:block; font-size:22px; }
+.modal-backdrop { position:fixed; inset:0; background:rgba(2,6,23,.72); display:grid; place-items:center; z-index:50; padding:18px; }
+.modal-backdrop[hidden] { display:none; }
+.modal { width:min(980px,100%); max-height:88vh; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:0 24px 80px rgba(0,0,0,.38); padding:16px; }
+.modal header { padding:0 0 12px; border:0; }
+.modal pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
+body.modal-open { overflow:hidden; }
 @media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } }
 </style>
 </head>
@@ -495,15 +502,15 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
   <section class="panel grid" id="metrics"></section>
   <section class="panel">
     <h2>Tegevuste ajalugu</h2>
-    <table><thead><tr><th>Aeg</th><th>Tüüp</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Sisu</th></tr></thead><tbody id="activityBody"><tr><td class="empty" colspan="6">Laen…</td></tr></tbody></table>
+    <table><thead><tr><th>Aeg</th><th>Tüüp</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Sisu</th><th></th></tr></thead><tbody id="activityBody"><tr><td class="empty" colspan="7">Laen…</td></tr></tbody></table>
   </section>
   <section class="panel">
     <h2>Work session'id</h2>
-    <table><thead><tr><th>Session UID</th><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Staatus</th><th>Min</th><th>Kokkuvõte</th></tr></thead><tbody id="sessionsBody"></tbody></table>
+    <table><thead><tr><th>Session UID</th><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Staatus</th><th>Min</th><th>Kokkuvõte</th><th></th></tr></thead><tbody id="sessionsBody"></tbody></table>
   </section>
   <section class="panel">
     <h2>Prompt-eventid</h2>
-    <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Kestus</th><th>Prompt</th></tr></thead><tbody id="promptsBody"></tbody></table>
+    <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Tööriist</th><th>Kestus</th><th>Prompt</th><th></th></tr></thead><tbody id="promptsBody"></tbody></table>
   </section>
   <section class="panel">
     <h2>Agent/subagent tree</h2>
@@ -511,9 +518,15 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; o
   </section>
   <section class="panel">
     <h2>Raw eventid</h2>
-    <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Event</th><th>Agent/tool</th><th>Session</th><th>Payload</th></tr></thead><tbody id="rawEventsBody"></tbody></table>
+    <table><thead><tr><th>Aeg</th><th>Kasutaja</th><th>Event</th><th>Agent/tool</th><th>Session</th><th>Payload</th><th></th></tr></thead><tbody id="rawEventsBody"></tbody></table>
   </section>
 </main>
+<div id="detailModal" class="modal-backdrop" hidden onclick="if (event.target === this) closeDetailModal()">
+  <section class="modal" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+    <header><h2 id="detailTitle">Toorandmed</h2><button class="icon" onclick="closeDetailModal()">Sulge</button></header>
+    <pre id="detailPre">Laen…</pre>
+  </section>
+</div>
 <script>
 const $ = (id) => document.getElementById(id);
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
@@ -564,6 +577,37 @@ function scheduleIssueOptions() {
   clearTimeout(issueOptionsTimer);
   issueOptionsTimer = setTimeout(loadIssueOptions, 200);
 }
+function detailButton(x) {
+  const type = x.type || 'work_session';
+  const id = x.id || x.work_session_id || '';
+  const sid = x.work_session_uid || x.session_uid || '';
+  if (!type || (!id && !sid)) return '';
+  return `<button class="icon" title="Näita toorandmeid" data-detail-type="${esc(type)}" data-detail-id="${esc(id)}" data-detail-session="${esc(sid)}" onclick="showDetailFromButton(this)">◳</button>`;
+}
+function showDetailFromButton(btn) {
+  showDetail(btn.dataset.detailType || '', btn.dataset.detailId || '', btn.dataset.detailSession || '');
+}
+function closeDetailModal() {
+  $('detailModal').hidden = true;
+  document.body.classList.remove('modal-open');
+}
+async function showDetail(type, id, sessionUid) {
+  const params = new URLSearchParams();
+  params.set('type', type);
+  if (id) params.set('id', id);
+  if (sessionUid) params.set('work_session_uid', sessionUid);
+  $('detailTitle').textContent = 'Toorandmed: ' + type;
+  $('detailPre').textContent = 'Laen…';
+  $('detailModal').hidden = false;
+  document.body.classList.add('modal-open');
+  try {
+    const data = await api('/api/event-detail?' + params.toString());
+    $('detailPre').textContent = JSON.stringify(data.detail || data, null, 2);
+  } catch (e) {
+    $('detailPre').textContent = e.message || 'Toorandmete laadimine ebaõnnestus';
+  }
+}
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('detailModal').hidden) closeDetailModal(); });
 function renderMetrics(data) {
   const minutes = (data.sessions || []).reduce((a, s) => a + Number(s.minutes || 0), 0);
   $('metrics').innerHTML = `
@@ -580,8 +624,8 @@ function renderActivity(rows) {
       : x.type === 'raw_event'
         ? `${esc(x.event_type || '')}<div class="small">${esc(x.agent_uid || '')}</div>`
         : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
-    return `<tr><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td></tr>`;
-  }).join('') : '<tr><td class="empty" colspan="6">Tegevusi pole.</td></tr>';
+    return `<tr><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td><td data-label="Toorandmed">${detailButton(x)}</td></tr>`;
+  }).join('') : '<tr><td class="empty" colspan="7">Tegevusi pole.</td></tr>';
 }
 function renderSessions(rows) {
   $('sessionsBody').innerHTML = rows.length ? rows.map(x => `<tr>
@@ -592,7 +636,8 @@ function renderSessions(rows) {
     <td data-label="Staatus"><span class="pill">${esc(x.status || '')}</span><div class="small">${esc(x.status_detail || x.result || '')}</div></td>
     <td data-label="Min">${esc(x.minutes || 0)}<div class="small">ticke ${esc(x.tick_count || 0)}</div></td>
     <td data-label="Kokkuvõte">${esc(x.summary || '')}${x.current_tool_name ? '<div class="small">Tool: ' + esc(x.current_tool_name) + ' · ' + fmtTime(x.current_tool_started_at) + '</div>' : ''}${x.agent_uid ? '<div class="small">Agent: ' + esc(x.agent_uid) + '</div>' : ''}</td>
-  </tr>`).join('') : '<tr><td class="empty" colspan="7">Sessioone pole.</td></tr>';
+    <td data-label="Toorandmed">${detailButton({...x, type:'work_session'})}</td>
+  </tr>`).join('') : '<tr><td class="empty" colspan="8">Sessioone pole.</td></tr>';
 }
 function renderPrompts(rows) {
   $('promptsBody').innerHTML = rows.length ? rows.map(x => `<tr>
@@ -602,7 +647,8 @@ function renderPrompts(rows) {
     <td data-label="Tööriist">${esc(x.tool || '')}</td>
     <td data-label="Kestus">${Math.round(Number(x.duration_seconds || 0) / 60)} min</td>
     <td data-label="Prompt"><pre>${esc(x.prompt_text || '')}</pre></td>
-  </tr>`).join('') : '<tr><td class="empty" colspan="6">Prompt-evente pole.</td></tr>';
+    <td data-label="Toorandmed">${detailButton({...x, type:'prompt_event'})}</td>
+  </tr>`).join('') : '<tr><td class="empty" colspan="7">Prompt-evente pole.</td></tr>';
 }
 function renderAgentNode(x, depth=0) {
   return `<div style="margin-left:${depth * 18}px">${depth ? '↳ ' : ''}<code>${esc(x.agent_uid || '')}</code> <span class="pill">${esc(x.events || 0)} event</span> ${esc((x.tools || []).join(', '))}</div>${(x.children || []).map(c => renderAgentNode(c, depth + 1)).join('')}`;
@@ -618,15 +664,16 @@ function renderRawEvents(rows) {
     <td data-label="Agent/tool">${esc(x.agent_uid || '')}<div class="small">${esc(x.tool_name || x.tool || '')}${x.tool_call_id ? ' · ' + esc(x.tool_call_id) : ''}</div></td>
     <td data-label="Session"><code>${esc(x.work_session_uid || '')}</code></td>
     <td data-label="Payload"><pre>${esc(x.payload_json || '')}</pre></td>
-  </tr>`).join('') : '<tr><td class="empty" colspan="6">Raw evente pole.</td></tr>';
+    <td data-label="Toorandmed">${detailButton({...x, type:'raw_event'})}</td>
+  </tr>`).join('') : '<tr><td class="empty" colspan="7">Raw evente pole.</td></tr>';
 }
 function renderWaiting(message) {
   $('metrics').innerHTML = '';
-  $('activityBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
-  $('sessionsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
-  $('promptsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
+  $('activityBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
+  $('sessionsBody').innerHTML = `<tr><td class="empty" colspan="8">${esc(message)}</td></tr>`;
+  $('promptsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
   $('agentTree').textContent = message;
-  $('rawEventsBody').innerHTML = `<tr><td class="empty" colspan="6">${esc(message)}</td></tr>`;
+  $('rawEventsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
 }
 async function loadActivity() {
   const params = new URLSearchParams();

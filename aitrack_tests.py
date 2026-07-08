@@ -966,5 +966,26 @@ tree_activity = A._db_activity_log(treedb, treetok, {"period": ["2026-06"]})
 root = tree_activity.get("agent_tree", [{}])[0]
 check("agent tree sisaldab parent-child seost", root.get("agent_uid") == "root-agent" and root.get("children") and root["children"][0].get("agent_uid") == "child-agent")
 
+# ============ TEST 60: activity detail modal ja event-detail helper ==========
+print("TEST 60: activity detail modal laadib sündmuse toorandmed")
+detdb = CFG / "server-detail-test.db"
+detdb.unlink(missing_ok=True)
+dettok = A._db_add_user(detdb, "detailuser")
+detstart = A._db_work_start(detdb, dettok, {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "detail", "summary": "detail"},
+    "session": {"client_id": "client-detail", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(4).isoformat(),
+})
+A._db_ingest_events(detdb, dettok, [{"event_key": "detail-raw", "event_type": "before_tool_call", "work_session_uid": detstart["work_session_uid"], "agent_uid": "agent-detail", "tool_name": "bash", "tool_call_id": "tc-detail", "occurred_at_utc": HFL(4).isoformat(), "payload": {"command": "echo detail"}}])
+with A._db_connect(detdb) as conn:
+    raw_id = conn.execute("SELECT id FROM raw_events WHERE event_key = 'detail-raw'").fetchone()["id"]
+raw_detail = A._db_event_detail(detdb, dettok, {"type": ["raw_event"], "id": [str(raw_id)]})
+session_detail = A._db_event_detail(detdb, dettok, {"type": ["work_session"], "work_session_uid": [detstart["work_session_uid"]]})
+activity_html = A._activity_page_html()
+check("event-detail tagastab raw event payload_json välja", raw_detail["detail"]["event_key"] == "detail-raw" and "echo detail" in raw_detail["detail"]["payload_json"])
+check("event-detail tagastab work_session toorrea", session_detail["detail"]["session_uid"] == detstart["work_session_uid"])
+check("activity HTML sisaldab detail modalit ja nuppe", "detailModal" in activity_html and "showDetail" in activity_html and "Toorandmed" in activity_html)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
