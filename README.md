@@ -175,7 +175,9 @@ saavad ajutise IP-ban'i.
 
 Harnessi/hookide jaoks salvestab server append-only `raw_events` ridu. Saada batch `POST /api/events`
 kaudu (`events: [...]`) ja ekspordi neid `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id
-piiratakse ning tüüpilised token/parool/saladuse võtmed redigeeritakse enne talletamist.
+piiratakse ning tüüpilised token/parool/saladuse võtmed redigeeritakse enne talletamist. Work-session'id ja
+sleep-gap'e arvestavad aktiivsed intervallid on eksporditavad `GET /api/export/work-sessions` ja
+`GET /api/export/active-intervals` endpointidest.
 
 Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 

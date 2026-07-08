@@ -1566,6 +1566,19 @@ def _db_init(path: Path) -> None:
           UNIQUE(work_session_id, minute_start_utc)
         );
         CREATE INDEX IF NOT EXISTS minute_ticks_item_minute_idx ON minute_ticks(work_item_id, minute_start_utc);
+        CREATE TABLE IF NOT EXISTS work_session_active_intervals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          work_session_id INTEGER NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
+          work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          start_minute_utc TEXT NOT NULL,
+          end_minute_utc TEXT NOT NULL,
+          minutes INTEGER NOT NULL,
+          source TEXT NOT NULL DEFAULT 'minute_ticks',
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS work_session_active_intervals_session_idx ON work_session_active_intervals(work_session_id, start_minute_utc);
+        CREATE INDEX IF NOT EXISTS work_session_active_intervals_user_idx ON work_session_active_intervals(user_id, start_minute_utc);
         CREATE TABLE IF NOT EXISTS contracts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -1636,6 +1649,7 @@ def _db_init(path: Path) -> None:
         _db_add_column_if_missing(conn, "work_sessions", "session_uid", "TEXT")
         conn.execute("UPDATE work_sessions SET session_uid = 'ws_legacy_' || id WHERE session_uid IS NULL OR session_uid = ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS work_sessions_session_uid_idx ON work_sessions(session_uid)")
+        _db_add_column_if_missing(conn, "work_sessions", "rollup_finalized_at", "TEXT")
         _db_add_column_if_missing(conn, "prompt_events", "project_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "issue_id", "INTEGER REFERENCES issues(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "work_item_id", "INTEGER REFERENCES work_items(id) ON DELETE SET NULL")
@@ -2004,6 +2018,80 @@ def _work_session_minutes(row: sqlite3.Row | dict, tick_count: int | None = None
     return max(1, int((end - start).total_seconds() + 59) // 60)
 
 
+def _minute_interval_minutes(start: dt.datetime, end: dt.datetime) -> int:
+    if end <= start:
+        return 0
+    return max(0, int((end - start).total_seconds()) // 60)
+
+
+def _db_rollup_active_intervals_conn(conn: sqlite3.Connection, session_id: int,
+                                     *, gap_threshold_minutes: int = 2,
+                                     source: str = "minute_ticks") -> dict:
+    """Build derived active intervals from minute ticks. A large tick gap starts a new interval."""
+    row = conn.execute("SELECT * FROM work_sessions WHERE id = ?", (int(session_id),)).fetchone()
+    if row is None:
+        raise ValueError("work_session puudub")
+    ticks = conn.execute(
+        "SELECT minute_start_utc FROM minute_ticks WHERE work_session_id = ? ORDER BY minute_start_utc",
+        (int(session_id),),
+    ).fetchall()
+    now = _now_utc().isoformat()
+    conn.execute("DELETE FROM work_session_active_intervals WHERE work_session_id = ?", (int(session_id),))
+    intervals: list[dict] = []
+    if ticks:
+        current_start = parse_iso(ticks[0]["minute_start_utc"])
+        current_last = current_start
+        for t in ticks[1:]:
+            minute = parse_iso(t["minute_start_utc"])
+            if not minute or not current_start or not current_last:
+                continue
+            gap = (minute - current_last).total_seconds() / 60.0
+            if gap <= max(1, gap_threshold_minutes):
+                current_last = minute
+                continue
+            end = current_last + dt.timedelta(minutes=1)
+            minutes = _minute_interval_minutes(current_start, end)
+            if minutes > 0:
+                intervals.append({"start": current_start.isoformat(), "end": end.isoformat(),
+                                  "minutes": minutes, "source": source})
+            current_start = current_last = minute
+        if current_start and current_last:
+            end = current_last + dt.timedelta(minutes=1)
+            minutes = _minute_interval_minutes(current_start, end)
+            if minutes > 0:
+                intervals.append({"start": current_start.isoformat(), "end": end.isoformat(),
+                                  "minutes": minutes, "source": source})
+    else:
+        # Fallback for manual sessions without ticks: store one bounded interval, but never span endlessly.
+        start = parse_iso(row["started_at"])
+        end = parse_iso(row["ended_at"] or row["last_seen_at"] or "")
+        if start and end and end > start:
+            minutes = _minute_interval_minutes(start, end)
+            if minutes > 0:
+                intervals.append({"start": start.isoformat(), "end": end.isoformat(),
+                                  "minutes": minutes, "source": "session_bounds"})
+    for item in intervals:
+        conn.execute(
+            "INSERT INTO work_session_active_intervals "
+            "(work_session_id, work_item_id, user_id, start_minute_utc, end_minute_utc, minutes, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(session_id), int(row["work_item_id"]), int(row["user_id"]), item["start"], item["end"],
+             int(item["minutes"]), item["source"], now),
+        )
+    conn.execute("UPDATE work_sessions SET rollup_finalized_at = ?, updated_at = ? WHERE id = ?", (now, now, int(session_id)))
+    return {"ok": True, "work_session_id": int(session_id), "intervals": intervals,
+            "minutes": sum(int(i["minutes"]) for i in intervals)}
+
+
+def _db_rollup_active_intervals(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        session_ref = payload.get("work_session_uid") or payload.get("work_session_id") or payload.get("session_id")
+        row = _db_session_for_user(conn, int(user["id"]), session_ref)
+        return _db_rollup_active_intervals_conn(conn, int(row["id"]))
+
+
 def _db_work_finish(path: Path, token: str, payload: dict, *, status: str = "done") -> dict:
     _db_init(path)
     now = _now_utc().isoformat()
@@ -2039,8 +2127,9 @@ def _db_work_finish(path: Path, token: str, payload: dict, *, status: str = "don
             "WHERE id = ?",
             (status, now, int(row["work_item_id"])),
         )
+        rollup = _db_rollup_active_intervals_conn(conn, session_id)
         return {"ok": True, "work_session_uid": session_uid, "work_session_id": session_id,
-                "minutes": minutes, "status": status}
+                "minutes": minutes, "status": status, "active_intervals": rollup.get("intervals", [])}
 
 
 def _db_work_status(path: Path, token: str) -> list[dict]:
@@ -2794,6 +2883,138 @@ def _db_ingest_events(path: Path, token: str, events: list[dict]) -> dict:
         raw = _db_ingest_raw_events_conn(conn, user, events, now)
         prompts = _db_ingest_legacy_prompt_events_conn(conn, user, events, now)
     return {"ok": True, "raw_events": raw, "prompt_events": prompts}
+
+
+def _db_export_work_sessions(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _activity_bounds(q)
+    limit = max(1, min(int(_qval(q, "limit") or 1000), 10000))
+    project_filter = _qval(q, "project_key")
+    issue_filter = _normalise_issue_key(_qval(q, "issue"))
+    status_filter = _qval(q, "status")
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        where = ["ws.started_at < ?", "COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ?"]
+        args: list = [end_iso, start_iso]
+        if user["role"] != "admin":
+            where.append("ws.user_id = ?")
+            args.append(int(user["id"]))
+        if project_filter:
+            where.append("p.project_key = ?")
+            args.append(project_filter)
+        if issue_filter:
+            where.append("i.issue_key = ?")
+            args.append(issue_filter)
+        if status_filter:
+            where.append("ws.status = ?")
+            args.append(status_filter)
+        rows = conn.execute(f"""
+            SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
+                   wi.title AS work_title, p.project_key, p.name AS project_name,
+                   i.provider, i.issue_key, i.title AS issue_title,
+                   (SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count,
+                   (SELECT COALESCE(SUM(minutes), 0) FROM work_session_active_intervals wai WHERE wai.work_session_id = ws.id) AS interval_minutes
+            FROM work_sessions ws
+            JOIN users u ON u.id = ws.user_id
+            JOIN devices d ON d.id = ws.device_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(where)}
+            ORDER BY ws.started_at DESC
+            LIMIT ?
+        """, (*args, limit)).fetchall()
+    sessions = []
+    for r in rows:
+        tick_count = int(r["tick_count"] or 0)
+        sessions.append({
+            "work_session_id": int(r["id"]),
+            "work_session_uid": r["session_uid"],
+            "work_item_id": int(r["work_item_id"]),
+            "user": r["user_name"],
+            "device": r["device_name"],
+            "client_id": r["client_id"],
+            "project": r["project_name"],
+            "project_key": r["project_key"],
+            "issue": f"#{r['issue_key']}" if r["issue_key"] else "",
+            "issue_provider": r["provider"] or "",
+            "issue_key": r["issue_key"] or "",
+            "title": r["issue_title"] or r["work_title"],
+            "tool": r["tool"],
+            "status": r["status"],
+            "result": r["result"],
+            "billable": bool(r["billable"]),
+            "summary": r["summary"],
+            "started_at": r["started_at"],
+            "ended_at": r["ended_at"],
+            "last_seen_at": r["last_seen_at"],
+            "minutes": _work_session_minutes(r, tick_count),
+            "tick_count": tick_count,
+            "interval_minutes": int(r["interval_minutes"] or 0),
+            "local_path": r["local_path"] or "",
+            "cwd": r["cwd"] or "",
+            "branch": r["branch"] or "",
+            "rollup_finalized_at": r["rollup_finalized_at"] or "",
+        })
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "count": len(sessions), "sessions": sessions}
+
+
+def _db_export_active_intervals(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _activity_bounds(q)
+    limit = max(1, min(int(_qval(q, "limit") or 1000), 10000))
+    project_filter = _qval(q, "project_key")
+    issue_filter = _normalise_issue_key(_qval(q, "issue"))
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        where = ["wai.start_minute_utc < ?", "wai.end_minute_utc > ?"]
+        args: list = [end_iso, start_iso]
+        if user["role"] != "admin":
+            where.append("wai.user_id = ?")
+            args.append(int(user["id"]))
+        if project_filter:
+            where.append("p.project_key = ?")
+            args.append(project_filter)
+        if issue_filter:
+            where.append("i.issue_key = ?")
+            args.append(issue_filter)
+        rows = conn.execute(f"""
+            SELECT wai.*, ws.session_uid, ws.tool, ws.status, ws.summary, u.name AS user_name,
+                   p.project_key, p.name AS project_name, i.issue_key, i.title AS issue_title
+            FROM work_session_active_intervals wai
+            JOIN work_sessions ws ON ws.id = wai.work_session_id
+            JOIN users u ON u.id = wai.user_id
+            JOIN work_items wi ON wi.id = wai.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(where)}
+            ORDER BY wai.start_minute_utc DESC, wai.id DESC
+            LIMIT ?
+        """, (*args, limit)).fetchall()
+    intervals = []
+    for r in rows:
+        intervals.append({
+            "id": int(r["id"]),
+            "work_session_id": int(r["work_session_id"]),
+            "work_session_uid": r["session_uid"],
+            "work_item_id": int(r["work_item_id"]),
+            "user": r["user_name"],
+            "project": r["project_name"],
+            "project_key": r["project_key"],
+            "issue": f"#{r['issue_key']}" if r["issue_key"] else "",
+            "issue_key": r["issue_key"] or "",
+            "tool": r["tool"],
+            "status": r["status"],
+            "summary": r["summary"] or r["issue_title"] or "",
+            "start_minute_utc": r["start_minute_utc"],
+            "end_minute_utc": r["end_minute_utc"],
+            "minutes": int(r["minutes"] or 0),
+            "source": r["source"],
+        })
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "count": len(intervals), "minutes": sum(i["minutes"] for i in intervals),
+            "intervals": intervals}
 
 
 def _db_export_raw_events(path: Path, token: str, q: dict) -> dict:
@@ -4680,6 +4901,12 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/export/raw-events" and self._server_mode():
                 self._json(_db_export_raw_events(self._db_path(), self._token(q), q))
+                return
+            if u.path == "/api/export/work-sessions" and self._server_mode():
+                self._json(_db_export_work_sessions(self._db_path(), self._token(q), q))
+                return
+            if u.path == "/api/export/active-intervals" and self._server_mode():
+                self._json(_db_export_active_intervals(self._db_path(), self._token(q), q))
                 return
             if u.path == "/api/billing/invoice-lines" and self._server_mode():
                 self._json(_db_invoice_lines(self._db_path(), self._token(q), q))

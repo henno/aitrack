@@ -734,5 +734,29 @@ check("activity helper tagastab raw event timeline'i", len(raw_activity.get("raw
 check("raw payload on piiratud ja saladus redigeeritud", "SALA" not in exported_raw.get("payload_json", "") and len(exported_raw.get("payload_json", "")) <= A.RAW_EVENT_PAYLOAD_MAX_BYTES)
 check("raw export filter töötab", A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["after_tool_call"]})["count"] == 0)
 
+# ============ TEST 50: active interval rollup käsitleb sleep-gap'i ==========
+print("TEST 50: active interval rollup tihendab tickid ja jätab sleep-gap'i auguks")
+idb = CFG / "server-intervals-test.db"
+idb.unlink(missing_ok=True)
+itok = A._db_add_user(idb, "intervaluser")
+ipayload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "interval test", "summary": "rollup"},
+    "session": {"client_id": "client-interval", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(10).isoformat(),
+}
+istart = A._db_work_start(idb, itok, ipayload)
+for minute in (0, 1, 10):
+    A._db_work_tick(idb, itok, {"work_session_uid": istart["work_session_uid"], "tick_at": (HFL(10) + dt.timedelta(minutes=minute)).isoformat()})
+ifinish = A._db_work_finish(idb, itok, {"work_session_uid": istart["work_session_uid"], "ended_at": (HFL(10) + dt.timedelta(minutes=11)).isoformat(), "summary": "rollup valmis", "result": "kept"})
+interval_export = A._db_export_active_intervals(idb, itok, {"period": ["2026-06"]})
+work_export = A._db_export_work_sessions(idb, itok, {"period": ["2026-06"]})
+intervals = sorted(interval_export.get("intervals", []), key=lambda x: x["start_minute_utc"])
+check("finish tagastab active_intervals", len(ifinish.get("active_intervals", [])) == 2)
+check("sleep-gap jagab tickid kaheks intervalliks", len(intervals) == 2 and [i["minutes"] for i in intervals] == [2, 1])
+check("active interval export summeerib ainult tickidega minutid", interval_export["minutes"] == 3)
+check("active interval export sisaldab work_session_uid", intervals and intervals[0]["work_session_uid"] == istart["work_session_uid"])
+check("work-sessions export sisaldab interval minuteid", work_export["count"] == 1 and work_export["sessions"][0]["interval_minutes"] == 3)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
