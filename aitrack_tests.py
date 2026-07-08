@@ -572,6 +572,8 @@ with A._db_connect(sdb) as conn:
     ev_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
 check("server salvestas prompt-eventi", ev_count == 2)
 check("serveri päevavaade asendab prompt placeholderi tegevuslausega", any("Tegin nähtav päevavaate kokkuvõte" in r[3] and "Promptid:" not in r[3] for r in prompt_day_rows))
+check("serveri päevavaade tuletab promptidest uued teadmised", any(r[5] != A._NA for r in prompt_day_rows if r[1] == "11:00–12:00"))
+check("praktikapäeviku heuristika täidab takistuse/teadmise", A._infer_takistus_from_texts(["paranda activity mittekuvamine"]) != A._NA and A._infer_teadmine_from_texts(["selgita heartbeat mudelit"]) != A._NA)
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
 print("TEST 42: repo URL normaliseerimine annab eri kloonidele sama project_key")
@@ -618,6 +620,7 @@ check("activity endpoint helper näitab sessioone ja prompt-evente", len(activit
 check("activity sisaldab serveri work_session_uid väärtust", activity["sessions"][0]["work_session_uid"] == start["work_session_uid"])
 check("activity sisaldab checkouti failiteed", activity["sessions"][0]["local_path"] == "/tmp/pp-finar-pi")
 check("serveri päevavaade asendab automaatkokkuvõtte placeholderi work-session kokkuvõttega", "parandus valmis" in day_rows_with_work[0][3])
+check("serveri päevavaade tuletab work-sessionist uued teadmised", day_rows_with_work[0][5] != A._NA)
 
 # ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
 print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")

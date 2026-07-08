@@ -2526,12 +2526,18 @@ def _db_work_session_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         if local.date() != target:
             continue
         hour = _hour_label_from_local(local)
-        g = grouped.setdefault(hour, {"date": date, "hour": hour, "objects": [], "summaries": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
+        g = grouped.setdefault(hour, {"date": date, "hour": hour, "objects": [], "topics": [],
+                                      "summaries": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
         issue = f"#{r['issue_key']}" if r["issue_key"] else ""
         title = r["issue_title"] or r["work_title"] or r["project_name"] or r["project_key"]
         obj = " ".join(x for x in [r["project_name"] or r["project_key"], issue, title] if x)
         if obj and obj not in g["objects"]:
             g["objects"].append(obj)
+        project_name = str(r["project_name"] or "").strip()
+        project_key = str(r["project_key"] or "").strip()
+        title_s = str(title or "").strip()
+        if title_s and title_s not in (project_name, project_key) and title_s not in g["topics"]:
+            g["topics"].append(title_s)
         summary = str(r["summary"] or title or "").strip()
         if summary and summary not in g["summaries"]:
             g["summaries"].append(summary)
@@ -2541,8 +2547,10 @@ def _db_work_session_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
     out = []
     for g in grouped.values():
         key = f"k:{g['utc'].isoformat()}|__work_session__"
+        analysis_texts = list(g["topics"]) + list(g["summaries"])
         out.append([g["date"], g["hour"], "; ".join(g["objects"]), "; ".join(g["summaries"]),
-                    _NA, _NA, ", ".join(g["tools"]), key])
+                    _infer_takistus_from_texts(analysis_texts), _infer_teadmine_from_texts(analysis_texts),
+                    ", ".join(g["tools"]), key])
     return sorted(out, key=lambda r: (r[1], r[7]))
 
 
@@ -2551,6 +2559,103 @@ def _safe_day_prompt_snippet(text: str, limit: int = 140) -> str:
     s = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-[redacted]", s)
     s = re.sub(r"(?i)\b(token|password|secret|api[_-]?key)\s*[:=]\s*\S+", r"\1=[redacted]", s)
     return s[:limit - 1] + "…" if len(s) > limit else s
+
+
+_TOPIC_VERBS = (
+    "selgita", "aruta", "kuidas", "mis", "miks", "kas", "kontrolli", "täpsusta", "uuri",
+    "lisa", "paranda", "muuda", "koosta", "ava", "installi", "paigalda", "deploy", "anna",
+    "alusta", "näita", "halda", "uuenda", "tee", "pushi",
+)
+_BLOCKER_MARKERS = (
+    "ei tööta", "ei kuvat", "mittekuv", "katki", "viga", "error", "fail", "hang", "probleem",
+    "takist", "paranda", "puudub", "puudu", "ebaõnnest", "unauthorized", "forbidden", "403",
+)
+
+
+def _topic_from_work_text(text: str, limit: int = 130) -> str:
+    """Lühike ohutu teemafraas praktikapäeviku heuristikate jaoks."""
+    s = _safe_day_prompt_snippet(text, limit).strip(" .;:!?\"'")
+    if not s:
+        return ""
+    # Work-session title'id on sageli kujul "aitrack selgita ..." — eemalda projekti nimi,
+    # kui selle järel algab tegusõnaline ülesanne.
+    verbs = "|".join(re.escape(v) for v in _TOPIC_VERBS)
+    s = re.sub(rf"^\S+\s+(?=({verbs})\b)", "", s, flags=re.IGNORECASE)
+    return s.strip(" .;:!?\"'")
+
+
+def _unique_limited(items: list[str], limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        val = item.strip()
+        key = val.lower()
+        if not val or key in seen:
+            continue
+        out.append(val)
+        seen.add(key)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _learning_sentence_from_text(text: str) -> str:
+    topic = _topic_from_work_text(text, 120)
+    if not topic:
+        return ""
+    low = topic.lower()
+    prefix_map = [
+        ("selgita", "Täpsustus"), ("aruta", "Täpsustusid valikud"),
+        ("täpsusta", "Täpsustus"), ("uuri", "Selgus"),
+        ("kontrolli", "Kontrolli käigus selgus"),
+    ]
+    for prefix, lead in prefix_map:
+        if low.startswith(prefix):
+            rest = topic[len(prefix):].strip(" :,-") or topic
+            return f"{lead}: {rest}."
+    for key, lead in (("kuidas", "Selgus, kuidas"), ("miks", "Selgus, miks"),
+                      ("mis", "Selgus, mis"), ("kas", "Selgus, kas")):
+        if low.startswith(key + " "):
+            return f"{lead} {topic[len(key):].strip(' :,-')}."
+        marker = f" {key} "
+        if marker in low:
+            rest = topic[low.index(marker) + len(marker):].strip(" :,-")
+            return f"{lead} {rest}."
+    if any(low.startswith(v) for v in ("lisa", "paranda", "muuda", "koosta", "deploy", "paigalda", "installi")):
+        return f"Täpsustus praktiline lahenduskäik: {topic}."
+    return f"Töö käigus täpsustus: {topic}."
+
+
+def _infer_teadmine_from_texts(texts: list[str]) -> str:
+    sentences = _unique_limited([_learning_sentence_from_text(t) for t in texts], 2)
+    return _cell_safe("; ".join(sentences)[:400]) if sentences else _NA
+
+
+def _blocker_sentence_from_text(text: str) -> str:
+    topic = _topic_from_work_text(text, 120)
+    if not topic:
+        return ""
+    low = topic.lower()
+    if "hang" in low:
+        return "Tuli arvestada hangumise tuvastamise ja heartbeat'i usaldusväärsusega."
+    if "mittekuv" in low or "ei kuvat" in low:
+        return f"Kuvamise probleem vajas parandamist: {topic}."
+    if low.startswith("paranda"):
+        rest = topic[len("paranda"):].strip(" :,-") or topic
+        return f"Parandamist vajas: {rest}."
+    if any(marker in low for marker in _BLOCKER_MARKERS):
+        return f"Lahendamist vajas probleem: {topic}."
+    return ""
+
+
+def _infer_takistus_from_texts(texts: list[str]) -> str:
+    hits = []
+    for t in texts:
+        low = str(t or "").lower()
+        if any(marker in low for marker in _BLOCKER_MARKERS):
+            hits.append(_blocker_sentence_from_text(t))
+    sentences = _unique_limited(hits, 2)
+    return _cell_safe("; ".join(sentences)[:400]) if sentences else _NA
 
 
 def _prompt_to_work_sentence(text: str) -> str:
@@ -2608,11 +2713,15 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         if local.date() != target:
             continue
         hour = _hour_label_from_local(local)
-        g = grouped.setdefault(hour, {"date": date, "hour": hour, "projects": [], "activities": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
+        g = grouped.setdefault(hour, {"date": date, "hour": hour, "projects": [], "activities": [],
+                                      "texts": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
         project = r["project_name"] or r["project_key"] or r["project"] or "AI-toega töö"
         if project and project not in g["projects"]:
             g["projects"].append(project)
-        activity = _prompt_to_work_sentence(r["prompt_text"])
+        prompt_text = str(r["prompt_text"] or "")
+        if prompt_text and prompt_text not in g["texts"]:
+            g["texts"].append(prompt_text)
+        activity = _prompt_to_work_sentence(prompt_text)
         if activity and activity not in g["activities"] and len(g["activities"]) < 8:
             g["activities"].append(activity)
         tool = str(r["tool"] or "").strip()
@@ -2623,7 +2732,8 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         key = f"k:{g['utc'].isoformat()}|__prompt_event__"
         activities = "; ".join(g["activities"])
         out.append([g["date"], g["hour"], "; ".join(g["projects"]), activities,
-                    _NA, _NA, ", ".join(g["tools"]), key])
+                    _infer_takistus_from_texts(g["texts"]), _infer_teadmine_from_texts(g["texts"]),
+                    ", ".join(g["tools"]), key])
     return sorted(out, key=lambda r: (r[1], r[7]))
 
 
@@ -2635,11 +2745,21 @@ def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) ->
             rows.append(d)
             by_hour[d[1]] = d
             continue
-        # Säilita käsitsi parandatud read; asenda ainult automaatse varukokkuvõtte placeholder.
-        if _placeholder_day_text(existing[2]) or _placeholder_day_text(existing[3]):
+        # Säilita käsitsi parandatud read; asenda automaatse varukokkuvõtte placeholder.
+        placeholder = _placeholder_day_text(existing[2]) or _placeholder_day_text(existing[3])
+        if placeholder:
             existing[2] = d[2] or existing[2]
             existing[3] = d[3] or existing[3]
+            existing[4] = d[4] or existing[4]
+            existing[5] = d[5] or existing[5]
             existing[6] = d[6] or existing[6]
+        else:
+            # Kui kasutaja on parandanud esimesed veerud, aga vanast automaatfallbackist jäid
+            # Takistus/Teadmine tühiväärtuseks, võib faktiline derivatsioon need täita.
+            if existing[4] == _NA and d[4] != _NA:
+                existing[4] = d[4]
+            if existing[5] == _NA and d[5] != _NA:
+                existing[5] = d[5]
     return sorted(rows, key=lambda r: (r[1], r[7]))
 
 
