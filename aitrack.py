@@ -4899,6 +4899,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))
                 return
+            if u.path == "/api/export/activity" and self._server_mode():
+                self._json(_db_activity_log(self._db_path(), self._token(q), q))
+                return
             if u.path == "/api/export/raw-events" and self._server_mode():
                 self._json(_db_export_raw_events(self._db_path(), self._token(q), q))
                 return
