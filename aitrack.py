@@ -2567,8 +2567,8 @@ _TOPIC_VERBS = (
     "alusta", "näita", "halda", "uuenda", "tee", "pushi",
 )
 _BLOCKER_MARKERS = (
-    "ei tööta", "ei kuvat", "mittekuv", "katki", "viga", "error", "fail", "hang", "probleem",
-    "takist", "paranda", "puudub", "puudu", "ebaõnnest", "unauthorized", "forbidden", "403",
+    "ei tööta", "ei kuvat", "mittekuv", "katki", "viga", "error", "tõrge", "hang", "probleem",
+    "paranda", "puudub", "puudu", "ebaõnnest", "unauthorized", "forbidden", "403",
 )
 
 
