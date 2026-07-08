@@ -19,6 +19,7 @@ import datetime as dt
 import getpass
 import hashlib
 import hmac
+import html
 import json
 import os
 import platform
@@ -30,6 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -59,6 +61,11 @@ SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack se
 WEB_SESSION_COOKIE = "aitrack_session"
 WEB_SESSION_DAYS = 30
 PASSWORD_HASH_ITERATIONS = 260_000
+RATE_WINDOW_SECONDS = 60
+RATE_MAX_REQUESTS = 180
+LOGIN_FAIL_WINDOW_SECONDS = 10 * 60
+LOGIN_FAIL_MAX = 5
+BAN_SECONDS = 30 * 60
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -1405,6 +1412,25 @@ def _public_user(row: sqlite3.Row | dict | None) -> dict | None:
     if row is None:
         return None
     return {"id": int(row["id"]), "name": row["name"], "role": row["role"]}
+
+
+def _normalise_request_ip(value: str | None) -> str:
+    raw = (value or "").split(",", 1)[0].strip()
+    if not raw or len(raw) > 80 or any(c in raw for c in "\r\n\t "):
+        return "unknown"
+    if re.fullmatch(r"[0-9a-fA-F:.]+", raw):
+        return raw
+    return "unknown"
+
+
+def _is_suspicious_request_path(path: str) -> bool:
+    lowered = urllib.parse.unquote(path or "").lower()
+    probes = (
+        "..", "\\", "/.env", "/.git", "/wp-", "/wp/", "wp-login", "xmlrpc.php",
+        "phpmyadmin", ".php", "/etc/passwd", "/cgi-bin/", "/vendor/phpunit", "/.aws",
+        "/.ssh", "/server-status", "/actuator", "/debug", "/boaform/",
+    )
+    return any(p in lowered for p in probes)
 
 
 def _db_init(path: Path) -> None:
@@ -3780,6 +3806,10 @@ init().catch(e => { renderWaiting(e.message || 'login puudub'); setStatus(e.mess
 
 class _AitrackHandler(BaseHTTPRequestHandler):
     cfg: dict = {}
+    _rate_lock = threading.Lock()
+    _rate_hits: dict[str, list[float]] = {}
+    _login_failures: dict[str, list[float]] = {}
+    _banned_until: dict[str, float] = {}
 
     def log_message(self, fmt, *args):  # vaiksem server; olulised vead lähevad vastusesse
         return
@@ -3808,6 +3838,80 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Location", location)
         self.end_headers()
+
+    def _client_ip(self) -> str:
+        return _normalise_request_ip(
+            self.headers.get("CF-Connecting-IP")
+            or self.headers.get("X-Real-IP")
+            or self.headers.get("X-Forwarded-For")
+            or (self.client_address[0] if self.client_address else "")
+        )
+
+    def _reject(self, status: int, error: str, *, retry_after: int | None = None) -> None:
+        headers = {"Retry-After": str(retry_after)} if retry_after else None
+        if self.command == "HEAD":
+            self.send_response(status)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/"):
+            self._json({"ok": False, "error": error}, status, headers=headers)
+        else:
+            self._html(f"<!doctype html><title>aitrack</title><h1>{html.escape(error)}</h1>", status, headers=headers)
+
+    @classmethod
+    def _ban_ip(cls, ip: str, reason: str, seconds: int = BAN_SECONDS) -> None:
+        until = time.time() + seconds
+        with cls._rate_lock:
+            cls._banned_until[ip] = max(cls._banned_until.get(ip, 0), until)
+        log(f"security: ip ban {ip} {seconds}s ({reason})")
+
+    def _allow_request(self) -> bool:
+        ip = self._client_ip()
+        now = time.time()
+        path = urllib.parse.urlparse(self.path).path
+        with self.__class__._rate_lock:
+            banned_until = self.__class__._banned_until.get(ip, 0)
+            if banned_until <= now:
+                self.__class__._banned_until.pop(ip, None)
+                banned_until = 0
+            if banned_until > now:
+                retry = max(1, int(banned_until - now))
+                self._reject(429, "IP on ajutiselt blokeeritud", retry_after=retry)
+                return False
+            if _is_suspicious_request_path(path):
+                self.__class__._banned_until[ip] = now + BAN_SECONDS
+                log(f"security: suspicious path {ip} {path}")
+                self._reject(403, "kahtlane päring")
+                return False
+            hits = [t for t in self.__class__._rate_hits.get(ip, []) if now - t < RATE_WINDOW_SECONDS]
+            hits.append(now)
+            self.__class__._rate_hits[ip] = hits
+            if len(hits) > RATE_MAX_REQUESTS:
+                self.__class__._banned_until[ip] = now + BAN_SECONDS
+                log(f"security: rate limit ban {ip} hits={len(hits)}")
+                self._reject(429, "liiga palju päringuid", retry_after=BAN_SECONDS)
+                return False
+        return True
+
+    def _record_login_success(self) -> None:
+        with self.__class__._rate_lock:
+            self.__class__._login_failures.pop(self._client_ip(), None)
+
+    def _record_login_failure(self) -> bool:
+        ip = self._client_ip()
+        now = time.time()
+        with self.__class__._rate_lock:
+            failures = [t for t in self.__class__._login_failures.get(ip, []) if now - t < LOGIN_FAIL_WINDOW_SECONDS]
+            failures.append(now)
+            self.__class__._login_failures[ip] = failures
+            if len(failures) >= LOGIN_FAIL_MAX:
+                self.__class__._banned_until[ip] = now + BAN_SECONDS
+                log(f"security: login failure ban {ip} failures={len(failures)}")
+                return True
+        return False
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -3861,6 +3965,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         return _server_db_path(self.cfg.get("_db_path"))
 
     def do_HEAD(self) -> None:  # noqa: N802 (http.server API)
+        if not self._allow_request():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html", "/activity", "/login"):
             self.send_response(200)
@@ -3875,6 +3981,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        if not self._allow_request():
+            return
         try:
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
@@ -3964,11 +4072,22 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)}, 500)
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        if not self._allow_request():
+            return
         try:
             u = urllib.parse.urlparse(self.path)
             data = self._read_json()
             if u.path == "/api/login" and self._server_mode():
-                result = _db_login(self._db_path(), str(data.get("name") or ""), str(data.get("password") or ""))
+                try:
+                    result = _db_login(self._db_path(), str(data.get("name") or ""), str(data.get("password") or ""))
+                except PermissionError as e:
+                    banned = self._record_login_failure()
+                    status = 429 if banned else 403
+                    retry = BAN_SECONDS if banned else None
+                    self._json({"ok": False, "error": "liiga palju ebaõnnestunud logineid" if banned else str(e)},
+                               status, headers={"Retry-After": str(retry)} if retry else None)
+                    return
+                self._record_login_success()
                 session_token = str(result.pop("session_token"))
                 self._json(result, headers={"Set-Cookie": self._session_cookie_header(session_token)})
                 return

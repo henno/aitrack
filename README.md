@@ -136,8 +136,8 @@ Google Sheetsi jaoks. Kõik muudatused salvestatakse `~/.config/aitrack/hours.cs
 päevavaade renderdatakse uuesti.
 
 **Mitme kasutaja server:** `aitrack serve --host 0.0.0.0 --port 8765 --db /data/server.db` käivitab
-SQLite-põhise keskserveri. Serveris loo kasutaja `aitrack user add karl --db /data/server.db` ja sea
-brauseri login'i parool `aitrack user password karl --db /data/server.db` (või turvalises skriptis
+SQLite-põhise keskserveri. Serveris loo administraator `aitrack user add admin --role admin --db /data/server.db` ja sea
+brauseri login'i parool `aitrack user password admin --db /data/server.db` (või turvalises skriptis
 `--password-stdin`). Kliendis seadista API jaoks `aitrack connect --url https://aitrack.example.com --token TOKEN`.
 Seejärel saadab kliendi `aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta
 repo juures `docker compose up -d --build` (vaikimisi seob `127.0.0.1:3103`).
@@ -169,7 +169,9 @@ aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser suunatakse vajadusel
 `/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.
 Tavakasutaja näeb enda work session'eid, prompt-evente ja tegevuste ajalugu; admin näeb kõiki kasutajaid.
-API/CLI jaoks jääb token-põhine autentimine alles.
+API/CLI jaoks jääb token-põhine autentimine alles. Server rakendab lihtsat mälupõhist rate limiterit;
+liigsed päringud, korduvad valed login'id ja tüüpilised probe'id (`/.env`, `/.git`, `wp-login.php` jne)
+saavad ajutise IP-ban'i.
 
 Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 

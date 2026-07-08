@@ -656,5 +656,21 @@ check("õige parool loob web sessioni", login.get("ok") is True and login.get("u
 check("web session mapib kasutaja tokenile", session_user is not None and session_user["token"] == ltok)
 check("vale parool ei valideeru", A._verify_password("vale", session_user["password_hash"]) is False)
 
+# ============ TEST 48: serveri rate-limit ja IP-ban abid ============
+print("TEST 48: rate limiter tuvastab kahtlased päringud ja login failure ban'i")
+check(".env päring on kahtlane", A._is_suspicious_request_path("/.env") is True)
+check("/activity ei ole kahtlane", A._is_suspicious_request_path("/activity") is False)
+check("CF/XFF IP normaliseerub", A._normalise_request_ip("203.0.113.7, 10.0.0.1") == "203.0.113.7")
+A._AitrackHandler._login_failures.clear()
+A._AitrackHandler._banned_until.clear()
+dummy = object.__new__(A._AitrackHandler)
+dummy.headers = {}
+dummy.client_address = ("203.0.113.77", 12345)
+for _ in range(A.LOGIN_FAIL_MAX - 1):
+    banned = dummy._record_login_failure()
+check("login failure ei banni enne limiiti", banned is False and "203.0.113.77" not in A._AitrackHandler._banned_until)
+banned = dummy._record_login_failure()
+check("login failure ban rakendub limiidil", banned is True and A._AitrackHandler._banned_until.get("203.0.113.77", 0) > 0)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
