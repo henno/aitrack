@@ -1148,8 +1148,8 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
         "TAKISTUS: Claude valis vale IP-aadressi -> kohaliku arvuti IP ja serveris seadistatud IP ei olnud samad\n"
         "TEADMINE: Kuidas Finaris ./copy_from_live.sh skriptiga enda koopiasse live-andmebaasi koopia saada\n"
         "Vormireeglid:\n"
-        "- OBJEKT: kujul 'Projekt/klient - teema (olulised detailid)', mitte vestluse küsimuste loetelu.\n"
-        "- Ära pane iga OBJEKTI ette üldist prefiksit 'Praktika -'; kasuta konkreetset projekti/teemat.\n"
+        "- OBJEKT: peab algama konkreetse projekti/kliendi nimega ja eesmärgiga, nt 'Puhastusproff - Finar ...' või 'aitrack - ...'.\n"
+        "- Ära pane iga OBJEKTI ette üldist prefiksit 'Praktika -'; kui teema on praktika üldosa, kasuta nt 'Praktika sissejuhatus - ...'.\n"
         "- SAAVUTUS: konkreetne tulemus, nt 'parandatud', 'valmis', 'üles seatud', 'kontrollitud'.\n"
         "- TAKISTUS: kui takistust polnud, kirjuta täpselt: Ei olnud; muidu kirjuta päris probleem lihtsas keeles.\n"
         "- TEADMINE: alusta võimalusel 'Kuidas...', 'Mis on...' või 'Miks...'; kirjuta õpitud mõte, mitte prompti ümbersõnastus.\n"
@@ -2662,6 +2662,35 @@ def _domain_learning_sentences(texts: list[str]) -> list[str]:
     return out
 
 
+def _project_prefix_from_context(projects: list[str] | None, combined: str) -> str:
+    """Leia päeviku objekti algusesse konkreetne projekt/klient, mitte üldine 'Praktika -'."""
+    vals = [str(p or "").strip() for p in (projects or []) if str(p or "").strip()]
+    blob = " ".join(vals).lower() + " " + combined.lower()
+    if "puhastusproff" in blob and "finar" in blob:
+        return "Puhastusproff - Finar"
+    if "puhastusproff" in blob:
+        return "Puhastusproff"
+    if "finar" in blob:
+        return "Puhastusproff - Finar"
+    if "aitrack" in blob or "ai-tööpäevik" in blob or "tööpäeviku" in blob:
+        return "aitrack"
+    for raw in vals:
+        low = raw.lower()
+        if low in {"praktika", "ai-toega töö"}:
+            continue
+        if raw.startswith("/") or raw.startswith("local:") or "://" in raw:
+            continue
+        return raw
+    if "praktika" in blob:
+        return "Praktika sissejuhatus"
+    return ""
+
+
+def _object_with_project(prefix: str, goal: str) -> str:
+    goal = goal.strip(" .")
+    return f"{prefix} - {goal}" if prefix else goal
+
+
 def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None = None) -> dict:
     """Faktiline, aga lihtrahvale loetav päevikuvaate fallback.
 
@@ -2672,59 +2701,44 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
     safe_texts = [_safe_day_prompt_snippet(t, 500) for t in texts if str(t or "").strip()]
     combined = " ".join(s.lower() for s in safe_texts)
     project_blob = " ".join(str(p or "").lower() for p in (projects or []))
+    prefix = _project_prefix_from_context(projects, combined)
 
     def has(*needles: str) -> bool:
         return any(n in combined or n in project_blob for n in needles)
 
+    def row(goal: str, saavutus: str) -> dict:
+        return {"objekt": _object_with_project(prefix, goal), "saavutus": saavutus}
+
     if has("tailscale"):
-        return {
-            "objekt": "Tailscale võrguühenduse kontroll ja ligipääsu uurimine",
-            "saavutus": "Tailscale ühendus kontrollitud; selge, kuidas teine kasutaja saab turvaliselt võrku liituda",
-        }
+        return row("Tailscale võrguühenduse kontroll ja ligipääsu uurimine",
+                   "Tailscale ühendus kontrollitud; selge, kuidas teine kasutaja saab turvaliselt võrku liituda")
     if has("gnome", "draw-on-gnome", "draw on gnome"):
-        return {
-            "objekt": "Linuxi töökeskkonna ja joonistustööriista seadistamine",
-            "saavutus": "GNOME töökeskkond tuvastatud; ekraanile joonistamise tööriist paigaldatud ja katsetatud",
-        }
+        return row("Linuxi töökeskkonna ja joonistustööriista seadistamine",
+                   "GNOME töökeskkond tuvastatud; ekraanile joonistamise tööriist paigaldatud ja katsetatud")
     if has("pole arusaadav", "lihtrahva", "uued teadmised", "takistused"):
-        return {
-            "objekt": "Tööpäeviku kirjete arusaadavamaks muutmine",
-            "saavutus": "Päeviku tekstide koostamine parandatud, et kirjeldused oleksid lihtsas keeles",
-        }
+        return row("tööpäeviku kirjete arusaadavamaks muutmine",
+                   "Päeviku tekstide koostamine parandatud, et kirjeldused oleksid lihtsas keeles")
     if has("pushi", "commit", "origin/main"):
-        return {
-            "objekt": "Koodimuudatuste salvestamine ja GitHubi pushimine",
-            "saavutus": "Muudatused salvestatud ja GitHubi üles pandud; kontrollitud, et seis on ajakohane",
-        }
+        return row("koodimuudatuste salvestamine ja GitHubi pushimine",
+                   "Muudatused salvestatud ja GitHubi üles pandud; kontrollitud, et seis on ajakohane")
     if has("raw_events", "raw event", "active interval", "export"):
-        return {
-            "objekt": "Tegevuste salvestamise ja aruandluse arendamine",
-            "saavutus": "Täpsem tegevuste salvestamine lisatud ja kontrollitud; andmed sobivad hilisemaks aruandluseks",
-        }
+        return row("tegevuste salvestamise ja aruandluse arendamine",
+                   "Täpsem tegevuste salvestamine lisatud ja kontrollitud; andmed sobivad hilisemaks aruandluseks")
     if has("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick", "hook", "alam-agent", "subagent"):
-        return {
-            "objekt": "AI-tööpäeviku tööaja automaatse jälgimise arendamine",
-            "saavutus": "Töö alguse ja töö jätkumise automaatne serverisse kirjapanek täpsustatud",
-        }
+        return row("AI-tööpäeviku tööaja automaatse jälgimise arendamine",
+                   "Töö alguse ja töö jätkumise automaatne serverisse kirjapanek täpsustatud")
     if has("server token", "servertoken", "login", "parool", "rate limiter", "ip ban", "kasutaja"):
-        return {
-            "objekt": "aitrack serveri sisselogimise ja turvalisuse arendamine",
-            "saavutus": "Serveri ligipääs, kasutajate sisselogimine ja kaitse valede päringute vastu täiendatud",
-        }
+        return row("serveri sisselogimise ja turvalisuse arendamine",
+                   "Serveri ligipääs, kasutajate sisselogimine ja kaitse valede päringute vastu täiendatud")
     if has("activity", "päevavaade", "failitee", "praktikapäeviku"):
-        return {
-            "objekt": "aitracki tegevusvaate ja päevikuvaate parandamine",
-            "saavutus": "Tegevuste ülevaade ja päeviku kuvamine parandatud, et tehtud töö oleks hiljem selgemini jälgitav",
-        }
+        return row("tegevusvaate ja päevikuvaate parandamine",
+                   "Tegevuste ülevaade ja päeviku kuvamine parandatud, et tehtud töö oleks hiljem selgemini jälgitav")
     if has("aitrack"):
-        return {
-            "objekt": "AI-tööpäeviku süsteemi arendamine",
-            "saavutus": "Tööpäeviku süsteemi täiendatud ja kontrollitud, et tegevused jõuaksid ülevaatesse arusaadavalt",
-        }
+        return row("AI-tööpäeviku süsteemi arendamine",
+                   "Tööpäeviku süsteemi täiendatud ja kontrollitud, et tegevused jõuaksid ülevaatesse arusaadavalt")
 
     topics = _unique_limited([_topic_from_work_text(t, 90) for t in safe_texts], 2)
-    proj = next((str(p).strip() for p in (projects or []) if str(p).strip()), "")
-    objekt = topics[0] if topics else (proj or "Tööülesande lahendamine")
+    objekt = _object_with_project(prefix, topics[0]) if topics else (prefix or "Tööülesande lahendamine")
     saavutus = "; ".join(topics) if topics else "Tegeldi praktikaga seotud tööülesandega"
     return {"objekt": _cell_safe(objekt[:400]), "saavutus": _cell_safe(saavutus[:400])}
 
