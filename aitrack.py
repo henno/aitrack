@@ -3601,8 +3601,16 @@ def _html_table_for_day(date: str, full: bool = False) -> tuple[str, str]:
     return html, text
 
 
-def _start_page_html() -> str:
-    return r"""<!doctype html>
+def _start_page_html(*, server_mode: bool = False) -> str:
+    token_control = "" if server_mode else (
+        '<label title="Vajalik ainult aitrack serve keskserveri puhul">Server token '
+        '<input id="tokenInput" type="password" placeholder="keskserveri token"></label>'
+    )
+    server_actions = "" if server_mode else (
+        '<button onclick="refreshFromLogs()">Töötle lõpetatud tunnid</button>'
+        '<button onclick="backfill()">Backfill 12h</button>'
+    )
+    page = r"""<!doctype html>
 <html lang="et">
 <head>
 <meta charset="utf-8">
@@ -3641,13 +3649,13 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 <body>
 <header>
   <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
-  <div class="toolbar"><button onclick="showHelp()">Abi</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="refreshFromLogs()">Töötle lõpetatud tunnid</button><button onclick="backfill()">Backfill 12h</button></div>
+  <div class="toolbar"><button onclick="showHelp()">Abi</button><button onclick="location.href='/activity'">Server tegevused</button>__SERVER_ACTIONS__</div>
 </header>
 <main>
   <section class="panel toolbar">
     <label>Kuupäev <input type="date" id="dateInput"></label>
     <select id="daySelect" title="Olemasolevad päevad"></select>
-    <label title="Vajalik ainult aitrack serve keskserveri puhul">Server token <input id="tokenInput" type="password" placeholder="keskserveri token"></label>
+    __TOKEN_CONTROL__
     <button onclick="loadDay()">Ava</button>
     <button onclick="addRow()">+ Lisa rida</button>
     <button class="primary" onclick="saveDay(true)">Salvesta</button>
@@ -3671,14 +3679,19 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 let currentDate = '';
 let days = [];
 const $ = (id) => document.getElementById(id);
+const SERVER_MODE = __SERVER_MODE__;
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
 function authToken() { return $('tokenInput') ? $('tokenInput').value.trim() : ''; }
 async function api(path, opts={}) {
   opts.headers = Object.assign({}, opts.headers || {});
   const tok = authToken();
   if (tok) opts.headers['X-Aitrack-Token'] = tok;
-  const res = await fetch(path, opts);
+  const res = await fetch(path, {credentials:'same-origin', ...opts});
   const data = await res.json().catch(() => ({}));
+  if (SERVER_MODE && (res.status === 401 || res.status === 403)) {
+    location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
+    throw new Error(data.error || 'login puudub');
+  }
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data;
 }
@@ -3810,6 +3823,10 @@ init().catch(e => setStatus(e.message, true));
 </script>
 </body>
 </html>"""
+    return (page
+            .replace("__TOKEN_CONTROL__", token_control)
+            .replace("__SERVER_ACTIONS__", server_actions)
+            .replace("__SERVER_MODE__", "true" if server_mode else "false"))
 
 
 def _login_page_html() -> str:
@@ -4215,7 +4232,10 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
             if u.path in ("/", "/index.html"):
-                self._html(_start_page_html())
+                if self._server_mode() and self._cookie_user() is None:
+                    self._redirect("/login?next=/")
+                    return
+                self._html(_start_page_html(server_mode=self._server_mode()))
                 return
             if u.path == "/login":
                 self._html(_login_page_html())
