@@ -2442,7 +2442,10 @@ def _prompt_to_work_sentence(text: str) -> str:
     for prefix, replacement in mappings:
         if lowered == prefix.strip() or lowered.startswith(prefix):
             rest = s[len(prefix):].strip(" :,-") if prefix.endswith(" ") else s[len(prefix):].strip(" :,-")
-            sentence = f"{replacement}{(' ' + rest) if rest else ''}".strip()
+            if prefix in ("tõmba", "installi", "ava"):
+                rest = ""
+            sep = "" if replacement.endswith(" ") or not rest else " "
+            sentence = f"{replacement}{sep}{rest}".strip()
             return sentence.rstrip(".") + "."
     return f"Tegelesin teemaga: {s}."
 
