@@ -598,6 +598,8 @@ invoice = A._db_invoice_lines(wdb, wtok, {"period": ["2026-06"], "hourly_rate": 
 A._db_ingest_events(wdb, wtok, [{"event_key": "work-e1", "tool": "Pi", "project": "/tmp/pp-finar-pi", "prompt_text": "tee issue 662", "started_at": HFL(10).isoformat(), "ended_at": (HFL(10) + dt.timedelta(minutes=1)).isoformat(), "duration_seconds": 60}])
 practice = A._db_practice_summary(wdb, wtok, {"period": ["2026-06"]})
 activity = A._db_activity_log(wdb, wtok, {"period": ["2026-06"]})
+A._db_ingest_rows(wdb, wtok, [["2026-06-16", "10:00–11:00", "(2 prompti, automaatkokkuvõte puudub)", "(2 prompti, automaatkokkuvõte puudub)", "Ei olnud", "Ei olnud", "Pi"]], ["k:2026-06-16T10:00:00+00:00|__hour__"])
+day_rows_with_work = A._db_rows_for_day(wdb, wtok, "2026-06-16")
 with A._db_connect(wdb) as conn:
     project_count = conn.execute("SELECT COUNT(*) AS c FROM projects").fetchone()["c"]
     issue_count = conn.execute("SELECT COUNT(*) AS c FROM issues").fetchone()["c"]
@@ -611,6 +613,7 @@ check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-fina
 check("activity endpoint helper näitab sessioone ja prompt-evente", len(activity["sessions"]) == 1 and len(activity["prompt_events"]) == 1)
 check("activity sisaldab serveri work_session_uid väärtust", activity["sessions"][0]["work_session_uid"] == start["work_session_uid"])
 check("activity sisaldab checkouti failiteed", activity["sessions"][0]["local_path"] == "/tmp/pp-finar-pi")
+check("serveri päevavaade asendab automaatkokkuvõtte placeholderi work-session kokkuvõttega", "parandus valmis" in day_rows_with_work[0][3])
 
 # ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
 print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")

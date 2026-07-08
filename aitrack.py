@@ -2312,17 +2312,106 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "sessions": session_items, "prompt_events": prompt_items, "activity": activity[:limit]}
 
 
-def _db_rows_for_day(path: Path, token: str, date: str) -> list[list]:
+def _hour_label_from_local(local: dt.datetime) -> str:
+    local_end = local + dt.timedelta(hours=1)
+    return f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}"
+
+
+def _placeholder_day_text(value: str) -> bool:
+    return "automaatkokkuvõte puudub" in str(value or "")
+
+
+def _infer_fixed_tz_from_day_rows(rows: list[list], cfg: dict | None = None) -> dt.tzinfo:
+    for r in rows:
+        if len(r) < 8:
+            continue
+        started = parse_iso(str(r[7]).split("|", 1)[0].removeprefix("k:"))
+        m = re.match(r"^(\d{2}):(\d{2})", str(r[1] or ""))
+        if not started or not m:
+            continue
+        local_naive = dt.datetime.fromisoformat(str(r[0])).replace(hour=int(m.group(1)), minute=int(m.group(2)))
+        offset_seconds = int((local_naive - started.replace(tzinfo=None)).total_seconds())
+        offset_hours = round(offset_seconds / 3600)
+        if -12 <= offset_hours <= 14:
+            return dt.timezone(dt.timedelta(hours=offset_hours))
+    return get_tz(cfg or load_config())
+
+
+def _db_work_session_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
+                              existing_rows: list[list], cfg: dict | None = None) -> list[list]:
+    tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg)
+    target = dt.date.fromisoformat(date)
+    start_utc = dt.datetime.combine(target, dt.time.min, tzinfo=dt.timezone.utc) - dt.timedelta(hours=14)
+    end_utc = dt.datetime.combine(target + dt.timedelta(days=1), dt.time.min, tzinfo=dt.timezone.utc) + dt.timedelta(hours=14)
+    rows = conn.execute("""
+        SELECT ws.*, wi.title AS work_title, p.project_key, p.name AS project_name,
+               i.issue_key, i.title AS issue_title,
+               (SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count
+        FROM work_sessions ws
+        JOIN work_items wi ON wi.id = ws.work_item_id
+        JOIN projects p ON p.id = wi.project_id
+        LEFT JOIN issues i ON i.id = wi.issue_id
+        WHERE ws.user_id = ? AND ws.status != 'discarded' AND ws.started_at >= ? AND ws.started_at < ?
+        ORDER BY ws.started_at
+    """, (int(user["id"]), start_utc.isoformat(), end_utc.isoformat())).fetchall()
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        started = parse_iso(r["started_at"])
+        if not started:
+            continue
+        local = hour_floor(started.astimezone(tz))
+        if local.date() != target:
+            continue
+        hour = _hour_label_from_local(local)
+        g = grouped.setdefault(hour, {"date": date, "hour": hour, "objects": [], "summaries": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
+        issue = f"#{r['issue_key']}" if r["issue_key"] else ""
+        title = r["issue_title"] or r["work_title"] or r["project_name"] or r["project_key"]
+        obj = " ".join(x for x in [r["project_name"] or r["project_key"], issue, title] if x)
+        if obj and obj not in g["objects"]:
+            g["objects"].append(obj)
+        summary = str(r["summary"] or title or "").strip()
+        if summary and summary not in g["summaries"]:
+            g["summaries"].append(summary)
+        tool = str(r["tool"] or "").strip()
+        if tool and tool not in g["tools"]:
+            g["tools"].append(tool)
+    out = []
+    for g in grouped.values():
+        key = f"k:{g['utc'].isoformat()}|__work_session__"
+        out.append([g["date"], g["hour"], "; ".join(g["objects"]), "; ".join(g["summaries"]),
+                    _NA, _NA, ", ".join(g["tools"]), key])
+    return sorted(out, key=lambda r: (r[1], r[7]))
+
+
+def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) -> list[list]:
+    by_hour = {r[1]: r for r in rows}
+    for d in derived:
+        existing = by_hour.get(d[1])
+        if existing is None:
+            rows.append(d)
+            by_hour[d[1]] = d
+            continue
+        # Säilita käsitsi parandatud read; asenda ainult automaatse varukokkuvõtte placeholder.
+        if _placeholder_day_text(existing[2]) or _placeholder_day_text(existing[3]):
+            existing[2] = d[2] or existing[2]
+            existing[3] = d[3] or existing[3]
+            existing[6] = d[6] or existing[6]
+    return sorted(rows, key=lambda r: (r[1], r[7]))
+
+
+def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None) -> list[list]:
     _db_init(path)
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        rows = conn.execute(
+        rows_db = conn.execute(
             "SELECT date, hour, objekt, saavutus, takistus, teadmine, tool, row_key "
             "FROM hour_rows WHERE user_id = ? AND date = ? ORDER BY hour, row_key",
             (user["id"], date),
         ).fetchall()
-    return [[r["date"], r["hour"], r["objekt"], r["saavutus"], r["takistus"],
-             r["teadmine"], r["tool"], r["row_key"]] for r in rows]
+        rows = [[r["date"], r["hour"], r["objekt"], r["saavutus"], r["takistus"],
+                 r["teadmine"], r["tool"], r["row_key"]] for r in rows_db]
+        derived = _db_work_session_day_rows(conn, user, date, rows, cfg)
+    return _merge_day_rows_with_work_sessions(rows, derived)
 
 
 def _db_days(path: Path, token: str) -> list[str]:
@@ -4264,7 +4353,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": "vigane kuupäev"}, 400)
                     return
                 if self._server_mode():
-                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date, self.cfg)
                     rows = [
                         {"key": r[7], "hour": r[1], "objekt": r[2], "saavutus": r[3],
                          "takistus": r[4], "teadmine": r[5], "tool": r[6]}
@@ -4281,7 +4370,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": "vigane kuupäev"}, 400)
                     return
                 if self._server_mode():
-                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date, self.cfg)
                     day = _day_row(date, db_rows) if db_rows else [date, 0, _weekday_letter(date), "", "", "", ""]
                     cols = slice(None) if full else slice(3, 7)
                     selected = day[cols]
@@ -4377,7 +4466,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 rows = data.get("rows") if isinstance(data.get("rows"), list) else []
                 if self._server_mode():
                     _db_replace_day_rows(self._db_path(), self._token(data=data), date, rows)
-                    db_rows = _db_rows_for_day(self._db_path(), self._token(data=data), date)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(data=data), date, self.cfg)
                     ui_rows = [
                         {"key": r[7], "hour": r[1], "objekt": r[2], "saavutus": r[3],
                          "takistus": r[4], "teadmine": r[5], "tool": r[6]}
