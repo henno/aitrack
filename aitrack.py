@@ -1149,6 +1149,7 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
         "TEADMINE: Kuidas Finaris ./copy_from_live.sh skriptiga enda koopiasse live-andmebaasi koopia saada\n"
         "Vormireeglid:\n"
         "- OBJEKT: kujul 'Projekt/klient - teema (olulised detailid)', mitte vestluse küsimuste loetelu.\n"
+        "- Ära pane iga OBJEKTI ette üldist prefiksit 'Praktika -'; kasuta konkreetset projekti/teemat.\n"
         "- SAAVUTUS: konkreetne tulemus, nt 'parandatud', 'valmis', 'üles seatud', 'kontrollitud'.\n"
         "- TAKISTUS: kui takistust polnud, kirjuta täpselt: Ei olnud; muidu kirjuta päris probleem lihtsas keeles.\n"
         "- TEADMINE: alusta võimalusel 'Kuidas...', 'Mis on...' või 'Miks...'; kirjuta õpitud mõte, mitte prompti ümbersõnastus.\n"
@@ -2677,53 +2678,53 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
 
     if has("tailscale"):
         return {
-            "objekt": "Praktika - Tailscale võrguühenduse kontroll ja ligipääsu uurimine",
+            "objekt": "Tailscale võrguühenduse kontroll ja ligipääsu uurimine",
             "saavutus": "Tailscale ühendus kontrollitud; selge, kuidas teine kasutaja saab turvaliselt võrku liituda",
         }
     if has("gnome", "draw-on-gnome", "draw on gnome"):
         return {
-            "objekt": "Praktika - Linuxi töökeskkonna ja joonistustööriista seadistamine",
+            "objekt": "Linuxi töökeskkonna ja joonistustööriista seadistamine",
             "saavutus": "GNOME töökeskkond tuvastatud; ekraanile joonistamise tööriist paigaldatud ja katsetatud",
         }
     if has("pole arusaadav", "lihtrahva", "uued teadmised", "takistused"):
         return {
-            "objekt": "Praktika - tööpäeviku kirjete arusaadavamaks muutmine",
+            "objekt": "Tööpäeviku kirjete arusaadavamaks muutmine",
             "saavutus": "Päeviku tekstide koostamine parandatud, et kirjeldused oleksid lihtsas keeles",
         }
     if has("pushi", "commit", "origin/main"):
         return {
-            "objekt": "Praktika - koodimuudatuste salvestamine ja GitHubi pushimine",
+            "objekt": "Koodimuudatuste salvestamine ja GitHubi pushimine",
             "saavutus": "Muudatused salvestatud ja GitHubi üles pandud; kontrollitud, et seis on ajakohane",
         }
     if has("raw_events", "raw event", "active interval", "export"):
         return {
-            "objekt": "Praktika - tegevuste salvestamise ja aruandluse arendamine",
+            "objekt": "Tegevuste salvestamise ja aruandluse arendamine",
             "saavutus": "Täpsem tegevuste salvestamine lisatud ja kontrollitud; andmed sobivad hilisemaks aruandluseks",
         }
     if has("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick", "hook", "alam-agent", "subagent"):
         return {
-            "objekt": "Praktika - AI-tööpäeviku tööaja automaatse jälgimise arendamine",
+            "objekt": "AI-tööpäeviku tööaja automaatse jälgimise arendamine",
             "saavutus": "Töö alguse ja töö jätkumise automaatne serverisse kirjapanek täpsustatud",
         }
     if has("server token", "servertoken", "login", "parool", "rate limiter", "ip ban", "kasutaja"):
         return {
-            "objekt": "Praktika - aitrack serveri sisselogimise ja turvalisuse arendamine",
+            "objekt": "aitrack serveri sisselogimise ja turvalisuse arendamine",
             "saavutus": "Serveri ligipääs, kasutajate sisselogimine ja kaitse valede päringute vastu täiendatud",
         }
     if has("activity", "päevavaade", "failitee", "praktikapäeviku"):
         return {
-            "objekt": "Praktika - aitracki tegevusvaate ja päevikuvaate parandamine",
+            "objekt": "aitracki tegevusvaate ja päevikuvaate parandamine",
             "saavutus": "Tegevuste ülevaade ja päeviku kuvamine parandatud, et tehtud töö oleks hiljem selgemini jälgitav",
         }
     if has("aitrack"):
         return {
-            "objekt": "Praktika - AI-tööpäeviku süsteemi arendamine",
+            "objekt": "AI-tööpäeviku süsteemi arendamine",
             "saavutus": "Tööpäeviku süsteemi täiendatud ja kontrollitud, et tegevused jõuaksid ülevaatesse arusaadavalt",
         }
 
     topics = _unique_limited([_topic_from_work_text(t, 90) for t in safe_texts], 2)
-    proj = next((str(p).strip() for p in (projects or []) if str(p).strip()), "Praktika")
-    objekt = f"Praktika - {topics[0]}" if topics else proj
+    proj = next((str(p).strip() for p in (projects or []) if str(p).strip()), "")
+    objekt = topics[0] if topics else (proj or "Tööülesande lahendamine")
     saavutus = "; ".join(topics) if topics else "Tegeldi praktikaga seotud tööülesandega"
     return {"objekt": _cell_safe(objekt[:400]), "saavutus": _cell_safe(saavutus[:400])}
 
