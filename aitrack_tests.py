@@ -610,6 +610,7 @@ check("invoice sisaldab aega, hinda ja summat", invoice["lines"][0]["time"] == "
 check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-finar" in practice["days"][0]["text"])
 check("activity endpoint helper näitab sessioone ja prompt-evente", len(activity["sessions"]) == 1 and len(activity["prompt_events"]) == 1)
 check("activity sisaldab serveri work_session_uid väärtust", activity["sessions"][0]["work_session_uid"] == start["work_session_uid"])
+check("activity sisaldab checkouti failiteed", activity["sessions"][0]["local_path"] == "/tmp/pp-finar-pi")
 
 # ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
 print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")
@@ -633,6 +634,7 @@ print("TEST 45: serveri tegevuste HTML leht ja link päevavaatest")
 activity_page = A._activity_page_html()
 start_page = A._start_page_html()
 check("activity leht kutsub /api/activity endpointi", "/api/activity" in activity_page and "work_session_uid" in activity_page)
+check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in activity_page and "class=\"small path\"" in activity_page)
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
 check("login leht postitab /api/login endpointi", "/api/login" in A._login_page_html() and "password" in A._login_page_html())
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
@@ -671,6 +673,42 @@ for _ in range(A.LOGIN_FAIL_MAX - 1):
 check("login failure ei banni enne limiiti", banned is False and "203.0.113.77" not in A._AitrackHandler._banned_until)
 banned = dummy._record_login_failure()
 check("login failure ban rakendub limiidil", banned is True and A._AitrackHandler._banned_until.get("203.0.113.77", 0) > 0)
+
+# ============ TEST 49: raw_events MVP ==========
+print("TEST 49: raw_events tabel, /api/events ingest helper ja export")
+rdb = CFG / "server-raw-events-test.db"
+rdb.unlink(missing_ok=True)
+rtok = A._db_add_user(rdb, "rawuser")
+rpayload = {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "raw events test", "summary": "raw events"},
+    "session": {"client_id": "client-raw", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": HFL(12).isoformat(),
+}
+rstart = A._db_work_start(rdb, rtok, rpayload)
+raw_event = {
+    "event_key": "raw-e1",
+    "event_type": "before_tool_call",
+    "tool_name": "read",
+    "work_session_uid": rstart["work_session_uid"],
+    "agent_uid": "agent-1",
+    "parent_agent_uid": "root-agent",
+    "tool_call_id": "tool-1",
+    "occurred_at_utc": HFL(12).isoformat(),
+    "payload": {"path": "aitrack.py", "token": "SALA", "output": "x" * 20000},
+}
+raw_res1 = A._db_ingest_events(rdb, rtok, [raw_event])
+raw_res2 = A._db_ingest_events(rdb, rtok, [raw_event])
+raw_export = A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["before_tool_call"]})
+with A._db_connect(rdb) as conn:
+    raw_count = conn.execute("SELECT COUNT(*) AS c FROM raw_events").fetchone()["c"]
+    prompt_count = conn.execute("SELECT COUNT(*) AS c FROM prompt_events").fetchone()["c"]
+exported_raw = raw_export["events"][0] if raw_export["events"] else {}
+check("raw event sisestus on idempotentne", raw_res1["raw_events"]["inserted"] == 1 and raw_res2["raw_events"]["inserted"] == 0 and raw_count == 1)
+check("raw event ei tekita legacy prompt-eventi", prompt_count == 0)
+check("raw export leiab sündmuse ja seob work_session_uid-ga", raw_export["count"] == 1 and exported_raw.get("work_session_uid") == rstart["work_session_uid"] and exported_raw.get("work_session_id") == rstart["work_session_id"])
+check("raw payload on piiratud ja saladus redigeeritud", "SALA" not in exported_raw.get("payload_json", "") and len(exported_raw.get("payload_json", "")) <= A.RAW_EVENT_PAYLOAD_MAX_BYTES)
+check("raw export filter töötab", A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["after_tool_call"]})["count"] == 0)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

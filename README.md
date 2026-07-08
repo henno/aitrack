@@ -173,6 +173,10 @@ API/CLI jaoks jääb token-põhine autentimine alles. Server rakendab lihtsat m�
 liigsed päringud, korduvad valed login'id ja tüüpilised probe'id (`/.env`, `/.git`, `wp-login.php` jne)
 saavad ajutise IP-ban'i.
 
+Harnessi/hookide jaoks salvestab server append-only `raw_events` ridu. Saada batch `POST /api/events`
+kaudu (`events: [...]`) ja ekspordi neid `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id
+piiratakse ning tüüpilised token/parool/saladuse võtmed redigeeritakse enne talletamist.
+
 Arve jaoks server dokumenti ei tee, vaid annab JSON endpointi välisele arvegeneraatorile. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 
 ```bash

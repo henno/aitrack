@@ -66,6 +66,9 @@ RATE_MAX_REQUESTS = 180
 LOGIN_FAIL_WINDOW_SECONDS = 10 * 60
 LOGIN_FAIL_MAX = 5
 BAN_SECONDS = 30 * 60
+RAW_EVENT_PAYLOAD_MAX_BYTES = 16 * 1024
+RAW_EVENT_STRING_MAX_CHARS = 4000
+RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "authorization", "cookie"}
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -1604,6 +1607,22 @@ def _db_init(path: Path) -> None:
           UNIQUE(user_id, event_key)
         );
         CREATE INDEX IF NOT EXISTS prompt_events_user_started_idx ON prompt_events(user_id, started_at);
+        CREATE TABLE IF NOT EXISTS raw_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          work_session_id INTEGER REFERENCES work_sessions(id) ON DELETE SET NULL,
+          work_session_uid TEXT NOT NULL DEFAULT '',
+          agent_uid TEXT NOT NULL DEFAULT '',
+          parent_agent_uid TEXT NOT NULL DEFAULT '',
+          event_type TEXT NOT NULL,
+          tool_name TEXT NOT NULL DEFAULT '',
+          tool_call_id TEXT NOT NULL DEFAULT '',
+          event_key TEXT NOT NULL DEFAULT '',
+          dedup_key TEXT NOT NULL,
+          occurred_at_utc TEXT NOT NULL,
+          received_at_utc TEXT NOT NULL,
+          payload_json TEXT NOT NULL
+        );
         """)
         # Vanade server.db failide kerge migratsioon.
         _db_add_column_if_missing(conn, "users", "password_hash", "TEXT")
@@ -1618,6 +1637,24 @@ def _db_init(path: Path) -> None:
         _db_add_column_if_missing(conn, "prompt_events", "work_session_id", "INTEGER REFERENCES work_sessions(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "confidence", "REAL")
         _db_add_column_if_missing(conn, "prompt_events", "payload_json", "TEXT")
+        _db_add_column_if_missing(conn, "raw_events", "work_session_id", "INTEGER REFERENCES work_sessions(id) ON DELETE SET NULL")
+        _db_add_column_if_missing(conn, "raw_events", "work_session_uid", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "agent_uid", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "parent_agent_uid", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "event_type", "TEXT NOT NULL DEFAULT 'event'")
+        _db_add_column_if_missing(conn, "raw_events", "tool_name", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "tool_call_id", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "event_key", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "dedup_key", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "occurred_at_utc", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "received_at_utc", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "raw_events", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("CREATE INDEX IF NOT EXISTS raw_events_work_session_idx ON raw_events(work_session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS raw_events_work_session_uid_idx ON raw_events(work_session_uid)")
+        conn.execute("CREATE INDEX IF NOT EXISTS raw_events_occurred_idx ON raw_events(occurred_at_utc)")
+        conn.execute("CREATE INDEX IF NOT EXISTS raw_events_type_idx ON raw_events(event_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS raw_events_agent_idx ON raw_events(agent_uid)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS raw_events_user_dedup_idx ON raw_events(user_id, dedup_key) WHERE dedup_key != ''")
 
 
 def _db_user_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
@@ -2206,7 +2243,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         """, (*session_args, limit)).fetchall()
         prompts = conn.execute(f"""
             SELECT pe.*, u.name AS user_name, p.project_key, p.name AS project_name,
-                   i.provider, i.issue_key, ws.session_uid
+                   i.provider, i.issue_key, ws.session_uid, ws.local_path AS session_local_path, ws.cwd AS session_cwd
             FROM prompt_events pe
             JOIN users u ON u.id = pe.user_id
             LEFT JOIN projects p ON p.id = pe.project_id
@@ -2243,6 +2280,8 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "last_seen_at": r["last_seen_at"],
             "minutes": minutes,
             "tick_count": tick_count,
+            "local_path": r["local_path"] or "",
+            "cwd": r["cwd"] or "",
         }
         session_items.append(item)
         activity.append({**item, "at": r["started_at"], "label": "work_session"})
@@ -2263,6 +2302,8 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
             "duration_seconds": int(r["duration_seconds"] or 0),
+            "local_path": r["session_local_path"] or (r["project"] if str(r["project"] or "").startswith("/") else ""),
+            "cwd": r["session_cwd"] or "",
         }
         prompt_items.append(item)
         activity.append({**item, "at": r["started_at"], "label": "prompt_event"})
@@ -2349,37 +2390,220 @@ def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict]) -
             )
 
 
-def _db_ingest_events(path: Path, token: str, events: list[dict]) -> None:
+def _event_text(e: dict, *keys: str) -> str:
+    for key in keys:
+        val = e.get(key)
+        if val not in (None, ""):
+            return str(val)
+    return ""
+
+
+def _raw_event_occurred_at(e: dict, now: str) -> str:
+    raw = _event_text(e, "occurred_at_utc", "occurred_at", "timestamp", "started_at", "created_at")
+    parsed = parse_iso(raw)
+    return parsed.isoformat() if parsed else now
+
+
+def _raw_event_payload_value(value, *, depth: int = 0):
+    if depth > 6:
+        return "[truncated-depth]"
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = str(k)
+            lowered = key.lower().replace("-", "_")
+            if lowered in RAW_EVENT_SENSITIVE_KEYS or any(s in lowered for s in ("token", "password", "secret")):
+                out[key] = "[redacted]"
+            else:
+                out[key] = _raw_event_payload_value(v, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        items = [_raw_event_payload_value(v, depth=depth + 1) for v in value[:200]]
+        if len(value) > 200:
+            items.append({"_truncated_items": len(value) - 200})
+        return items
+    if isinstance(value, str):
+        if len(value) > RAW_EVENT_STRING_MAX_CHARS:
+            return value[:RAW_EVENT_STRING_MAX_CHARS] + f"...[truncated {len(value) - RAW_EVENT_STRING_MAX_CHARS} chars]"
+        return value
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _raw_event_payload_json(e: dict) -> str:
+    safe = _raw_event_payload_value(e)
+    text = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(text.encode("utf-8")) <= RAW_EVENT_PAYLOAD_MAX_BYTES:
+        return text
+    prefix = text.encode("utf-8")[:RAW_EVENT_PAYLOAD_MAX_BYTES // 2].decode("utf-8", "ignore")
+    return json.dumps({"_truncated": True, "prefix": prefix}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _raw_event_dedup_key(e: dict, event_type: str, occurred_at: str, tool_call_id: str) -> str:
+    event_key = _event_text(e, "event_key", "event_uid", "id")
+    if event_key:
+        return f"event_key:{event_key}"
+    agent_uid = _event_text(e, "agent_uid", "agent_id")
+    raw = "|".join([agent_uid, event_type, occurred_at, tool_call_id])
+    if raw.strip("|"):
+        return "tuple:" + hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
+    return "fallback:" + secrets.token_urlsafe(18)
+
+
+def _raw_event_work_session_id(conn: sqlite3.Connection, user_id: int, work_session_uid: str) -> int | None:
+    if not work_session_uid:
+        return None
+    row = conn.execute(
+        "SELECT id FROM work_sessions WHERE session_uid = ? AND user_id = ?",
+        (work_session_uid, user_id),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def _db_ingest_raw_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, events: list[dict], now: str) -> dict:
+    accepted = 0
+    inserted = 0
+    ignored = 0
+    for e in events:
+        if not isinstance(e, dict):
+            ignored += 1
+            continue
+        event_type = _event_text(e, "event_type", "type", "name") or "event"
+        occurred_at = _raw_event_occurred_at(e, now)
+        work_session_uid = _event_text(e, "work_session_uid", "session_uid")
+        tool_call_id = _event_text(e, "tool_call_id", "call_id")
+        event_key = _event_text(e, "event_key", "event_uid", "id")
+        dedup_key = _raw_event_dedup_key(e, event_type, occurred_at, tool_call_id)
+        work_session_id = _raw_event_work_session_id(conn, int(user["id"]), work_session_uid)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO raw_events "
+            "(user_id, work_session_id, work_session_uid, agent_uid, parent_agent_uid, event_type, tool_name, "
+            "tool_call_id, event_key, dedup_key, occurred_at_utc, received_at_utc, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(user["id"]), work_session_id, work_session_uid,
+             _event_text(e, "agent_uid", "agent_id"), _event_text(e, "parent_agent_uid", "parent_agent_id"),
+             event_type, _event_text(e, "tool_name", "tool"), tool_call_id, event_key, dedup_key,
+             occurred_at, now, _raw_event_payload_json(e)),
+        )
+        accepted += 1
+        if cur.rowcount:
+            inserted += 1
+        else:
+            ignored += 1
+    return {"accepted": accepted, "inserted": inserted, "ignored": ignored}
+
+
+def _looks_like_legacy_prompt_event(e: dict) -> bool:
+    event_type = str(e.get("event_type") or "")
+    return "prompt_text" in e and event_type in ("", "prompt_event", "prompt_finished")
+
+
+def _db_ingest_legacy_prompt_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, events: list[dict], now: str) -> dict:
+    accepted = 0
+    inserted = 0
+    ignored = 0
+    for e in events:
+        if not isinstance(e, dict) or not _looks_like_legacy_prompt_event(e):
+            continue
+        key = str(e.get("event_key", ""))
+        if not key:
+            ignored += 1
+            continue
+        project_raw = str(e.get("project", ""))
+        ctx = _project_context(project_raw or ".")
+        project_id = _db_upsert_project(conn, {
+            "project_key": ctx["project_key"], "repo_url": ctx["repo_url"],
+            "name": ctx["name"], "local_path": ctx["local_path"],
+        }, now)
+        issue_id = None
+        if ctx.get("issue_key"):
+            issue_id = _db_upsert_issue(conn, project_id, {
+                "provider": ctx.get("issue_provider") or "local", "issue_key": ctx.get("issue_key")
+            }, ctx.get("issue_provider") or "local", now)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO prompt_events "
+            "(user_id, event_key, tool, project, prompt_text, started_at, ended_at, duration_seconds, "
+            "created_at, project_id, issue_id, confidence, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user["id"], key, str(e.get("tool", e.get("tool_name", ""))), project_raw,
+             str(e.get("prompt_text", "")), str(e.get("started_at", "")),
+             str(e.get("ended_at", "")), int(e.get("duration_seconds") or 0), now,
+             project_id, issue_id, float(e.get("confidence") or 0.5),
+             json.dumps(_raw_event_payload_value(e), ensure_ascii=False, sort_keys=True)),
+        )
+        accepted += 1
+        if cur.rowcount:
+            inserted += 1
+        else:
+            ignored += 1
+    return {"accepted": accepted, "inserted": inserted, "ignored": ignored}
+
+
+def _db_ingest_events(path: Path, token: str, events: list[dict]) -> dict:
     _db_init(path)
     now = _now_utc().isoformat()
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        for e in events:
-            key = str(e.get("event_key", ""))
-            if not key:
-                continue
-            project_raw = str(e.get("project", ""))
-            ctx = _project_context(project_raw or ".")
-            project_id = _db_upsert_project(conn, {
-                "project_key": ctx["project_key"], "repo_url": ctx["repo_url"],
-                "name": ctx["name"], "local_path": ctx["local_path"],
-            }, now)
-            issue_id = None
-            if ctx.get("issue_key"):
-                issue_id = _db_upsert_issue(conn, project_id, {
-                    "provider": ctx.get("issue_provider") or "local", "issue_key": ctx.get("issue_key")
-                }, ctx.get("issue_provider") or "local", now)
-            conn.execute(
-                "INSERT OR IGNORE INTO prompt_events "
-                "(user_id, event_key, tool, project, prompt_text, started_at, ended_at, duration_seconds, "
-                "created_at, project_id, issue_id, confidence, payload_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (user["id"], key, str(e.get("tool", "")), project_raw,
-                 str(e.get("prompt_text", "")), str(e.get("started_at", "")),
-                 str(e.get("ended_at", "")), int(e.get("duration_seconds") or 0), now,
-                 project_id, issue_id, float(e.get("confidence") or 0.5),
-                 json.dumps(e, ensure_ascii=False, sort_keys=True)),
-            )
+        raw = _db_ingest_raw_events_conn(conn, user, events, now)
+        prompts = _db_ingest_legacy_prompt_events_conn(conn, user, events, now)
+    return {"ok": True, "raw_events": raw, "prompt_events": prompts}
+
+
+def _db_export_raw_events(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _activity_bounds(q)
+    limit = max(1, min(int(_qval(q, "limit") or 500), 5000))
+    event_type = _qval(q, "event_type") or _qval(q, "type")
+    work_session_uid = _qval(q, "work_session_uid") or _qval(q, "session_uid")
+    agent_uid = _qval(q, "agent_uid") or _qval(q, "agent_id")
+    tool_name = _qval(q, "tool_name") or _qval(q, "tool")
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        where = ["re.occurred_at_utc >= ?", "re.occurred_at_utc < ?"]
+        args: list = [start_iso, end_iso]
+        if user["role"] != "admin":
+            where.append("re.user_id = ?")
+            args.append(int(user["id"]))
+        if event_type:
+            where.append("re.event_type = ?")
+            args.append(event_type)
+        if work_session_uid:
+            where.append("re.work_session_uid = ?")
+            args.append(work_session_uid)
+        if agent_uid:
+            where.append("re.agent_uid = ?")
+            args.append(agent_uid)
+        if tool_name:
+            where.append("re.tool_name = ?")
+            args.append(tool_name)
+        rows = conn.execute(f"""
+            SELECT re.*, u.name AS user_name
+            FROM raw_events re
+            JOIN users u ON u.id = re.user_id
+            WHERE {' AND '.join(where)}
+            ORDER BY re.occurred_at_utc DESC, re.id DESC
+            LIMIT ?
+        """, (*args, limit)).fetchall()
+    events = []
+    for r in rows:
+        events.append({
+            "id": int(r["id"]),
+            "user": r["user_name"],
+            "work_session_id": int(r["work_session_id"]) if r["work_session_id"] is not None else None,
+            "work_session_uid": r["work_session_uid"] or "",
+            "agent_uid": r["agent_uid"] or "",
+            "parent_agent_uid": r["parent_agent_uid"] or "",
+            "event_type": r["event_type"],
+            "tool_name": r["tool_name"] or "",
+            "tool_call_id": r["tool_call_id"] or "",
+            "event_key": r["event_key"] or "",
+            "occurred_at_utc": r["occurred_at_utc"],
+            "received_at_utc": r["received_at_utc"],
+            "payload_json": r["payload_json"],
+        })
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "count": len(events), "events": events}
 
 
 def _server_url(cfg: dict, op: str) -> str:
@@ -3683,6 +3907,7 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; }
 .bad { color:var(--bad); }
 .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-size:12px; }
+.path { margin-top:4px; word-break:break-all; }
 .empty { text-align:center; color:var(--muted); padding:26px; }
 .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; }
 .metric { border:1px solid var(--line); border-radius:12px; padding:10px; }
@@ -3721,7 +3946,10 @@ const $ = (id) => document.getElementById(id);
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
 function esc(s) { return String(s ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }
-function projectLabel(x) { return `${esc(x.project_key || x.project || '')}${x.issue ? ' <span class="pill">' + esc(x.issue) + '</span>' : ''}`; }
+function projectLabel(x) {
+  const path = x.local_path || x.cwd || '';
+  return `${esc(x.project_key || x.project || '')}${x.issue ? ' <span class="pill">' + esc(x.issue) + '</span>' : ''}${path ? '<div class="small path">' + esc(path) + '</div>' : ''}`;
+}
 async function api(path, opts={}) {
   const res = await fetch(path, {credentials: 'same-origin', ...opts});
   const data = await res.json().catch(() => ({}));
@@ -4059,6 +4287,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))
                 return
+            if u.path == "/api/export/raw-events" and self._server_mode():
+                self._json(_db_export_raw_events(self._db_path(), self._token(q), q))
+                return
             if u.path == "/api/billing/invoice-lines" and self._server_mode():
                 self._json(_db_invoice_lines(self._db_path(), self._token(q), q))
                 return
@@ -4107,8 +4338,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/events" and self._server_mode():
                 events = data.get("events") if isinstance(data.get("events"), list) else []
-                _db_ingest_events(self._db_path(), self._token(data=data), events)
-                self._json({"ok": True})
+                self._json(_db_ingest_events(self._db_path(), self._token(data=data), events))
                 return
             if u.path == "/api/work/start" and self._server_mode():
                 self._json(_db_work_start(self._db_path(), self._token(data=data), data))
