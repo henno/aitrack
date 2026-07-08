@@ -2495,7 +2495,7 @@ def _rawish_day_text(value: str) -> bool:
     """Kas päevikuvaate lahter paistab toorpromptide/tehnilise fallbackina, mitte lõpptekstina."""
     text = str(value or "").strip()
     low = text.lower()
-    if low in {"praktika", "aitrack"}:
+    if low in {"praktika", "aitrack"} or low.startswith("aitrack "):
         return True
     markers = ("; aitrack ", "agents.md", "cookie-auth", "work start", "tool-call",
                "raw_events", "prompt tracking", "heartbeat/minute", "server token")
@@ -2674,15 +2674,15 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
             "objekt": "Praktika – tööpäeviku kirjete arusaadavamaks muutmine.",
             "saavutus": "Parandati päeviku tekstide koostamist, et kirjeldused oleksid lihtsas keeles ja sobiksid praktikapäevikusse.",
         }
+    if has("pushi", "commit", "origin/main"):
+        return {
+            "objekt": "Praktika – koodimuudatuste salvestamine ja avaldamine.",
+            "saavutus": "Kontrolliti, et muudatused on salvestatud ja GitHubi üles pandud.",
+        }
     if has("raw_events", "raw event", "active interval", "export"):
         return {
             "objekt": "Praktika – aitracki tegevuslogide ja ekspordi arendamine.",
             "saavutus": "Lisati ja kontrolliti detailsemat tegevuste salvestamist ning andmete eksportimist hilisemaks aruandluseks.",
-        }
-    if has("activity", "päevavaade", "failitee", "praktikapäeviku"):
-        return {
-            "objekt": "Praktika – aitracki tegevusvaate ja päevikuvaate parandamine.",
-            "saavutus": "Parandati tegevuste ülevaadet ja päeviku kuvamist, et töö oleks hiljem selgemini jälgitav.",
         }
     if has("work start", "aitrack tick", "heartbeat", "minute_tick", "minute tick", "hook", "alam-agent", "subagent"):
         return {
@@ -2693,6 +2693,11 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
         return {
             "objekt": "Praktika – aitrack serveri sisselogimise ja turvalisuse arendamine.",
             "saavutus": "Täiendati serveri ligipääsu, kasutajate sisselogimist ja kaitset valede päringute vastu.",
+        }
+    if has("activity", "päevavaade", "failitee", "praktikapäeviku"):
+        return {
+            "objekt": "Praktika – aitracki tegevusvaate ja päevikuvaate parandamine.",
+            "saavutus": "Parandati tegevuste ülevaadet ja päeviku kuvamist, et töö oleks hiljem selgemini jälgitav.",
         }
     if has("aitrack"):
         return {
@@ -2750,8 +2755,14 @@ def _blocker_sentence_from_text(text: str) -> str:
     if not topic:
         return ""
     low = topic.lower()
+    if "upstream buffer limit" in low or "buffer limit" in low:
+        return "Tekkis tehniline bufferi limiidi viga, mis vajas lahendamist."
+    if "serveri url" in low or "token puudu" in low or "ligipääs hetzner" in low:
+        return "Serveri ühenduse andmed ja ligipääs vajasid täpsustamist."
     if "hang" in low:
         return "Tuli arvestada hangumise tuvastamise ja heartbeat'i usaldusväärsusega."
+    if "failitee" in low and ("mittekuv" in low or "ei kuvat" in low):
+        return "Activity vaates ei kuvanud failitee õigesti."
     if "mittekuv" in low or "ei kuvat" in low:
         return f"Kuvamise probleem vajas parandamist: {topic}."
     if low.startswith("paranda"):
