@@ -80,9 +80,11 @@ SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack se
 WEB_SESSION_COOKIE = "aitrack_session"
 WEB_SESSION_DAYS = 30
 RATE_WINDOW_SECONDS = 60
-RATE_MAX_REQUESTS = 180
+# Tavakasutus ei tohi IP-banni anda. 600/min on piisav ka NAT-i taga mitme brauseri
+# ja CLI-kliendi jaoks; ületamisel throttlime lühidalt, mitte ei lukusta IP-d.
+RATE_MAX_REQUESTS = 600
 # Agent/hook tracking may legitimately send many events/tool heartbeats in bursts.
-# Keep these out of the normal browser/IP ban bucket and throttle without banning.
+# Keep these out of the normal browser/API bucket and throttle without banning.
 RATE_MAX_AGENT_REQUESTS = 3000
 LOGIN_FAIL_WINDOW_SECONDS = 10 * 60
 LOGIN_FAIL_MAX = 5
@@ -93,7 +95,8 @@ RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", 
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
-CLIENT_VERSION = 3
+CLIENT_VERSION = 4
+ALLOWLIST_SYNC_TTL_SECONDS = 10 * 60
 AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
@@ -564,18 +567,82 @@ def _local_session_tracked(session: dict, allow: list[str] | None = None) -> boo
     return bool(project_key and project_key in _local_allowed_project_keys(allow))
 
 
-def _sync_allowed_projects(cfg: dict, paths: list[str] | None = None, *, quiet: bool = False) -> bool:
+def _allowlist_sync_fingerprint(paths: list[str]) -> str:
+    projects = [_allowed_project_payload(p) for p in paths]
+    slim = sorted(
+        (
+            {
+                "project_key": str(p.get("project_key") or ""),
+                "root_path": str(p.get("root_path") or p.get("local_path") or ""),
+                "name": str(p.get("name") or ""),
+            }
+            for p in projects
+        ),
+        key=lambda p: (p["project_key"], p["root_path"]),
+    )
+    raw = json.dumps(slim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _allowlist_sync_cache_hit(fingerprint: str) -> bool:
+    try:
+        _local_db_init()
+        with _local_db_connect() as conn:
+            row = conn.execute("SELECT value FROM local_meta WHERE key = 'allowlist_sync'").fetchone()
+        if not row:
+            return False
+        data = json.loads(str(row["value"] or "{}"))
+        if data.get("fingerprint") != fingerprint:
+            return False
+        synced_at = parse_iso(str(data.get("synced_at") or ""))
+        return bool(synced_at and (_now_utc() - synced_at).total_seconds() < ALLOWLIST_SYNC_TTL_SECONDS)
+    except Exception:  # noqa: BLE001 - cache ei tohi sünkroniseerimist murda
+        return False
+
+
+def _allowlist_sync_cache_store(fingerprint: str) -> None:
+    try:
+        _local_db_init()
+        now = _now_utc().isoformat()
+        value = json.dumps({"fingerprint": fingerprint, "synced_at": now}, ensure_ascii=False)
+        with _local_db_connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO local_meta(key, value, updated_at) VALUES ('allowlist_sync', ?, ?)",
+                (value, now),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _allowlist_sync_cache_clear() -> None:
+    try:
+        _local_db_init()
+        with _local_db_connect() as conn:
+            conn.execute("DELETE FROM local_meta WHERE key = 'allowlist_sync'")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sync_allowed_projects(cfg: dict, paths: list[str] | None = None, *, quiet: bool = False, force: bool = False) -> bool:
     """Saada lokaalne `aitrack add` allowlist serverile.
 
-    Serveri allowlist on kaitse vana/stale kliendi ja käsitsi `work start` vastu; klient
-    sünkroniseerib seda enne töö saatmist ning `add/connect` järel.
+    Serveri allowlist on kaitse vana/stale kliendi ja käsitsi `work start` vastu. Tihedad
+    hook/tick käsud ei tohi aga iga kord `/api/projects/allow` spämmida; muutumatu täislist
+    sünkroniseeritakse vahemällu ja saadetakse uuesti alles TTL-i järel või päris add/connect puhul.
     """
     if cfg.get("sink", {}).get("type") != "server":
         return True
-    paths = paths if paths is not None else load_projects()
+    current_allow = load_projects()
+    full_sync = paths is None or sorted(set(paths)) == sorted(set(current_allow))
+    paths = paths if paths is not None else current_allow
+    fingerprint = _allowlist_sync_fingerprint(paths)
+    if full_sync and not force and _allowlist_sync_cache_hit(fingerprint):
+        return True
     projects = [_allowed_project_payload(p) for p in paths]
     body = _server_post("projects/allow", {"projects": projects}, cfg)
     ok = bool(body and body.get("ok"))
+    if ok and full_sync:
+        _allowlist_sync_cache_store(fingerprint)
     if not ok and not quiet:
         log("allowlist: serveriga sünkroniseerimine ebaõnnestus")
     return ok
@@ -587,7 +654,9 @@ def _sync_removed_project(cfg: dict, path: str | Path) -> bool:
     payload = _allowed_project_payload(path)
     body = _server_post("projects/unallow", payload, cfg)
     ok = bool(body and body.get("ok"))
-    if not ok:
+    if ok:
+        _allowlist_sync_cache_clear()
+    else:
         log("allowlist: serverist eemaldamine ebaõnnestus")
     return ok
 
@@ -1759,15 +1828,19 @@ def _db_record_security_event(path: Path, user_id: int | None, event_type: str,
 def _rate_limit_profile(path: str) -> tuple[str, int, bool]:
     """Return (bucket, max_requests_per_window, ban_on_limit).
 
-    High-volume agent endpoints are throttled in a separate bucket and never create
-    a broad IP ban, so Pi/Claude hook bursts do not lock users out of the UI.
+    High-volume agent/client endpoints are throttled in a separate bucket and never
+    create a broad IP ban, so Pi/Claude hook bursts do not lock users out of the UI.
+    Normal browser/API traffic is also throttle-only; IP ban jääb ainult kahtlastele
+    teedele ja korduvatele valedele loginitele.
     """
     p = str(path or "")
     if p == "/api/events" or p.startswith("/api/prompt/") or p.startswith("/api/agent/") or p in {
-        "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard", "/api/watchdog",
+        "/api/projects/allow", "/api/projects/unallow",
+        "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard", "/api/work/status",
+        "/api/watchdog",
     }:
         return "agent", RATE_MAX_AGENT_REQUESTS, False
-    return "default", RATE_MAX_REQUESTS, True
+    return "default", RATE_MAX_REQUESTS, False
 
 
 
@@ -5700,7 +5773,7 @@ def cmd_add(args, cfg):
         log(f"add: hoiatus — tee ei ole olemasolev kaust: {new}")
     paths.append(new)
     save_projects(paths)
-    _sync_allowed_projects(cfg, [new])
+    _sync_allowed_projects(cfg, [new], force=True)
     log(f"add: lisatud {new}")
     cmd_list(args, cfg)
 
@@ -6668,7 +6741,7 @@ def cmd_connect(args, cfg):
     cfg2["sink"] = {"type": "server", "server_url": args.url.rstrip("/"), "token": args.token,
                     "webapp_url": "", "path": ""}
     save_config(cfg2)
-    _sync_allowed_projects(cfg2, load_projects(), quiet=True)
+    _sync_allowed_projects(cfg2, load_projects(), quiet=True, force=True)
     print(f"aitrack server seadistatud: {args.url.rstrip('/')}")
     print("Edaspidi saadab 'aitrack run' tunniread ja prompt-eventid serverisse.")
 

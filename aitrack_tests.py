@@ -780,8 +780,10 @@ check(".env päring on kahtlane", A._is_suspicious_request_path("/.env") is True
 check("/activity ei ole kahtlane", A._is_suspicious_request_path("/activity") is False)
 check("CF/XFF IP normaliseerub", A._normalise_request_ip("203.0.113.7, 10.0.0.1") == "203.0.113.7")
 agent_profile = A._rate_limit_profile("/api/events")
+project_sync_profile = A._rate_limit_profile("/api/projects/allow")
 normal_profile = A._rate_limit_profile("/activity")
-check("agent event endpoint kasutab eraldi mitte-bannivat rate-limit bucketit", agent_profile[0] == "agent" and agent_profile[1] > normal_profile[1] and agent_profile[2] is False and normal_profile[2] is True)
+check("agent/client endpointid kasutavad eraldi mitte-bannivat rate-limit bucketit", agent_profile[0] == "agent" and project_sync_profile[0] == "agent" and agent_profile[1] > normal_profile[1] and agent_profile[2] is False and project_sync_profile[2] is False)
+check("tavaline rate-limit throttleb, aga ei pane IP-banni", normal_profile[2] is False)
 A._AitrackHandler._login_failures.clear()
 A._AitrackHandler._banned_until.clear()
 dummy = object.__new__(A._AitrackHandler)
@@ -1150,6 +1152,22 @@ finally:
             os.environ[k] = v
 check("non-TTY/agent ei saa projekti lisada", blocked_add)
 check("päris terminalist lisamine töötab", str(add_target.resolve()) in A.load_projects())
+
+# ============ TEST 62: allowlist sync ei spämmmi serverit iga hook/tickiga ==========
+print("TEST 62: allowlist sync kasutab lühikest cache'i")
+sync_calls = []
+_orig_server_post = A._server_post
+try:
+    A._server_post = lambda endpoint, payload, cfg: sync_calls.append((endpoint, payload)) or {"ok": True}
+    A.save_projects([str(add_target)])
+    A._allowlist_sync_cache_clear()
+    server_cfg = {"sink": {"type": "server", "server_url": "https://aitrack.example", "token": "tok"}}
+    A._sync_allowed_projects(server_cfg, quiet=True)
+    A._sync_allowed_projects(server_cfg, quiet=True)
+    A._sync_allowed_projects(server_cfg, quiet=True, force=True)
+finally:
+    A._server_post = _orig_server_post
+check("muutumatu täis-allowlist saadetakse cache'i ajal ainult korra", [c[0] for c in sync_calls].count("projects/allow") == 2)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
