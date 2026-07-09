@@ -743,9 +743,9 @@ raw_event = {
 raw_res1 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_res2 = A._db_ingest_events(rdb, rtok, [raw_event])
 raw_export = A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["before_tool_call"]})
-raw_activity = A._db_activity_log(rdb, rtok, {"period": ["2026-06"]})
-raw_activity_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "project": ["parkkarl"], "user": ["raw"]})
-raw_activity_issue_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "issue": ["662 - Asendaja pühadetasu"]})
+raw_activity = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "stale_minutes": ["9999"], "stuck_minutes": ["9999"]})
+raw_activity_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "project": ["parkkarl"], "user": ["raw"], "stale_minutes": ["9999"], "stuck_minutes": ["9999"]})
+raw_activity_issue_filtered = A._db_activity_log(rdb, rtok, {"period": ["2026-06"], "issue": ["662 - Asendaja pühadetasu"], "stale_minutes": ["9999"], "stuck_minutes": ["9999"]})
 raw_filter_options = A._db_activity_filter_options(rdb, rtok, {"project": ["parkkarl"]})
 with A._db_connect(rdb) as conn:
     raw_count = conn.execute("SELECT COUNT(*) AS c FROM raw_events").fetchone()["c"]
@@ -808,6 +808,25 @@ with A._db_connect(stdb) as conn:
 check("watchdog märgib sessiooni stale", stale["marked_count"] == 1 and st_row["status"] == "stale")
 check("watchdog lisab session_stale raw eventi", stale_events == 1 and stale_again["marked_count"] == 0)
 check("stale sessioon ei ole enam aktiivses work/status vaates", A._db_work_status(stdb, stok) == [])
+A._now_utc = lambda: dt.datetime.now(dt.timezone.utc)
+
+# ============ TEST 51B: activity auto-watchdog ja status filter ==========
+print("TEST 51B: activity märgib live-aknas vanad active sessioonid stale'iks")
+adb = CFG / "server-activity-watchdog-test.db"
+adb.unlink(missing_ok=True)
+atok = A._db_add_user(adb, "activitywatch")
+A._now_utc = lambda: HFL(9)
+astart = A._db_work_start(adb, atok, {
+    "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
+    "work": {"title": "activity watchdog", "summary": "activity watchdog"},
+    "session": {"client_id": "client-activity-watch", "device_name": "testbox", "platform": "linux", "tool": "pi", "local_path": "/tmp/aitrack", "cwd": "/tmp/aitrack"},
+    "started_at": (HFL(8) + dt.timedelta(minutes=40)).isoformat(),
+})
+A._db_ingest_event_endpoint(adb, atok, {"work_session_uid": astart["work_session_uid"], "agent_uid": "agent-watch", "tool": "pi", "prompt": "watchdog prompt", "occurred_at_utc": (HFL(8) + dt.timedelta(minutes=41)).isoformat()}, "prompt_started")
+activity_stale = A._db_activity_log(adb, atok, {"date": ["2026-06-16"], "timezone": ["UTC"], "status": ["stale"]})
+activity_active = A._db_activity_log(adb, atok, {"date": ["2026-06-16"], "timezone": ["UTC"], "status": ["active"]})
+check("activity auto-watchdog muudab vana active sessiooni stale'iks", len(activity_stale.get("sessions", [])) == 1 and activity_stale["sessions"][0]["status"] == "stale" and len(activity_active.get("sessions", [])) == 0)
+check("status filter rakendub ka prompt-eventidele", len(activity_stale.get("prompt_events", [])) == 1 and len(activity_active.get("prompt_events", [])) == 0)
 A._now_utc = lambda: dt.datetime.now(dt.timezone.utc)
 
 # ============ TEST 52: event endpointid seovad prompti ja tool progressi ==========

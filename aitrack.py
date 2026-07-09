@@ -86,6 +86,8 @@ BAN_SECONDS = 30 * 60
 RAW_EVENT_PAYLOAD_MAX_BYTES = 16 * 1024
 RAW_EVENT_STRING_MAX_CHARS = 4000
 RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "authorization", "cookie"}
+DEFAULT_STALE_MINUTES = 10
+DEFAULT_STUCK_MINUTES = 10
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -2633,6 +2635,26 @@ def _activity_bounds(q: dict) -> tuple[str, str, str]:
     return _period_bounds(q)
 
 
+def _activity_window_includes_now(start_iso: str, end_iso: str) -> bool:
+    start = parse_iso(start_iso)
+    end = parse_iso(end_iso)
+    now = _now_utc()
+    return bool(start and end and start <= now < end)
+
+
+def _db_activity_auto_watchdog(path: Path, token: str, q: dict, start_iso: str, end_iso: str) -> None:
+    """Hoia activity vaates active/stale staatust värskena tänase/live perioodi jaoks."""
+    if not _activity_window_includes_now(start_iso, end_iso):
+        return
+    try:
+        stale_minutes = max(1, int(_qval(q, "stale_minutes") or DEFAULT_STALE_MINUTES))
+        stuck_minutes = max(1, int(_qval(q, "stuck_minutes") or DEFAULT_STUCK_MINUTES))
+    except ValueError:
+        stale_minutes = DEFAULT_STALE_MINUTES
+        stuck_minutes = DEFAULT_STUCK_MINUTES
+    _db_watchdog(path, token, {"stale_minutes": stale_minutes, "stuck_minutes": stuck_minutes})
+
+
 def _agent_tree_from_raw_items(raw_items: list[dict]) -> list[dict]:
     nodes: dict[str, dict] = {}
     for item in raw_items:
@@ -2672,6 +2694,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     status_filter = _qval(q, "status")
     agent_filter = _qval(q, "agent_uid") or _qval(q, "agent_id")
     event_type_filter = _qval(q, "event_type")
+    _db_activity_auto_watchdog(path, token, q, start_iso, end_iso)
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
         session_where = ["ws.started_at < ?", "COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ?"]
@@ -2720,6 +2743,8 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         if status_filter:
             session_where.append("ws.status = ?")
             session_args.append(status_filter)
+            prompt_where.append("ws.status = ?")
+            prompt_args.append(status_filter)
             raw_where.append("ws.status = ?")
             raw_args.append(status_filter)
         if agent_filter:
@@ -3826,8 +3851,8 @@ def _db_ingest_event_endpoint(path: Path, token: str, payload: dict, event_type:
 def _db_watchdog(path: Path, token: str, payload: dict) -> dict:
     """Mark active work sessions stale/stuck when heartbeat or tool progress disappears."""
     _db_init(path)
-    stale_minutes = max(1, int(payload.get("stale_minutes") or payload.get("minutes") or 10))
-    stuck_minutes = max(1, int(payload.get("stuck_minutes") or 10))
+    stale_minutes = max(1, int(payload.get("stale_minutes") or payload.get("minutes") or DEFAULT_STALE_MINUTES))
+    stuck_minutes = max(1, int(payload.get("stuck_minutes") or DEFAULT_STUCK_MINUTES))
     now_dt = _now_utc()
     now = now_dt.isoformat()
     stale_cutoff = (now_dt - dt.timedelta(minutes=stale_minutes)).isoformat()
@@ -5984,8 +6009,8 @@ def _select_local_session(args) -> dict:
 
 def cmd_watchdog(args, cfg):
     _require_server_cfg(cfg)
-    payload = {"stale_minutes": int(getattr(args, "stale_minutes", 10) or 10),
-               "stuck_minutes": int(getattr(args, "stuck_minutes", 10) or 10)}
+    payload = {"stale_minutes": int(getattr(args, "stale_minutes", DEFAULT_STALE_MINUTES) or DEFAULT_STALE_MINUTES),
+               "stuck_minutes": int(getattr(args, "stuck_minutes", DEFAULT_STUCK_MINUTES) or DEFAULT_STUCK_MINUTES)}
     body = _server_post("watchdog", payload, cfg)
     if not body or not body.get("ok"):
         raise SystemExit(f"watchdog ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
@@ -6669,8 +6694,8 @@ def main():
     tick.set_defaults(fn=cmd_tick)
 
     wd = sub.add_parser("watchdog", help="märgi heartbeatita aktiivsed serveri sessioonid stale/stuck olekusse")
-    wd.add_argument("--stale-minutes", type=int, default=10, help="mitu minutit progressita tähendab stale (vaikimisi 10)")
-    wd.add_argument("--stuck-minutes", type=int, default=10, help="mitu minutit pooleliolev tool tähendab stuck (vaikimisi 10)")
+    wd.add_argument("--stale-minutes", type=int, default=DEFAULT_STALE_MINUTES, help=f"mitu minutit progressita tähendab stale (vaikimisi {DEFAULT_STALE_MINUTES})")
+    wd.add_argument("--stuck-minutes", type=int, default=DEFAULT_STUCK_MINUTES, help=f"mitu minutit pooleliolev tool tähendab stuck (vaikimisi {DEFAULT_STUCK_MINUTES})")
     wd.set_defaults(fn=cmd_watchdog)
 
     cln = sub.add_parser("cleanup", help="retention cleanup raw_events/minute_ticks jaoks")
