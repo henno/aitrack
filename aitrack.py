@@ -80,6 +80,9 @@ WEB_SESSION_COOKIE = "aitrack_session"
 WEB_SESSION_DAYS = 30
 RATE_WINDOW_SECONDS = 60
 RATE_MAX_REQUESTS = 180
+# Agent/hook tracking may legitimately send many events/tool heartbeats in bursts.
+# Keep these out of the normal browser/IP ban bucket and throttle without banning.
+RATE_MAX_AGENT_REQUESTS = 3000
 LOGIN_FAIL_WINDOW_SECONDS = 10 * 60
 LOGIN_FAIL_MAX = 5
 BAN_SECONDS = 30 * 60
@@ -1546,6 +1549,20 @@ def _db_record_security_event(path: Path, user_id: int | None, event_type: str,
                                            success=success, detail=detail)
     except Exception:  # noqa: BLE001 - audit ei tohi põhivoogu murda
         pass
+
+
+def _rate_limit_profile(path: str) -> tuple[str, int, bool]:
+    """Return (bucket, max_requests_per_window, ban_on_limit).
+
+    High-volume agent endpoints are throttled in a separate bucket and never create
+    a broad IP ban, so Pi/Claude hook bursts do not lock users out of the UI.
+    """
+    p = str(path or "")
+    if p == "/api/events" or p.startswith("/api/prompt/") or p.startswith("/api/agent/") or p in {
+        "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard", "/api/watchdog",
+    }:
+        return "agent", RATE_MAX_AGENT_REQUESTS, False
+    return "default", RATE_MAX_REQUESTS, True
 
 
 
@@ -5604,15 +5621,25 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     _db_record_security_event(self._db_path(), None, "suspicious_path", ip=ip, req_path=path, detail="auto ban")
                 self._reject(403, "kahtlane päring")
                 return False
-            hits = [t for t in self.__class__._rate_hits.get(ip, []) if now - t < RATE_WINDOW_SECONDS]
+            bucket, max_requests, ban_on_limit = _rate_limit_profile(path)
+            hit_key = f"{ip}|{bucket}"
+            hits = [t for t in self.__class__._rate_hits.get(hit_key, []) if now - t < RATE_WINDOW_SECONDS]
             hits.append(now)
-            self.__class__._rate_hits[ip] = hits
-            if len(hits) > RATE_MAX_REQUESTS:
-                self.__class__._banned_until[ip] = now + BAN_SECONDS
-                log(f"security: rate limit ban {ip} hits={len(hits)}")
-                if self._server_mode():
-                    _db_record_security_event(self._db_path(), None, "rate_limit_ban", ip=ip, req_path=path, detail=f"hits={len(hits)}")
-                self._reject(429, "liiga palju päringuid", retry_after=BAN_SECONDS)
+            self.__class__._rate_hits[hit_key] = hits
+            if len(hits) > max_requests:
+                if ban_on_limit:
+                    self.__class__._banned_until[ip] = now + BAN_SECONDS
+                    log(f"security: rate limit ban {ip} bucket={bucket} hits={len(hits)}")
+                    if self._server_mode():
+                        _db_record_security_event(self._db_path(), None, "rate_limit_ban", ip=ip, req_path=path,
+                                                  detail=f"bucket={bucket} hits={len(hits)}")
+                    self._reject(429, "liiga palju päringuid", retry_after=BAN_SECONDS)
+                else:
+                    log(f"security: rate limit throttle {ip} bucket={bucket} hits={len(hits)} path={path}")
+                    if self._server_mode():
+                        _db_record_security_event(self._db_path(), None, "rate_limit_throttle", ip=ip, req_path=path,
+                                                  detail=f"bucket={bucket} hits={len(hits)}")
+                    self._reject(429, "liiga palju agent API päringuid", retry_after=RATE_WINDOW_SECONDS)
                 return False
         return True
 
