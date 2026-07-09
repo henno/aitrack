@@ -308,6 +308,9 @@ curl -H "X-Aitrack-Token: TOKEN" \
   `work start`/evente saata projektist, mida pole lisatud, server ei salvesta neid. Kui lisasid projekti enne serveriga
   ühendamist, tee pärast `aitrack connect` uuesti `aitrack add /tee/projektini` või käivita mõni tavaline aitrack käsk,
   mis allowlisti sünkroniseerib.
+- **Kliendi sunduuendus.** Klient saadab iga serveripäringuga `CLIENT_VERSION` täisarvu. Serveri `.env` väärtus
+  `MIN_CLIENT_VERSION` määrab miinimumi. Kui klient on vanem, vastab server `upgrade_required` ja klient uuendab end
+  ise ametlikust `aitrack` Git repost ning käivitab sama käsu ühe korra uuesti. Server ei saada shell-käske.
 - **Kaks faili.** Sisemine tunnipõhine algandmestik `~/.config/aitrack/hours.csv`
   (veerud `Kuupäev | Tund | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised | Tööriist | _key`)
   on **allikas** — dedup ja päevavaate renderdamine. Kasutaja kleebitav **päevavaade**

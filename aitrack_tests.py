@@ -635,9 +635,21 @@ except PermissionError:
 allow_server_project(allowdb, allowtok, "/tmp/allowed-root", "local:allowed-root", "allowed-root")
 allowed_start = A._db_work_start(allowdb, allowtok, {"project": {"project_key": "github.com/example/child", "name": "child", "local_path": "/tmp/allowed-root/child"}, "work": {"title": "allowed"}, "session": {"client_id": "c", "tool": "pi", "local_path": "/tmp/allowed-root/child", "cwd": "/tmp/allowed-root/child"}})
 rejected_events = A._db_ingest_events(allowdb, allowtok, [{"event_key": "blocked-event", "tool": "Pi", "project": "/tmp/blocked", "prompt_text": "ei tohi", "started_at": HFL(10).isoformat(), "ended_at": HFL(10).isoformat(), "duration_seconds": 60}])
+old_min_client = os.environ.get("MIN_CLIENT_VERSION")
+os.environ["MIN_CLIENT_VERSION"] = "3"
+old_client = A._db_check_client_version(allowdb, allowtok, {"client_version": 2, "client": {"client_id": "client-old", "name": "oldbox", "platform": "linux"}})
+ok_client = A._db_check_client_version(allowdb, allowtok, {"client_version": 3, "client": {"client_id": "client-new", "name": "newbox", "platform": "linux"}})
+if old_min_client is None:
+    os.environ.pop("MIN_CLIENT_VERSION", None)
+else:
+    os.environ["MIN_CLIENT_VERSION"] = old_min_client
+with A._db_connect(allowdb) as conn:
+    old_device = conn.execute("SELECT client_version FROM devices WHERE client_id = 'client-old'").fetchone()
 check("server blokeerib work/start projekti, mida pole allowlisti lisatud", blocked is True)
 check("server lubab allowlisti juure all oleva projekti", str(allowed_start.get("work_session_uid", "")).startswith("ws_"))
 check("server ei salvesta evente mitte-allowlist projektist", rejected_events["raw_events"]["rejected"] == 1 and rejected_events["prompt_events"]["rejected"] == 1)
+check("server nõuab vana kliendi korral uuendust", old_client.get("upgrade_required") is True and old_client.get("min_client_version") == 3 and ok_client.get("ok") is True)
+check("server salvestab kliendi versiooni seadme külge", old_device is not None and old_device["client_version"] == 2)
 
 # ============ TEST 43: 3NF work_session + invoice/practice vaated ============
 print("TEST 43: serveri normaliseeritud work_session'id toidavad arve- ja praktikavaadet")

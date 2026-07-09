@@ -9,6 +9,7 @@ services:
     environment:
       AITRACK_CONFIG_DIR: /data
       PYTHONUNBUFFERED: "1"
+      MIN_CLIENT_VERSION: ${MIN_CLIENT_VERSION:-0}
     volumes:
       - aitrack-data:/data
 

@@ -93,6 +93,7 @@ RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", 
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
+CLIENT_VERSION = 2
 AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
@@ -611,6 +612,90 @@ def _client_info() -> dict:
     data.setdefault("name", socket.gethostname() or platform.node() or "unknown")
     data.setdefault("platform", _platform())
     return data
+
+
+def _client_request_meta(flat: bool = False) -> dict:
+    client = {k: v for k, v in _client_info().items() if k in {"client_id", "name", "platform"}}
+    client["client_version"] = CLIENT_VERSION
+    if flat:
+        return {
+            "client_version": str(CLIENT_VERSION),
+            "client_id": str(client.get("client_id", "")),
+            "device_name": str(client.get("name", "")),
+            "platform": str(client.get("platform", "")),
+        }
+    return {"client_version": CLIENT_VERSION, "client": client}
+
+
+def _run_git(root: Path, args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60)
+
+
+def _self_update_from_official_repo() -> bool:
+    """Uuenda klient ametlikust Git repost. Server ei anna käsku; klient teab seda rada ise."""
+    try:
+        start = THIS.parent
+        root_raw = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+                                  capture_output=True, text=True, timeout=10)
+        if root_raw.returncode != 0:
+            log("update: aitrack ei asu git repos; automaatuuendus jäi tegemata")
+            return False
+        root = Path(root_raw.stdout.strip()).resolve()
+        remote = _run_git(root, ["config", "--get", "remote.origin.url"])
+        if remote.returncode != 0 or _normalise_repo_url(remote.stdout.strip()) != _normalise_repo_url(AITRACK_REPO_URL):
+            log("update: remote ei ole ametlik aitrack repo; automaatuuendus jäi tegemata")
+            return False
+        branch = _run_git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        if branch.returncode != 0 or branch.stdout.strip() != "main":
+            log("update: automaatuuendus töötab ainult main harus")
+            return False
+        dirty = _run_git(root, ["status", "--porcelain"])
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            log("update: tööpuu pole puhas; automaatuuendus jäi tegemata")
+            return False
+        fetch = _run_git(root, ["fetch", "--prune", "origin", "main"])
+        if fetch.returncode != 0:
+            log(f"update: git fetch ebaõnnestus: {(fetch.stderr or fetch.stdout).strip()[:300]}")
+            return False
+        reset = _run_git(root, ["reset", "--hard", "origin/main"])
+        if reset.returncode != 0:
+            log(f"update: git reset ebaõnnestus: {(reset.stderr or reset.stdout).strip()[:300]}")
+            return False
+        try:
+            os.chmod(root / "aitrack.py", 0o755)
+            bin_dir = HOME / ".local" / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            link = bin_dir / "aitrack"
+            if not link.exists() or link.is_symlink():
+                link.unlink(missing_ok=True)
+                link.symlink_to(root / "aitrack.py")
+        except OSError:
+            pass
+        ext = subprocess.run(
+            [sys.executable, "-c", "import aitrack; print(aitrack._install_pi_extension())"],
+            cwd=str(root), capture_output=True, text=True, timeout=30,
+        )
+        if ext.returncode != 0:
+            log(f"update: Pi extensioni paigaldus jäi vahele: {(ext.stderr or ext.stdout).strip()[:300]}")
+        log("update: aitrack uuendatud ametlikust repost")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"update: automaatuuendus ebaõnnestus: {e}")
+        return False
+
+
+def _maybe_reexec_after_upgrade(body: dict | None) -> None:
+    if not isinstance(body, dict) or not body.get("upgrade_required"):
+        return
+    if os.environ.get("AITRACK_UPGRADE_REEXEC") == "1" or os.environ.get("AITRACK_DISABLE_AUTO_UPGRADE") == "1":
+        return
+    minv = body.get("min_client_version", "?")
+    log(f"update: server nõuab kliendiversiooni vähemalt {minv}; uuendan ennast")
+    if not _self_update_from_official_repo():
+        return
+    env = os.environ.copy()
+    env["AITRACK_UPGRADE_REEXEC"] = "1"
+    os.execvpe(sys.executable, [sys.executable, str(THIS), *sys.argv[1:]], env)
 
 
 def _detect_cli(explicit: str | None = None) -> str:
@@ -1722,6 +1807,7 @@ def _db_init(path: Path) -> None:
           client_id TEXT NOT NULL,
           name TEXT NOT NULL,
           platform TEXT NOT NULL,
+          client_version INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           last_seen_at TEXT NOT NULL,
           UNIQUE(user_id, client_id)
@@ -1921,6 +2007,7 @@ def _db_init(path: Path) -> None:
         # Vanade server.db failide kerge migratsioon.
         _db_add_column_if_missing(conn, "users", "password_hash", "TEXT")
         _db_add_column_if_missing(conn, "users", "password_updated_at", "TEXT")
+        _db_add_column_if_missing(conn, "devices", "client_version", "INTEGER NOT NULL DEFAULT 0")
         # prompt_events jäi alles, aga saab nüüd viidata normaliseeritud projekti/töö/sessiooni ridadele.
         _db_add_column_if_missing(conn, "work_sessions", "session_uid", "TEXT")
         conn.execute("UPDATE work_sessions SET session_uid = 'ws_legacy_' || id WHERE session_uid IS NULL OR session_uid = ''")
@@ -2309,16 +2396,82 @@ def _new_work_session_uid() -> str:
     return "ws_" + secrets.token_urlsafe(18).rstrip("=")
 
 
-def _db_upsert_device(conn: sqlite3.Connection, user_id: int, client_id: str, name: str, plat: str, now: str) -> int:
+def _payload_value(payload: dict, key: str, default=""):
+    if not isinstance(payload, dict):
+        return default
+    value = payload.get(key, default)
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value
+
+
+def _payload_client_version(payload: dict) -> int:
+    client = _payload_value(payload, "client", {})
+    raw = _payload_value(payload, "client_version", None)
+    if raw is None and isinstance(client, dict):
+        raw = client.get("client_version")
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _payload_client_info(payload: dict) -> dict:
+    client = _payload_value(payload, "client", {})
+    client = client if isinstance(client, dict) else {}
+    session = _payload_value(payload, "session", {})
+    session = session if isinstance(session, dict) else {}
+    return {
+        "client_id": str(client.get("client_id") or _payload_value(payload, "client_id", "") or session.get("client_id") or ""),
+        "name": str(client.get("name") or _payload_value(payload, "device_name", "") or session.get("device_name") or session.get("name") or "unknown"),
+        "platform": str(client.get("platform") or _payload_value(payload, "platform", "") or session.get("platform") or "unknown"),
+    }
+
+
+def _min_client_version() -> int:
+    try:
+        return max(0, int(os.environ.get("MIN_CLIENT_VERSION", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _db_record_client_seen_conn(conn: sqlite3.Connection, user: sqlite3.Row, payload: dict, now: str) -> None:
+    info = _payload_client_info(payload)
+    if not info.get("client_id"):
+        return
+    _db_upsert_device(conn, int(user["id"]), info["client_id"], info["name"], info["platform"], now,
+                      _payload_client_version(payload))
+
+
+def _db_check_client_version(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    min_version = _min_client_version()
+    version = _payload_client_version(payload)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        _db_record_client_seen_conn(conn, user, payload, now)
+    if min_version > 0 and version < min_version:
+        return {"ok": False, "upgrade_required": True, "client_version": version,
+                "min_client_version": min_version, "error": "aitrack klient vajab uuendust"}
+    return {"ok": True, "client_version": version, "min_client_version": min_version}
+
+
+def _db_upsert_device(conn: sqlite3.Connection, user_id: int, client_id: str, name: str, plat: str, now: str,
+                      client_version: int = 0) -> int:
     client_id = client_id or "unknown"
+    try:
+        version = max(0, int(client_version or 0))
+    except (TypeError, ValueError):
+        version = 0
     conn.execute(
-        "INSERT OR IGNORE INTO devices(user_id, client_id, name, platform, created_at, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, client_id, name or "unknown", plat or "unknown", now, now),
+        "INSERT OR IGNORE INTO devices(user_id, client_id, name, platform, client_version, created_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, client_id, name or "unknown", plat or "unknown", version, now, now),
     )
     conn.execute(
-        "UPDATE devices SET name = ?, platform = ?, last_seen_at = ? WHERE user_id = ? AND client_id = ?",
-        (name or "unknown", plat or "unknown", now, user_id, client_id),
+        "UPDATE devices SET name = ?, platform = ?, client_version = ?, last_seen_at = ? WHERE user_id = ? AND client_id = ?",
+        (name or "unknown", plat or "unknown", version, now, user_id, client_id),
     )
     return _db_one_id(conn, "SELECT id FROM devices WHERE user_id = ? AND client_id = ?", (user_id, client_id))
 
@@ -2545,11 +2698,13 @@ def _db_work_graph(conn: sqlite3.Connection, user: sqlite3.Row, payload: dict, n
     session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
     work = payload.get("work") if isinstance(payload.get("work"), dict) else {}
 
-    client_id = str(session.get("client_id") or payload.get("client_id") or "unknown")
+    client_meta = payload.get("client") if isinstance(payload.get("client"), dict) else {}
+    client_id = str(session.get("client_id") or payload.get("client_id") or client_meta.get("client_id") or "unknown")
     device_id = _db_upsert_device(
         conn, int(user["id"]), client_id,
-        str(session.get("device_name") or session.get("name") or "unknown"),
-        str(session.get("platform") or "unknown"), now,
+        str(session.get("device_name") or session.get("name") or client_meta.get("name") or "unknown"),
+        str(session.get("platform") or client_meta.get("platform") or "unknown"), now,
+        _payload_client_version(payload),
     )
     project_id = _db_upsert_project(conn, project, now)
     default_provider = str(issue.get("provider") or _issue_provider_for_project_key(str(project.get("project_key") or project.get("key") or "")))
@@ -4731,16 +4886,19 @@ def _decode_http_error(e: urllib.error.HTTPError) -> dict | None:
 
 def _server_get(op: str, params: dict, cfg: dict) -> dict | None:
     sink = cfg.get("sink", {})
-    params = {"token": sink.get("token", ""), **params}
+    params = {"token": sink.get("token", ""), **_client_request_meta(flat=True), **params}
     qs = urllib.parse.urlencode(params)
     url = _server_url(cfg, op) + (f"?{qs}" if qs else "")
     try:
         req = urllib.request.Request(url, headers=_server_headers(), method="GET")
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+            _maybe_reexec_after_upgrade(body)
+            return body
     except urllib.error.HTTPError as e:
         body = _decode_http_error(e)
         log(f"server sink: GET /api/{op} ebaõnnestus: HTTP {e.code} {body.get('error') if body else e.reason}")
+        _maybe_reexec_after_upgrade(body)
         return body
     except Exception as e:  # noqa: BLE001
         log(f"server sink: GET /api/{op} ebaõnnestus: {e}")
@@ -4749,16 +4907,19 @@ def _server_get(op: str, params: dict, cfg: dict) -> dict | None:
 
 def _server_post(op: str, payload: dict, cfg: dict) -> dict | None:
     sink = cfg.get("sink", {})
-    payload = {"token": sink.get("token", ""), **payload}
+    payload = {"token": sink.get("token", ""), **_client_request_meta(), **payload}
     data = json.dumps(payload).encode("utf-8")
     try:
         req = urllib.request.Request(_server_url(cfg, op), data=data,
                                      headers=_server_headers({"Content-Type": "application/json"}), method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+            _maybe_reexec_after_upgrade(body)
+            return body
     except urllib.error.HTTPError as e:
         body = _decode_http_error(e)
         log(f"server sink: POST /api/{op} ebaõnnestus: HTTP {e.code} {body.get('error') if body else e.reason}")
+        _maybe_reexec_after_upgrade(body)
         return body
     except Exception as e:  # noqa: BLE001
         log(f"server sink: POST /api/{op} ebaõnnestus: {e}")
@@ -5796,6 +5957,16 @@ def _html_table_for_day(date: str, full: bool = False) -> tuple[str, str]:
 
 
 
+def _client_version_endpoint(path: str) -> bool:
+    return path in {
+        "/api/keys", "/api/ingest", "/api/events", "/api/projects/allow", "/api/projects/unallow",
+        "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard",
+        "/api/work/status", "/api/watchdog", "/api/cleanup",
+        "/api/prompt/start", "/api/prompt/done", "/api/agent/heartbeat", "/api/agent/tool-start",
+        "/api/agent/tool-end", "/api/agent/start", "/api/agent/done",
+    }
+
+
 class _AitrackHandler(BaseHTTPRequestHandler):
     cfg: dict = {}
     _rate_lock = threading.Lock()
@@ -5980,6 +6151,31 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         user = self._cookie_user()
         return str(user["token"]) if user is not None else ""
 
+    def _has_api_token(self, q: dict | None = None, data: dict | None = None) -> bool:
+        return bool((data and data.get("token")) or (q and q.get("token")) or self.headers.get("X-Aitrack-Token", ""))
+
+    def _reject_if_client_upgrade_required(self, path: str, payload: dict) -> bool:
+        if not self._server_mode() or not _client_version_endpoint(path):
+            return False
+        if not self._has_api_token(data=payload):
+            return False
+        result = _db_check_client_version(self._db_path(), self._token(data=payload), payload)
+        if result.get("upgrade_required"):
+            self._json(result, 426)
+            return True
+        return False
+
+    def _reject_if_client_upgrade_required_get(self, path: str, q: dict) -> bool:
+        if not self._server_mode() or not _client_version_endpoint(path):
+            return False
+        if not self._has_api_token(q=q):
+            return False
+        result = _db_check_client_version(self._db_path(), self._token(q), q)
+        if result.get("upgrade_required"):
+            self._json(result, 426)
+            return True
+        return False
+
     def _server_mode(self) -> bool:
         return bool(self.cfg.get("_server_mode"))
 
@@ -6008,6 +6204,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         try:
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
+            if self._reject_if_client_upgrade_required_get(u.path, q):
+                return
             if u.path in ("/", "/index.html"):
                 if self._server_mode() and self._cookie_user() is None:
                     self._redirect("/login?next=/")
@@ -6154,6 +6352,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         try:
             u = urllib.parse.urlparse(self.path)
             data = self._read_json()
+            if self._reject_if_client_upgrade_required(u.path, data):
+                return
             if u.path == "/api/login" and self._server_mode():
                 login_name = str(data.get("name") or "")
                 try:
