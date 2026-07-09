@@ -458,6 +458,9 @@ button { border:1px solid var(--line); background:transparent; color:var(--text)
 button.primary { background:var(--accent); color:white; border-color:var(--accent); }
 button:hover { filter:brightness(1.08); }
 button.icon { padding:4px 8px; border-radius:8px; color:var(--muted); }
+.filter-group { display:flex; gap:6px; align-items:center; }
+.filter-toggle { padding:7px 10px; border-radius:999px; color:var(--muted); }
+.filter-toggle.active { background:var(--accent); border-color:var(--accent); color:white; }
 input, select { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
 .small { color:var(--muted); font-size:13px; }
 .status { color:var(--muted); min-height:20px; }
@@ -498,10 +501,9 @@ body.modal-open { overflow:hidden; }
     <label>Kasutaja <input id="userInput" list="userOptions" placeholder="kasutajanimi" style="width:130px" autocomplete="off"><datalist id="userOptions"></datalist></label>
     <label>Issue <input id="issueInput" list="issueOptions" placeholder="issue nr / pealkiri" style="width:220px" autocomplete="off"><datalist id="issueOptions"></datalist></label>
     <label>Tool <input id="toolInput" placeholder="pi" style="width:90px"></label>
-    <label>Status <input id="statusInput" placeholder="active/stale" style="width:110px"></label>
+    <div class="filter-group"><span>Status</span><input type="hidden" id="statusInput" value=""><button type="button" class="filter-toggle active" data-status-filter="" onclick="setSessionStatusFilter('')">Kõik</button><button type="button" class="filter-toggle" data-status-filter="active" onclick="setSessionStatusFilter('active')">Active</button><button type="button" class="filter-toggle" data-status-filter="stale" onclick="setSessionStatusFilter('stale')">Stale</button></div>
     <label>Agent <input id="agentInput" placeholder="agent_uid" style="width:130px"></label>
     <label>Piir <input type="number" id="limitInput" value="200" min="1" max="1000" style="width:90px"></label>
-    <button onclick="loadActivity()">Ava</button>
     <span class="status" id="status"></span>
   </section>
   <section class="panel grid" id="metrics"></section>
@@ -581,6 +583,20 @@ let issueOptionsTimer = null;
 function scheduleIssueOptions() {
   clearTimeout(issueOptionsTimer);
   issueOptionsTimer = setTimeout(loadIssueOptions, 200);
+}
+let activityLoadTimer = null;
+function scheduleActivityLoad(delay=250) {
+  clearTimeout(activityLoadTimer);
+  activityLoadTimer = setTimeout(loadActivity, delay);
+}
+function updateStatusFilterButtons() {
+  const selected = $('statusInput').value || '';
+  document.querySelectorAll('[data-status-filter]').forEach(btn => btn.classList.toggle('active', (btn.dataset.statusFilter || '') === selected));
+}
+function setSessionStatusFilter(value) {
+  $('statusInput').value = value || '';
+  updateStatusFilterButtons();
+  scheduleActivityLoad(0);
 }
 function detailButton(x) {
   const type = x.type || 'work_session';
@@ -689,6 +705,7 @@ function renderWaiting(message) {
   $('rawEventsBody').innerHTML = `<tr><td class="empty" colspan="7">${esc(message)}</td></tr>`;
 }
 async function loadActivity() {
+  clearTimeout(activityLoadTimer);
   const params = new URLSearchParams();
   params.set('date', $('dateInput').value || '');
   params.set('limit', $('limitInput').value || '200');
@@ -714,8 +731,14 @@ async function logout() {
 }
 async function init() {
   $('dateInput').value = new Date().toISOString().slice(0, 10);
-  $('projectInput').addEventListener('input', scheduleIssueOptions);
-  $('projectInput').addEventListener('change', loadIssueOptions);
+  $('dateInput').addEventListener('change', () => scheduleActivityLoad(0));
+  $('projectInput').addEventListener('input', () => { scheduleIssueOptions(); scheduleActivityLoad(); });
+  $('projectInput').addEventListener('change', () => { loadIssueOptions(); scheduleActivityLoad(0); });
+  for (const id of ['userInput', 'issueInput', 'toolInput', 'agentInput', 'limitInput']) {
+    $(id).addEventListener('input', () => scheduleActivityLoad());
+    $(id).addEventListener('change', () => scheduleActivityLoad(0));
+  }
+  updateStatusFilterButtons();
   const me = await api('/api/me');
   $('userInfo').textContent = me.user ? `(${me.user.name}, ${me.user.role})` : '';
   await loadFilterOptions();
