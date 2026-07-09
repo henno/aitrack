@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -302,6 +303,25 @@ def save_projects(paths: list[str]) -> None:
     _atomic_write_json(PROJECTS_FILE, {"allow": sorted(set(paths))})
 
 
+def _path_parts_text(value: str | Path) -> tuple[str, ...]:
+    """Tee-komponentide võrdlus ilma serveri failisüsteemi järgi resolve'imata.
+
+    Seda kasutatakse serveris kliendi saadetud absolutsete teede võrdlemiseks; serveri
+    enda `/home` ei pruugi kliendi omaga kattuda.
+    """
+    s = str(value or "").strip().replace("\\", "/")
+    s = re.sub(r"/+", "/", s).rstrip("/")
+    if not s:
+        return ()
+    return tuple(part.lower() for part in s.split("/") if part)
+
+
+def _path_is_same_or_under_text(candidate: str | Path, root: str | Path) -> bool:
+    cparts = _path_parts_text(candidate)
+    rparts = _path_parts_text(root)
+    return bool(cparts and rparts and cparts[:len(rparts)] == rparts)
+
+
 def _resolve_path_loose(value: str | Path) -> Path:
     try:
         return Path(value).expanduser().resolve()
@@ -495,6 +515,82 @@ def _project_context(path: str | Path = ".", issue: str | None = None) -> dict:
     }
 
 
+def _allowed_project_payload(path: str | Path) -> dict:
+    root = str(_resolve_path_loose(path))
+    ctx = _project_context(root)
+    return {
+        "root_path": root,
+        "project_key": ctx.get("project_key", ""),
+        "repo_url": ctx.get("repo_url", ""),
+        "name": ctx.get("name", ""),
+        "local_path": ctx.get("local_path", root),
+        "checkout_id": ctx.get("checkout_id", ""),
+        "branch": ctx.get("branch", ""),
+    }
+
+
+def _local_allowed_project_keys(allow: list[str] | None = None) -> set[str]:
+    keys: set[str] = set()
+    for p in allow if allow is not None else load_projects():
+        try:
+            key = str(_allowed_project_payload(p).get("project_key") or "")
+        except Exception:  # noqa: BLE001 - katkine git/tee ei tohi trackingut maha võtta
+            key = ""
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _local_project_tracked(ctx: dict, allow: list[str] | None = None) -> bool:
+    allow = allow if allow is not None else load_projects()
+    if not allow:
+        return False
+    for candidate in (ctx.get("cwd"), ctx.get("local_path")):
+        if candidate and match_project(str(candidate), allow):
+            return True
+    project_key = str(ctx.get("project_key") or "")
+    return bool(project_key and project_key in _local_allowed_project_keys(allow))
+
+
+def _local_session_tracked(session: dict, allow: list[str] | None = None) -> bool:
+    allow = allow if allow is not None else load_projects()
+    if not allow:
+        return False
+    for candidate in (session.get("cwd"), session.get("local_path")):
+        if candidate and match_project(str(candidate), allow):
+            return True
+    project_key = str(session.get("project_key") or "")
+    return bool(project_key and project_key in _local_allowed_project_keys(allow))
+
+
+def _sync_allowed_projects(cfg: dict, paths: list[str] | None = None, *, quiet: bool = False) -> bool:
+    """Saada lokaalne `aitrack add` allowlist serverile.
+
+    Serveri allowlist on kaitse vana/stale kliendi ja käsitsi `work start` vastu; klient
+    sünkroniseerib seda enne töö saatmist ning `add/connect` järel.
+    """
+    if cfg.get("sink", {}).get("type") != "server":
+        return True
+    paths = paths if paths is not None else load_projects()
+    projects = [_allowed_project_payload(p) for p in paths]
+    body = _server_post("projects/allow", {"projects": projects}, cfg)
+    ok = bool(body and body.get("ok"))
+    if not ok and not quiet:
+        log("allowlist: serveriga sünkroniseerimine ebaõnnestus")
+    return ok
+
+
+def _sync_removed_project(cfg: dict, path: str | Path) -> bool:
+    if cfg.get("sink", {}).get("type") != "server":
+        return True
+    payload = _allowed_project_payload(path)
+    body = _server_post("projects/unallow", payload, cfg)
+    ok = bool(body and body.get("ok"))
+    if not ok:
+        log("allowlist: serverist eemaldamine ebaõnnestus")
+    return ok
+
+
 def _client_info() -> dict:
     """Püsiv, mitte-salajane client_id selle seadme eristamiseks serveris."""
     _mkconfdir()
@@ -588,6 +684,8 @@ def _local_upsert_work_session_row(conn: sqlite3.Connection, session: dict) -> N
         "project_key": str(session.get("project_key") or ""),
         "issue_key": str(session.get("issue_key") or ""),
         "checkout_id": str(session.get("checkout_id") or ""),
+        "local_path": str(session.get("local_path") or ""),
+        "cwd": str(session.get("cwd") or ""),
         "tool": str(session.get("tool") or "manual"),
         "client_id": str(session.get("client_id") or ""),
         "summary": str(session.get("summary") or ""),
@@ -605,11 +703,11 @@ def _local_upsert_work_session_row(conn: sqlite3.Connection, session: dict) -> N
     if existing is None:
         conn.execute(
             "INSERT INTO local_work_sessions "
-            "(work_session_uid, work_session_id, work_item_id, project_key, issue_key, checkout_id, tool, "
+            "(work_session_uid, work_session_id, work_item_id, project_key, issue_key, checkout_id, local_path, cwd, tool, "
             "client_id, summary, status, owner_pid, owner_start, owner_command, owner_cli, started_at, "
             "last_tick_at, ended_at, minutes, state_key, created_at, updated_at) "
             "VALUES (:work_session_uid, :work_session_id, :work_item_id, :project_key, :issue_key, :checkout_id, "
-            ":tool, :client_id, :summary, :status, :owner_pid, :owner_start, :owner_command, :owner_cli, "
+            ":local_path, :cwd, :tool, :client_id, :summary, :status, :owner_pid, :owner_start, :owner_command, :owner_cli, "
             ":started_at, :last_tick_at, :ended_at, :minutes, :state_key, :created_at, :updated_at)",
             {**values, "created_at": now, "updated_at": now},
         )
@@ -617,7 +715,8 @@ def _local_upsert_work_session_row(conn: sqlite3.Connection, session: dict) -> N
         conn.execute(
             "UPDATE local_work_sessions SET work_session_uid = COALESCE(:work_session_uid, work_session_uid), "
             "work_session_id = COALESCE(:work_session_id, work_session_id), work_item_id = :work_item_id, "
-            "project_key = :project_key, issue_key = :issue_key, checkout_id = :checkout_id, tool = :tool, "
+            "project_key = :project_key, issue_key = :issue_key, checkout_id = :checkout_id, "
+            "local_path = :local_path, cwd = :cwd, tool = :tool, "
             "client_id = :client_id, summary = :summary, status = :status, owner_pid = :owner_pid, "
             "owner_start = :owner_start, owner_command = :owner_command, owner_cli = :owner_cli, "
             "started_at = :started_at, last_tick_at = :last_tick_at, ended_at = :ended_at, minutes = :minutes, "
@@ -661,6 +760,8 @@ def _local_db_init() -> None:
           project_key TEXT NOT NULL DEFAULT '',
           issue_key TEXT NOT NULL DEFAULT '',
           checkout_id TEXT NOT NULL DEFAULT '',
+          local_path TEXT NOT NULL DEFAULT '',
+          cwd TEXT NOT NULL DEFAULT '',
           tool TEXT NOT NULL DEFAULT 'manual',
           client_id TEXT NOT NULL DEFAULT '',
           summary TEXT NOT NULL DEFAULT '',
@@ -695,6 +796,8 @@ def _local_db_init() -> None:
         );
         CREATE INDEX IF NOT EXISTS local_event_outbox_pending_idx ON local_event_outbox(ack_at, occurred_at);
         """)
+        _db_add_column_if_missing(conn, "local_work_sessions", "local_path", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "local_work_sessions", "cwd", "TEXT NOT NULL DEFAULT ''")
         _local_import_legacy_work_state(conn)
 
 
@@ -1657,6 +1760,17 @@ def _db_init(path: Path) -> None:
           last_seen_at TEXT NOT NULL,
           UNIQUE(user_id, device_id, checkout_id)
         );
+        CREATE TABLE IF NOT EXISTS user_project_allowlist (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          project_key TEXT NOT NULL DEFAULT '',
+          root_path TEXT NOT NULL DEFAULT '',
+          name TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, project_key, root_path)
+        );
+        CREATE INDEX IF NOT EXISTS user_project_allowlist_user_idx ON user_project_allowlist(user_id);
         CREATE TABLE IF NOT EXISTS issues (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -2232,6 +2346,114 @@ def _db_upsert_project(conn: sqlite3.Connection, project: dict, now: str) -> int
     return project_id
 
 
+def _project_key_from_payload(project: dict) -> str:
+    repo_url = str(project.get("repo_url") or "")
+    return str(project.get("project_key") or project.get("key") or _normalise_repo_url(repo_url) or "")
+
+
+def _db_allow_projects(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    now = _now_utc().isoformat()
+    items = payload.get("projects") if isinstance(payload.get("projects"), list) else [payload]
+    added = 0
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            root_path = str(item.get("root_path") or item.get("local_path") or item.get("cwd") or "").strip()
+            project_key = _project_key_from_payload(item)
+            if not root_path and not project_key:
+                continue
+            name = str(item.get("name") or project_key.rstrip("/").split("/")[-1] or Path(root_path).name or "project")
+            conn.execute(
+                "INSERT OR IGNORE INTO user_project_allowlist(user_id, project_key, root_path, name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (int(user["id"]), project_key, root_path, name, now, now),
+            )
+            conn.execute(
+                "UPDATE user_project_allowlist SET name = ?, updated_at = ? "
+                "WHERE user_id = ? AND project_key = ? AND root_path = ?",
+                (name, now, int(user["id"]), project_key, root_path),
+            )
+            added += 1
+    return {"ok": True, "allowed": added}
+
+
+def _db_unallow_project(path: Path, token: str, payload: dict) -> dict:
+    _db_init(path)
+    root_path = str(payload.get("root_path") or payload.get("local_path") or payload.get("cwd") or "").strip()
+    project_key = _project_key_from_payload(payload)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        if root_path and project_key:
+            cur = conn.execute(
+                "DELETE FROM user_project_allowlist WHERE user_id = ? AND project_key = ? AND root_path = ?",
+                (int(user["id"]), project_key, root_path),
+            )
+        elif root_path:
+            cur = conn.execute("DELETE FROM user_project_allowlist WHERE user_id = ? AND root_path = ?", (int(user["id"]), root_path))
+        elif project_key:
+            cur = conn.execute("DELETE FROM user_project_allowlist WHERE user_id = ? AND project_key = ?", (int(user["id"]), project_key))
+        else:
+            cur = None
+    return {"ok": True, "removed": int(cur.rowcount if cur is not None else 0)}
+
+
+def _payload_project_identity(payload: dict) -> tuple[str, list[str]]:
+    project_obj = payload.get("project")
+    project = project_obj if isinstance(project_obj, dict) else {}
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    project_key = _project_key_from_payload(project) if project else ""
+    paths: list[str] = []
+    if isinstance(project_obj, str):
+        paths.append(project_obj)
+    for source in (project, session, payload, inner):
+        for key in ("root_path", "local_path", "cwd", "path"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if value:
+                paths.append(str(value))
+    return project_key, [p for i, p in enumerate(paths) if p and p not in paths[:i]]
+
+
+def _db_work_session_project_identity(conn: sqlite3.Connection, user_id: int, work_session_id: int) -> tuple[str, list[str]]:
+    row = conn.execute(
+        "SELECT p.project_key, ws.local_path, ws.cwd FROM work_sessions ws "
+        "JOIN work_items wi ON wi.id = ws.work_item_id "
+        "JOIN projects p ON p.id = wi.project_id WHERE ws.id = ? AND ws.user_id = ?",
+        (int(work_session_id), int(user_id)),
+    ).fetchone()
+    if row is None:
+        return "", []
+    return str(row["project_key"] or ""), [str(row["local_path"] or ""), str(row["cwd"] or "")]
+
+
+def _db_project_allowed_conn(conn: sqlite3.Connection, user_id: int, payload: dict,
+                             *, work_session_id: int | None = None) -> bool:
+    if work_session_id is not None:
+        project_key, paths = _db_work_session_project_identity(conn, user_id, work_session_id)
+    else:
+        project_key, paths = _payload_project_identity(payload)
+    rows = conn.execute(
+        "SELECT project_key, root_path FROM user_project_allowlist WHERE user_id = ?",
+        (int(user_id),),
+    ).fetchall()
+    if not rows:
+        return False
+    if project_key and not project_key.startswith("local:") and any(str(r["project_key"] or "") == project_key for r in rows):
+        return True
+    for candidate in paths:
+        if any(r["root_path"] and _path_is_same_or_under_text(candidate, str(r["root_path"])) for r in rows):
+            return True
+    return False
+
+
+def _db_require_project_allowed_conn(conn: sqlite3.Connection, user: sqlite3.Row, payload: dict) -> None:
+    if not _db_project_allowed_conn(conn, int(user["id"]), payload):
+        raise PermissionError("projekt ei ole aitrack allowlistis; käivita selles projektis: aitrack add <tee>")
+
+
 def _db_upsert_issue(conn: sqlite3.Connection, project_id: int, issue: dict, default_provider: str, now: str) -> int | None:
     issue_key = _normalise_issue_key(str(issue.get("issue_key") or issue.get("key") or issue.get("id") or ""))
     if not issue_key:
@@ -2347,6 +2569,7 @@ def _db_work_start(path: Path, token: str, payload: dict) -> dict:
     now = _now_utc().isoformat()
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
+        _db_require_project_allowed_conn(conn, user, payload)
         graph = _db_work_graph(conn, user, payload, now)
         project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
         session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
@@ -2415,6 +2638,8 @@ def _db_work_tick(path: Path, token: str, payload: dict) -> dict:
         row = _db_session_for_user(conn, int(user["id"]), session_ref)
         session_id = int(row["id"])
         session_uid = str(row["session_uid"])
+        if not _db_project_allowed_conn(conn, int(user["id"]), payload, work_session_id=session_id):
+            raise PermissionError("projekt ei ole aitrack allowlistis; ticki ei salvestatud")
         if row["status"] != "active":
             return {"ok": True, "ignored": True, "reason": f"session status is {row['status']}",
                     "work_session_uid": session_uid, "work_session_id": session_id}
@@ -3975,20 +4200,32 @@ def _db_insert_raw_event_conn(conn: sqlite3.Connection, user_id: int, e: dict, n
     return inserted
 
 
+def _db_event_project_allowed_conn(conn: sqlite3.Connection, user: sqlite3.Row, event: dict) -> bool:
+    user_id = int(user["id"])
+    work_session_id = _raw_event_work_session_id(conn, user_id, _event_text(event, "work_session_uid", "session_uid"))
+    if work_session_id is not None:
+        return _db_project_allowed_conn(conn, user_id, event, work_session_id=work_session_id)
+    return _db_project_allowed_conn(conn, user_id, event)
+
+
 def _db_ingest_raw_events_conn(conn: sqlite3.Connection, user: sqlite3.Row, events: list[dict], now: str) -> dict:
     accepted = 0
     inserted = 0
     ignored = 0
+    rejected = 0
     for e in events:
         if not isinstance(e, dict):
             ignored += 1
             continue
         accepted += 1
+        if not _db_event_project_allowed_conn(conn, user, e):
+            rejected += 1
+            continue
         if _db_insert_raw_event_conn(conn, int(user["id"]), e, now):
             inserted += 1
         else:
             ignored += 1
-    return {"accepted": accepted, "inserted": inserted, "ignored": ignored}
+    return {"accepted": accepted, "inserted": inserted, "ignored": ignored, "rejected": rejected}
 
 
 def _looks_like_legacy_prompt_event(e: dict) -> bool:
@@ -4000,8 +4237,13 @@ def _db_ingest_legacy_prompt_events_conn(conn: sqlite3.Connection, user: sqlite3
     accepted = 0
     inserted = 0
     ignored = 0
+    rejected = 0
     for e in events:
         if not isinstance(e, dict) or not _looks_like_legacy_prompt_event(e):
+            continue
+        accepted += 1
+        if not _db_event_project_allowed_conn(conn, user, e):
+            rejected += 1
             continue
         key = str(e.get("event_key", ""))
         if not key:
@@ -4055,12 +4297,11 @@ def _db_ingest_legacy_prompt_events_conn(conn: sqlite3.Connection, user: sqlite3
              project_id, issue_id, work_item_id, work_session_id, float(e.get("confidence") or 0.5),
              json.dumps(_raw_event_payload_value(e), ensure_ascii=False, sort_keys=True)),
         )
-        accepted += 1
         if cur.rowcount:
             inserted += 1
         else:
             ignored += 1
-    return {"accepted": accepted, "inserted": inserted, "ignored": ignored}
+    return {"accepted": accepted, "inserted": inserted, "ignored": ignored, "rejected": rejected}
 
 
 def _db_ingest_events(path: Path, token: str, events: list[dict]) -> dict:
@@ -4467,6 +4708,17 @@ def _server_headers(extra: dict | None = None) -> dict:
     return headers
 
 
+def _decode_http_error(e: urllib.error.HTTPError) -> dict | None:
+    try:
+        raw = e.read().decode("utf-8", "replace")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _server_get(op: str, params: dict, cfg: dict) -> dict | None:
     sink = cfg.get("sink", {})
     params = {"token": sink.get("token", ""), **params}
@@ -4476,6 +4728,10 @@ def _server_get(op: str, params: dict, cfg: dict) -> dict | None:
         req = urllib.request.Request(url, headers=_server_headers(), method="GET")
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body = _decode_http_error(e)
+        log(f"server sink: GET /api/{op} ebaõnnestus: HTTP {e.code} {body.get('error') if body else e.reason}")
+        return body
     except Exception as e:  # noqa: BLE001
         log(f"server sink: GET /api/{op} ebaõnnestus: {e}")
         return None
@@ -4490,6 +4746,10 @@ def _server_post(op: str, payload: dict, cfg: dict) -> dict | None:
                                      headers=_server_headers({"Content-Type": "application/json"}), method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body = _decode_http_error(e)
+        log(f"server sink: POST /api/{op} ebaõnnestus: HTTP {e.code} {body.get('error') if body else e.reason}")
+        return body
     except Exception as e:  # noqa: BLE001
         log(f"server sink: POST /api/{op} ebaõnnestus: {e}")
         return None
@@ -4523,6 +4783,7 @@ def _local_enqueue_events(events: list[dict], error: str = "") -> int:
 
 def _flush_event_outbox(cfg: dict, *, limit: int = 100) -> dict:
     _require_server_cfg(cfg)
+    _sync_allowed_projects(cfg, quiet=True)
     _local_db_init()
     with _local_db_connect() as conn:
         rows = conn.execute(
@@ -4560,6 +4821,7 @@ def _post_events_or_enqueue(events: list[dict], cfg: dict) -> dict:
         _flush_event_outbox(cfg, limit=50)
     except SystemExit:
         pass
+    _sync_allowed_projects(cfg, quiet=True)
     body = _server_post("events", {"events": events}, cfg)
     if body and body.get("ok"):
         return body
@@ -4568,6 +4830,7 @@ def _post_events_or_enqueue(events: list[dict], cfg: dict) -> dict:
 
 
 def _server_append_rows(rows: list[list], keys: list[str], cfg: dict) -> bool:
+    _sync_allowed_projects(cfg, quiet=True)
     body = _server_post("ingest", {"rows": rows, "keys": keys}, cfg)
     return bool(body and body.get("ok"))
 
@@ -5237,6 +5500,7 @@ def cmd_add(args, cfg):
         log(f"add: hoiatus — tee ei ole olemasolev kaust: {new}")
     paths.append(new)
     save_projects(paths)
+    _sync_allowed_projects(cfg, [new])
     log(f"add: lisatud {new}")
     cmd_list(args, cfg)
 
@@ -5246,6 +5510,7 @@ def cmd_remove(args, cfg):
     target = str(Path(args.path).expanduser().resolve())
     paths = [p for p in paths if p != target]
     save_projects(paths)
+    _sync_removed_project(cfg, target)
     log(f"remove: eemaldatud {target}")
     cmd_list(args, cfg)
 
@@ -5951,6 +6216,12 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 _db_ingest_rows(self._db_path(), self._token(data=data), rows, [str(k) for k in keys])
                 self._json({"ok": True})
                 return
+            if u.path == "/api/projects/allow" and self._server_mode():
+                self._json(_db_allow_projects(self._db_path(), self._token(data=data), data))
+                return
+            if u.path == "/api/projects/unallow" and self._server_mode():
+                self._json(_db_unallow_project(self._db_path(), self._token(data=data), data))
+                return
             if u.path == "/api/events" and self._server_mode():
                 events = data.get("events") if isinstance(data.get("events"), list) else []
                 self._json(_db_ingest_events(self._db_path(), self._token(data=data), events))
@@ -6158,6 +6429,7 @@ def cmd_connect(args, cfg):
     cfg2["sink"] = {"type": "server", "server_url": args.url.rstrip("/"), "token": args.token,
                     "webapp_url": "", "path": ""}
     save_config(cfg2)
+    _sync_allowed_projects(cfg2, load_projects(), quiet=True)
     print(f"aitrack server seadistatud: {args.url.rstrip('/')}")
     print("Edaspidi saadab 'aitrack run' tunniread ja prompt-eventid serverisse.")
 
@@ -6210,6 +6482,9 @@ def cmd_work(args, cfg):
         if not summary:
             raise SystemExit("Kasuta: aitrack work start [--issue N] 'töö kirjeldus'")
         payload, ctx, client = _work_payload_from_args(args, cfg, summary=summary)
+        if not getattr(args, "force_untracked", False) and not _local_project_tracked(ctx):
+            raise SystemExit(f"Projekt ei ole aitrack allowlistis: {ctx.get('cwd', '')}\nLisa enne: aitrack add {ctx.get('local_path') or ctx.get('cwd')}")
+        _sync_allowed_projects(cfg, load_projects(), quiet=True)
         tool = payload["session"]["tool"]
         active = _active_work_sessions(tool=tool, checkout_id=ctx["checkout_id"])
         if active and not args.force:
@@ -6231,7 +6506,8 @@ def cmd_work(args, cfg):
             "work_session_uid": session_uid, "work_session_id": session_db_id,
             "work_item_id": body.get("work_item_id"), "status": "active",
             "summary": summary, "project_key": ctx["project_key"], "issue_key": ctx.get("issue_key", ""),
-            "checkout_id": ctx["checkout_id"], "tool": tool, "client_id": client["client_id"],
+            "checkout_id": ctx["checkout_id"], "local_path": ctx.get("local_path", ""), "cwd": ctx.get("cwd", ""),
+            "tool": tool, "client_id": client["client_id"],
             "owner_pid": payload["session"].get("owner_pid"), "owner_start": payload["session"].get("owner_start", ""),
             "owner_command": payload["session"].get("owner_command", ""), "owner_cli": payload["session"].get("owner_cli", tool),
             "started_at": payload["started_at"], "state_key": _work_state_key(client["client_id"], ctx["checkout_id"], tool),
@@ -6348,13 +6624,7 @@ def _hook_owner_start(owner_pid) -> str:
 
 def _hook_project_tracked(ctx: dict) -> bool:
     """Automaatne Pi hook logib ainult aitrack allowlistis olevaid projekte."""
-    allow = load_projects()
-    if not allow:
-        return False
-    for candidate in (ctx.get("cwd"), ctx.get("local_path")):
-        if candidate and match_project(str(candidate), allow):
-            return True
-    return False
+    return _local_project_tracked(ctx)
 
 
 def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tuple[dict | None, dict]:
@@ -6362,6 +6632,7 @@ def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tu
     ctx = _project_context(getattr(args, "cwd", None) or ".", getattr(args, "issue", None))
     if not _hook_project_tracked(ctx):
         return None, {**ctx, "_tracking_skipped": True, "_skip_reason": "project not in aitrack allowlist"}
+    _sync_allowed_projects(cfg, load_projects(), quiet=True)
     tool = _detect_cli(getattr(args, "tool", None) or "pi")
     active = _active_work_sessions(tool=tool, checkout_id=ctx["checkout_id"])
     if active:
@@ -6383,7 +6654,8 @@ def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tu
         "work_session_uid": session_uid, "work_session_id": body.get("work_session_id"),
         "work_item_id": body.get("work_item_id"), "status": "active", "summary": summary,
         "project_key": ctx["project_key"], "issue_key": ctx.get("issue_key", ""),
-        "checkout_id": ctx["checkout_id"], "tool": tool, "client_id": client["client_id"],
+        "checkout_id": ctx["checkout_id"], "local_path": ctx.get("local_path", ""), "cwd": ctx.get("cwd", ""),
+        "tool": tool, "client_id": client["client_id"],
         "owner_pid": payload["session"].get("owner_pid"), "owner_start": payload["session"].get("owner_start", ""),
         "owner_command": payload["session"].get("owner_command", ""), "owner_cli": tool,
         "started_at": payload["started_at"], "state_key": _work_state_key(client["client_id"], ctx["checkout_id"], tool),
@@ -6469,6 +6741,7 @@ def cmd_hook(args, cfg):
 
 def cmd_tick(args, cfg):
     _require_server_cfg(cfg)
+    _sync_allowed_projects(cfg, load_projects(), quiet=True)
     sessions = _active_work_sessions()
     if getattr(args, "session_id", None):
         sessions = [s for s in sessions if _session_ref_matches(s, args.session_id)]
@@ -6477,6 +6750,9 @@ def cmd_tick(args, cfg):
         return
     sent = 0
     for s in sessions:
+        if not _local_session_tracked(s):
+            print(f"Jätsin ticki saatmata: projekt ei ole allowlistis ({s.get('project_key', '')})")
+            continue
         ref = _local_session_ref(s)
         if not _owner_still_alive(s):
             event = {

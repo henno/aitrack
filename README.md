@@ -77,8 +77,9 @@ aitrack add /tee/projektini
 aitrack install --minute-tracking --pi-extension
 ```
 
-Pi sees tee seejärel `/reload` või ava uus Pi sessioon. `aitrack add` on oluline: globaalne Pi extension
-logib ainult lisatud projektides, mitte kõiki arvutis avatud repo'sid.
+Pi sees tee seejärel `/reload` või ava uus Pi sessioon. `aitrack add` on oluline: globaalne Pi extension,
+`aitrack work start`, `aitrack tick` ja serveri vastuvõtt lubavad vaikimisi ainult lisatud projekte. Nii ei logita
+kogemata mõnda muud arvutis avatud repo't.
 
 > Juba seadistatud? Kõik on edaspidi käsuga **`aitrack <...>`** (lühivorm; ka `python3 aitrack.py <...>` töötab).
 
@@ -92,8 +93,8 @@ logib ainult lisatud projektides, mitte kõiki arvutis avatud repo'sid.
 | `aitrack user add/list/password` | Lisa/listi keskserveri kasutajaid, API token'eid ja brauseri login'i paroole. |
 | `aitrack connect --url ... --token ...` | Ühenda klient keskserveriga; `aitrack run` saadab tunniread ja prompt-eventid serverisse. |
 | `aitrack project-id` | Näita serveri ühist projektivõtit: Git repo korral normaliseeritud remote URL, muidu `local:<kaust>`. |
-| `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; mitu kasutajat/agentit võivad sama issue all paralleelselt töötada. |
-| `aitrack tick` | Saada kõigi aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
+| `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; töö algus õnnestub ainult `aitrack add` projektis. |
+| `aitrack tick` | Saada allowlistis olevate aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
 | `https://SERVER/activity` | Serveri veebivaade work session'ite, prompt-eventide ja tegevuste vaatamiseks. |
 | `aitrack install --minute-tracking` | Lisa tavapärase tunniajasti kõrvale OS-i iga-minuti tick timer aktiivsete work-session'ite heartbeat'iks. |
 | `aitrack install --pi-extension` | Paigalda globaalne Pi extension, mis saadab prompt/tool-call raw evente ja lühikokkuvõtteid. Logib ainult `aitrack add` projektides. |
@@ -104,7 +105,7 @@ logib ainult lisatud projektides, mitte kõiki arvutis avatud repo'sid.
 | `aitrack project assign-customer PROJECT_KEY CUSTOMER` | Seo olemasolev projekt kliendiga. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
-| `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt. |
+| `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt; serverirežiimis sünkroniseerib ka serveripoolse allowlisti. |
 | `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Läheb "Uued teadmised" veergu. Tühjalt = kuva märkmed. |
 | `aitrack day [KUUPÄEV]` | **Prindi päeva sisuveerud D–G** (Objekt/Saavutused/Takistused/Uued teadmised, tab-eraldus) — vali Sheetsis lahter `D<rida>` ja Ctrl+V. Vaikimisi viimane päev; `--all` = kõik; `--header` = päiserida; `--full` = kõik 7 veergu; `--html` = clipboardi jaoks, säilitab punktid lahtris eri ridadel; `--flat` = üks füüsiline rida. |
 | `aitrack digest [--days N] [--notify]` | Päeva/nädala kokkuvõte (valikuliselt töölaua-teavitus). |
@@ -303,6 +304,10 @@ curl -H "X-Aitrack-Token: TOKEN" \
   `~/projects/team/b` eraldi projektidena. Kui `cwd` on allowlisti juure all, aga Git tööpuud ei leita,
   jäetakse see kirje vaikimisi vahele. **Käivita AI projektikaustast** (`cd projekt && pi/claude`), et
   filtreerimine töötaks.
+- **Server kaitseb samuti allowlistiga.** `aitrack add` saadab lubatud juure serverisse. Kui klient või agent proovib
+  `work start`/evente saata projektist, mida pole lisatud, server ei salvesta neid. Kui lisasid projekti enne serveriga
+  ühendamist, tee pärast `aitrack connect` uuesti `aitrack add /tee/projektini` või käivita mõni tavaline aitrack käsk,
+  mis allowlisti sünkroniseerib.
 - **Kaks faili.** Sisemine tunnipõhine algandmestik `~/.config/aitrack/hours.csv`
   (veerud `Kuupäev | Tund | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised | Tööriist | _key`)
   on **allikas** — dedup ja päevavaate renderdamine. Kasutaja kleebitav **päevavaade**

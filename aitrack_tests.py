@@ -43,6 +43,10 @@ def fake_append(rows, keys, cfg):
         SINK_KEYS.add(k); ADDED.append(row)
     return True
 
+def allow_server_project(db, tok, root="/tmp/aitrack", project_key="github.com/parkkarl/aitrack", name="aitrack"):
+    return A._db_allow_projects(db, tok, {"projects": [{"root_path": root, "local_path": root, "project_key": project_key, "name": name}]})
+
+
 def setup(records, state=None, allow=None):
     CFG.mkdir(parents=True, exist_ok=True)
     A.save_projects(allow or ["/proj"])
@@ -583,6 +587,7 @@ print("TEST 41: SQLite keskserver salvestab tunniread ja prompt-eventid tokeniga
 sdb = CFG / "server-test.db"
 sdb.unlink(missing_ok=True)
 tok = A._db_add_user(sdb, "karl")
+allow_server_project(sdb, tok, "/proj", "local:proj", "proj")
 A._db_ingest_rows(sdb, tok, [["2026-06-16", "10:00–11:00", "obj", "saav", "tak", "tead", "Pi"]], ["k:server:1"])
 check("server keys sisaldab ingestitud võtit", A._db_keys(sdb, tok) == {"k:server:1"})
 check("server day row loetav", A._db_rows_for_day(sdb, tok, "2026-06-16")[0][2] == "obj")
@@ -619,12 +624,27 @@ hook_other = CFG / "hook-other"
 hook_other.mkdir(parents=True, exist_ok=True)
 A.save_projects([str(hook_allowed)])
 check("Pi hook logib ainult aitrack allowlistis oleva projekti", A._hook_project_tracked({"cwd": str(hook_allowed / "sub"), "local_path": str(hook_allowed)}) is True and A._hook_project_tracked({"cwd": str(hook_other), "local_path": str(hook_other)}) is False)
+allowdb = CFG / "server-allowlist-test.db"
+allowdb.unlink(missing_ok=True)
+allowtok = A._db_add_user(allowdb, "allowuser")
+blocked = False
+try:
+    A._db_work_start(allowdb, allowtok, {"project": {"project_key": "github.com/example/blocked", "name": "blocked", "local_path": "/tmp/blocked"}, "work": {"title": "blocked"}, "session": {"client_id": "c", "tool": "pi", "local_path": "/tmp/blocked", "cwd": "/tmp/blocked"}})
+except PermissionError:
+    blocked = True
+allow_server_project(allowdb, allowtok, "/tmp/allowed-root", "local:allowed-root", "allowed-root")
+allowed_start = A._db_work_start(allowdb, allowtok, {"project": {"project_key": "github.com/example/child", "name": "child", "local_path": "/tmp/allowed-root/child"}, "work": {"title": "allowed"}, "session": {"client_id": "c", "tool": "pi", "local_path": "/tmp/allowed-root/child", "cwd": "/tmp/allowed-root/child"}})
+rejected_events = A._db_ingest_events(allowdb, allowtok, [{"event_key": "blocked-event", "tool": "Pi", "project": "/tmp/blocked", "prompt_text": "ei tohi", "started_at": HFL(10).isoformat(), "ended_at": HFL(10).isoformat(), "duration_seconds": 60}])
+check("server blokeerib work/start projekti, mida pole allowlisti lisatud", blocked is True)
+check("server lubab allowlisti juure all oleva projekti", str(allowed_start.get("work_session_uid", "")).startswith("ws_"))
+check("server ei salvesta evente mitte-allowlist projektist", rejected_events["raw_events"]["rejected"] == 1 and rejected_events["prompt_events"]["rejected"] == 1)
 
 # ============ TEST 43: 3NF work_session + invoice/practice vaated ============
 print("TEST 43: serveri normaliseeritud work_session'id toidavad arve- ja praktikavaadet")
 wdb = CFG / "server-work-test.db"
 wdb.unlink(missing_ok=True)
 wtok = A._db_add_user(wdb, "karl")
+allow_server_project(wdb, wtok, "/tmp/pp-finar-pi", "github.com/puhastusproff/pp-finar", "pp-finar")
 payload = {
     "project": {"project_key": "github.com/puhastusproff/pp-finar", "repo_url": "git@github.com:Puhastusproff/pp-finar.git", "name": "pp-finar", "local_path": "/tmp/pp-finar-pi", "checkout_id": "co-pi", "branch": "662-test"},
     "issue": {"provider": "github", "issue_key": "662", "title": "Asendaja pühadetasu"},
@@ -766,6 +786,7 @@ print("TEST 49: raw_events tabel, /api/events ingest helper ja export")
 rdb = CFG / "server-raw-events-test.db"
 rdb.unlink(missing_ok=True)
 rtok = A._db_add_user(rdb, "rawuser")
+allow_server_project(rdb, rtok)
 rpayload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
     "issue": {"provider": "github", "issue_key": "662", "title": "Asendaja pühadetasu"},
@@ -812,6 +833,7 @@ print("TEST 50: active interval rollup tihendab tickid ja jätab sleep-gap'i aug
 idb = CFG / "server-intervals-test.db"
 idb.unlink(missing_ok=True)
 itok = A._db_add_user(idb, "intervaluser")
+allow_server_project(idb, itok)
 ipayload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
     "work": {"title": "interval test", "summary": "rollup"},
@@ -836,6 +858,7 @@ print("TEST 51: watchdog märgib heartbeatita aktiivse sessiooni stale olekusse"
 stdb = CFG / "server-watchdog-test.db"
 stdb.unlink(missing_ok=True)
 stok = A._db_add_user(stdb, "watchuser")
+allow_server_project(stdb, stok)
 A._now_utc = lambda: HFL(10)
 st_payload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
@@ -861,6 +884,7 @@ print("TEST 51B: activity märgib live-aknas vanad active sessioonid stale'iks")
 adb = CFG / "server-activity-watchdog-test.db"
 adb.unlink(missing_ok=True)
 atok = A._db_add_user(adb, "activitywatch")
+allow_server_project(adb, atok)
 A._now_utc = lambda: HFL(9)
 astart = A._db_work_start(adb, atok, {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
@@ -880,6 +904,7 @@ print("TEST 52: event endpointid seovad prompti work_sessioniga ja uuendavad too
 edb = CFG / "server-event-endpoint-test.db"
 edb.unlink(missing_ok=True)
 etok = A._db_add_user(edb, "eventuser")
+allow_server_project(edb, etok)
 epayload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
     "work": {"title": "event endpoint test", "summary": "events"},
@@ -913,6 +938,7 @@ print("TEST 53: watchdog märgib pika poolelioleva tool-call'i stuck olekusse")
 sdb2 = CFG / "server-stuck-test.db"
 sdb2.unlink(missing_ok=True)
 stok2 = A._db_add_user(sdb2, "stuckuser")
+allow_server_project(sdb2, stok2)
 A._now_utc = lambda: HFL(8)
 spayload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
@@ -936,6 +962,7 @@ print("TEST 54: cleanup dry-run/apply ja minute_ticks ainult pärast rollupit")
 cdb = CFG / "server-cleanup-test.db"
 cdb.unlink(missing_ok=True)
 ctok = A._db_add_user(cdb, "cleanupuser")
+allow_server_project(cdb, ctok)
 A._now_utc = lambda: dt.datetime(2026, 7, 1, tzinfo=UTC)
 cpayload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
@@ -968,6 +995,7 @@ print("TEST 55: active interval export lõikab intervalli päeva piiridesse")
 clipdb = CFG / "server-clip-test.db"
 clipdb.unlink(missing_ok=True)
 cltok = A._db_add_user(clipdb, "clipuser")
+allow_server_project(clipdb, cltok)
 clip_payload = {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
     "work": {"title": "clip test", "summary": "clip"},
@@ -1010,6 +1038,7 @@ print("TEST 58: customer, contract ja rate workflow")
 wdb = CFG / "server-workflow-test.db"
 wdb.unlink(missing_ok=True)
 wtok = A._db_add_user(wdb, "workflow")
+allow_server_project(wdb, wtok, "/tmp/acme", "github.com/example/acme", "acme")
 wstart = A._db_work_start(wdb, wtok, {
     "project": {"project_key": "github.com/example/acme", "name": "acme", "local_path": "/tmp/acme"},
     "work": {"title": "workflow", "summary": "workflow"},
@@ -1031,6 +1060,7 @@ print("TEST 59: activity tagastab agent/subagent tree")
 treedb = CFG / "server-agent-tree-test.db"
 treedb.unlink(missing_ok=True)
 treetok = A._db_add_user(treedb, "treeuser")
+allow_server_project(treedb, treetok)
 tstart = A._db_work_start(treedb, treetok, {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
     "work": {"title": "tree", "summary": "tree"},
@@ -1050,6 +1080,7 @@ print("TEST 60: activity detail modal laadib sündmuse toorandmed")
 detdb = CFG / "server-detail-test.db"
 detdb.unlink(missing_ok=True)
 dettok = A._db_add_user(detdb, "detailuser")
+allow_server_project(detdb, dettok)
 detstart = A._db_work_start(detdb, dettok, {
     "project": {"project_key": "github.com/parkkarl/aitrack", "name": "aitrack", "local_path": "/tmp/aitrack"},
     "work": {"title": "detail", "summary": "detail"},
