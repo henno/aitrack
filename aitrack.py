@@ -2862,18 +2862,21 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     for r in raw_rows:
         payload_preview, payload_truncated, payload_bytes = _payload_preview_json(r["payload_json"])
         payload_summary = ""
+        payload_value = {}
         try:
-            payload_value = json.loads(r["payload_json"] or "{}")
-            if isinstance(payload_value, dict):
+            parsed_payload = json.loads(r["payload_json"] or "{}")
+            if isinstance(parsed_payload, dict):
+                payload_value = parsed_payload
                 payload_summary = _event_summary_text(payload_value, limit=500)
         except (TypeError, json.JSONDecodeError):
             payload_summary = ""
+        display_tool = _raw_event_display_tool(r["tool_name"] or "", payload_value)
         item = {
             "type": "raw_event",
             "id": int(r["id"]),
             "user": r["user_name"],
             "event_type": r["event_type"],
-            "tool": r["tool_name"] or "",
+            "tool": display_tool,
             "tool_name": r["tool_name"] or "",
             "tool_call_id": r["tool_call_id"] or "",
             "event_key": r["event_key"] or "",
@@ -2892,7 +2895,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "payload_json": payload_preview,
             "payload_truncated": payload_truncated,
             "payload_bytes": payload_bytes,
-            "summary": _raw_event_display_summary(r["event_type"], r["tool_name"] or "", payload_summary, r["session_summary"] or r["work_title"] or ""),
+            "summary": _raw_event_display_summary(r["event_type"], display_tool, payload_summary, r["session_summary"] or r["work_title"] or ""),
         }
         raw_items.append(item)
         activity.append({**item, "at": r["occurred_at_utc"], "label": "raw_event"})
@@ -3559,6 +3562,52 @@ def _event_summary_text(e: dict, *, limit: int = 1000) -> str:
     if not summary and isinstance(payload, dict):
         summary = _event_text(payload, "summary", "done_summary", "change_summary", "changes", "result_summary")
     return _safe_day_prompt_snippet(summary, limit) if summary else ""
+
+
+def _bash_command_label(command: str) -> str:
+    """Tuleta bash-käsust inimlikum tööliik activity vaate jaoks."""
+    cmd = re.sub(r"\s+", " ", str(command or "").strip().lower())
+    if not cmd:
+        return ""
+    if re.search(r"\bdocker\s+compose\b|\bdocker-compose\b", cmd):
+        return "docker compose"
+    if re.search(r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:ssh|scp|rsync)\b", cmd):
+        return "ssh"
+    if re.search(r"\b(pytest|phpunit|go\s+test|cargo\s+test|npm\s+(?:run\s+)?test|pnpm\s+test|yarn\s+test|aitrack_tests\.py|python3?\s+-m\s+pytest)\b", cmd):
+        return "testid"
+    if re.search(r"(?:^|[;&|]\s*)(?:sudo\s+)?git\b", cmd):
+        return "git"
+    if re.search(r"(?:^|[;&|]\s*)(?:curl|wget)\b", cmd):
+        return "http"
+    if re.search(r"(?:^|[;&|]\s*)(?:cat|sed|head|tail|less|rg|grep|find|ls|pwd)\b", cmd):
+        return "read"
+    if re.search(r"(>\s*[^&]|\btee\b|\bsed\s+-i\b|\.write_text\(|\bcat\s+>)", cmd):
+        return "write"
+    return "bash"
+
+
+def _raw_event_tool_input(payload_value: dict) -> dict | str:
+    payload = payload_value.get("payload") if isinstance(payload_value.get("payload"), dict) else payload_value
+    tool_input = payload.get("tool_input") if isinstance(payload, dict) else None
+    if isinstance(tool_input, (dict, str)):
+        return tool_input
+    return ""
+
+
+def _raw_event_display_tool(tool_name: str, payload_value: dict | None = None) -> str:
+    tool = str(tool_name or "").strip()
+    if tool != "bash":
+        return tool
+    tool_input = _raw_event_tool_input(payload_value or {})
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            return _bash_command_label(tool_input)
+    if isinstance(tool_input, dict):
+        command = str(tool_input.get("command") or tool_input.get("cmd") or tool_input.get("script") or "")
+        return _bash_command_label(command) or tool
+    return tool
 
 
 def _raw_event_display_summary(event_type: str, tool_name: str = "", payload_summary: str = "", session_summary: str = "") -> str:
@@ -6163,6 +6212,12 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
         "issue_key": ctx.get("issue_key", ""),
         "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 500)},
     }
+    tool_input = getattr(args, "tool_input", "")
+    if tool_input:
+        try:
+            event["payload"]["tool_input"] = json.loads(str(tool_input))
+        except json.JSONDecodeError:
+            event["payload"]["tool_input"] = str(tool_input)[:2000]
     if event_type in {"prompt_started", "prompt_finished"}:
         event["prompt_text"] = _safe_day_prompt_snippet(getattr(args, "prompt", "") or getattr(args, "summary", "") or "", 500)
         event["tool"] = tool_name
@@ -6345,6 +6400,15 @@ function common(ctx: any, agentUid: string, prompt?: string, summary?: string): 
   ];
 }
 
+function toolInputArgs(input: unknown): string[] {
+  try {
+    const text = JSON.stringify(input ?? {});
+    return text && text !== "{}" ? ["--tool-input", text.slice(0, 2000)] : [];
+  } catch {
+    return [];
+  }
+}
+
 type ContentBlock = { type?: string; text?: string; name?: string; arguments?: Record<string, unknown> };
 
 function textParts(content: unknown): string[] {
@@ -6411,6 +6475,7 @@ export default function (pi: ExtensionAPI) {
       ...common(ctx, agentUid),
       "--tool-name", event.toolName || "",
       "--tool-call-id", event.toolCallId || "",
+      ...toolInputArgs(event.input),
     ], ctx.cwd);
   });
 
@@ -6420,6 +6485,7 @@ export default function (pi: ExtensionAPI) {
       ...common(ctx, agentUid),
       "--tool-name", event.toolName || "",
       "--tool-call-id", event.toolCallId || "",
+      ...toolInputArgs(event.input),
       ...(event.isError ? ["--is-error"] : []),
     ], ctx.cwd);
   });
@@ -6772,6 +6838,7 @@ def main():
         p.add_argument("--parent-agent-uid", dest="parent_agent_uid", default="")
         p.add_argument("--tool-name", dest="tool_name", default="")
         p.add_argument("--tool-call-id", dest="tool_call_id", default="")
+        p.add_argument("--tool-input", dest="tool_input", default="")
         p.add_argument("--owner-pid", dest="owner_pid")
         p.add_argument("--owner-start", dest="owner_start", default="")
         p.add_argument("--owner-command", dest="owner_command", default="")

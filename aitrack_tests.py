@@ -592,6 +592,7 @@ check("SSH ja HTTPS URL normaliseeruvad samaks",
       "github.com/puhastusproff/pp-finar")
 check("branchist leitakse issue number", A._issue_from_branch("fix/662-asendaja-puhadetasu") == "662")
 check("issue combobox labelist leitakse issue number", A._normalise_issue_key("662 - Asendaja pühadetasu") == "662")
+check("bash raw-eventist tuletatakse päris tööliik", A._raw_event_display_tool("bash", {"payload": {"tool_input": {"command": "docker compose up -d && curl -I https://x"}}}) == "docker compose" and A._raw_event_display_tool("bash", {"payload": {"tool_input": {"command": "python3 aitrack_tests.py"}}}) == "testid" and A._raw_event_display_tool("bash", {"payload": {"tool_input": {"command": "ssh root@example uptime"}}}) == "ssh")
 hook_allowed = CFG / "hook-allowed"
 hook_other = CFG / "hook-other"
 (hook_allowed / "sub").mkdir(parents=True, exist_ok=True)

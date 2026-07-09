@@ -763,7 +763,7 @@ function renderRawEvents(rows) {
     <td data-label="Aeg">${fmtTime(x.occurred_at_utc)}</td>
     <td data-label="Kasutaja">${esc(x.user || '')}</td>
     <td data-label="Event"><span class="pill">${esc(x.event_type || '')}</span><div class="small">${esc(x.event_key || '')}</div></td>
-    <td data-label="Agent/tool">${esc(x.agent_uid || '')}<div class="small">${esc(x.tool_name || x.tool || '')}${x.tool_call_id ? ' · ' + esc(x.tool_call_id) : ''}</div></td>
+    <td data-label="Agent/tool">${esc(x.agent_uid || '')}<div class="small">${esc(x.tool || x.tool_name || '')}${x.tool_name && x.tool && x.tool_name !== x.tool ? ' · raw: ' + esc(x.tool_name) : ''}${x.tool_call_id ? ' · ' + esc(x.tool_call_id) : ''}</div></td>
     <td data-label="Session"><code>${esc(x.work_session_uid || '')}</code></td>
     <td data-label="Payload"><pre>${esc(x.payload_json || '')}</pre></td>
     <td data-label="Toorandmed">${detailButton({...x, type:'raw_event'})}</td>
