@@ -3056,6 +3056,8 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
     issue_filter = _normalise_issue_key(_qval(q, "issue"))
     tool_filter = _qval(q, "tool")
     status_filter = _qval(q, "status")
+    work_session_filter = (_qval(q, "work_session_uid") or _qval(q, "work_session_id") or
+                           _qval(q, "worksessionid") or _qval(q, "session_uid") or _qval(q, "session_id")).strip()
     agent_filter = _qval(q, "agent_uid") or _qval(q, "agent_id")
     event_type_filter = _qval(q, "event_type")
     _db_activity_auto_watchdog(path, token, q, start_iso, end_iso)
@@ -3111,6 +3113,14 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             prompt_args.append(status_filter)
             raw_where.append("ws.status = ?")
             raw_args.append(status_filter)
+        if work_session_filter:
+            session_like = f"%{work_session_filter.lower()}%"
+            session_where.append("(LOWER(ws.session_uid) LIKE ? OR CAST(ws.id AS TEXT) = ?)")
+            session_args.extend([session_like, work_session_filter])
+            prompt_where.append("(LOWER(COALESCE(ws.session_uid, '')) LIKE ? OR CAST(pe.work_session_id AS TEXT) = ? OR CAST(ws.id AS TEXT) = ?)")
+            prompt_args.extend([session_like, work_session_filter, work_session_filter])
+            raw_where.append("(LOWER(COALESCE(NULLIF(re.work_session_uid, ''), ws.session_uid, '')) LIKE ? OR CAST(re.work_session_id AS TEXT) = ? OR CAST(ws.id AS TEXT) = ?)")
+            raw_args.extend([session_like, work_session_filter, work_session_filter])
         if agent_filter:
             session_where.append("ws.agent_uid = ?")
             session_args.append(agent_filter)

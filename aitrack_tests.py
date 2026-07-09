@@ -1088,6 +1088,8 @@ detstart = A._db_work_start(detdb, dettok, {
     "started_at": HFL(4).isoformat(),
 })
 A._db_ingest_events(detdb, dettok, [{"event_key": "detail-raw", "event_type": "before_tool_call", "work_session_uid": detstart["work_session_uid"], "agent_uid": "agent-detail", "tool_name": "bash", "tool_call_id": "tc-detail", "occurred_at_utc": HFL(4).isoformat(), "payload": {"command": "echo detail"}}])
+filtered_activity = A._db_activity_log(detdb, dettok, {"period": ["2026-06"], "work_session_uid": [detstart["work_session_uid"]]})
+miss_activity = A._db_activity_log(detdb, dettok, {"period": ["2026-06"], "worksessionid": ["ws_missing"]})
 with A._db_connect(detdb) as conn:
     raw_id = conn.execute("SELECT id FROM raw_events WHERE event_key = 'detail-raw'").fetchone()["id"]
 raw_detail = A._db_event_detail(detdb, dettok, {"type": ["raw_event"], "id": [str(raw_id)]})
@@ -1097,6 +1099,8 @@ check("event-detail tagastab raw event payload_json välja", raw_detail["detail"
 check("event-detail tagastab work_session toorrea", session_detail["detail"]["session_uid"] == detstart["work_session_uid"])
 check("activity HTML sisaldab detail modalit ja nuppe", "detailModal" in activity_html and "showDetail" in activity_html and "Toorandmed" in activity_html)
 check("detail modal värvib JSON-i süntaksit", "syntaxHighlightJson" in activity_html and "json-key" in activity_html and "json-string" in activity_html)
+check("activity filtreerib worksessionid järgi", len(filtered_activity["sessions"]) == 1 and len(filtered_activity["raw_events"]) == 1 and not miss_activity["sessions"] and not miss_activity["raw_events"])
+check("activity HTML sisaldab worksessionid filtrit", "workSessionInput" in activity_html and "work_session_uid" in activity_html)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

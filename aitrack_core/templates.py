@@ -604,6 +604,7 @@ body.modal-open { overflow:hidden; }
     <label>Issue <input id="issueInput" list="issueOptions" placeholder="issue nr / pealkiri" style="width:220px" autocomplete="off"><datalist id="issueOptions"></datalist></label>
     <label>Tool <input id="toolInput" placeholder="pi" style="width:90px"></label>
     <div class="filter-group"><span>Status</span><input type="hidden" id="statusInput" value=""><button type="button" class="filter-toggle active" data-status-filter="" onclick="setSessionStatusFilter('')">Kõik</button><button type="button" class="filter-toggle" data-status-filter="active" onclick="setSessionStatusFilter('active')">Active</button><button type="button" class="filter-toggle" data-status-filter="stale" onclick="setSessionStatusFilter('stale')">Stale</button><button type="button" class="filter-toggle" data-status-filter="stuck" onclick="setSessionStatusFilter('stuck')">Stuck</button></div>
+    <label>Worksessionid <input id="workSessionInput" placeholder="ws_… või id" style="width:170px" autocomplete="off"></label>
     <label>Agent <input id="agentInput" placeholder="agent_uid" style="width:130px"></label>
     <label>Piir <input type="number" id="limitInput" value="200" min="1" max="1000" style="width:90px"></label>
     <span class="status" id="status"></span>
@@ -898,6 +899,7 @@ async function loadActivity() {
   if ($('issueInput').value) params.set('issue', $('issueInput').value);
   if ($('toolInput').value) params.set('tool', $('toolInput').value);
   if ($('statusInput').value) params.set('status', $('statusInput').value);
+  if ($('workSessionInput').value) params.set('work_session_uid', $('workSessionInput').value.trim());
   if ($('agentInput').value) params.set('agent_uid', $('agentInput').value);
   setStatus('Laen…');
   try {
@@ -922,7 +924,7 @@ async function init() {
   $('dateInput').addEventListener('focus', openDatePicker);
   $('projectInput').addEventListener('input', () => { scheduleIssueOptions(); scheduleActivityLoad(); });
   $('projectInput').addEventListener('change', () => { loadIssueOptions(); scheduleActivityLoad(0); });
-  for (const id of ['userInput', 'issueInput', 'toolInput', 'agentInput', 'limitInput']) {
+  for (const id of ['userInput', 'issueInput', 'toolInput', 'workSessionInput', 'agentInput', 'limitInput']) {
     $(id).addEventListener('input', () => scheduleActivityLoad());
     $(id).addEventListener('change', () => scheduleActivityLoad(0));
   }
