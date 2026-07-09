@@ -299,35 +299,91 @@ def save_projects(paths: list[str]) -> None:
     _atomic_write_json(PROJECTS_FILE, {"allow": sorted(set(paths))})
 
 
-def match_project(record_project: str, allow: list[str]) -> str | None:
-    """Tagastab lubatud projekti tee, kui kirje sinna alla kuulub (pikim vaste).
-
-    Võrdleb tee-komponente (mitte stringi-prefiksit) ja normaliseerib tõstu
-    (`normcase`) — väldib Windowsi tõstutundlikkuse ja segasseparaatorite vigu
-    ning sibling-vasteid (nt /a/proj vs /a/proj2). Git worktree puhul kontrollib
-    lisaks põhitööpuu juurt, et `/repo-662` läheks lubatud `/repo` alla.
-    """
+def _resolve_path_loose(value: str | Path) -> Path:
     try:
-        rp = os.path.normcase(str(Path(record_project).expanduser().resolve()))
+        return Path(value).expanduser().resolve()
     except (OSError, ValueError, RuntimeError):
-        rp = os.path.normcase(record_project)
+        return Path(value).expanduser()
 
-    def _best_for(parts) -> str | None:
-        best = None
-        best_len = -1
-        for p in allow:
-            pparts = Path(os.path.normcase(p)).parts
-            if parts[: len(pparts)] == pparts and len(pparts) > best_len:
-                best, best_len = p, len(pparts)
-        return best
 
-    direct = _best_for(Path(rp).parts)
+def _norm_parts(path: str | Path) -> tuple[str, ...]:
+    return Path(os.path.normcase(str(path))).parts
+
+
+def _best_allow_root_for_path(path: str | Path, allow: list[str]) -> str | None:
+    parts = _norm_parts(path)
+    best = None
+    best_len = -1
+    for p in allow:
+        pparts = _norm_parts(_resolve_path_loose(p))
+        if parts[: len(pparts)] == pparts and len(pparts) > best_len:
+            best, best_len = str(_resolve_path_loose(p)), len(pparts)
+    return best
+
+
+def _git_root_within(record_project: str | Path, boundary: str | Path) -> str | None:
+    """Leia cwd-st ülespoole esimene Git tööpuu juur, kuid ära mine allowlisti piirist välja.
+
+    Git-projektiks loeme nii `.git` kataloogi kui ka `.git` faili (worktree/submodule kuju).
+    """
+    start = _resolve_path_loose(record_project)
+    boundary_p = _resolve_path_loose(boundary)
+    try:
+        if start.exists() and start.is_file():
+            start = start.parent
+    except OSError:
+        pass
+    boundary_parts = _norm_parts(boundary_p)
+    cur = start
+    while True:
+        cur_parts = _norm_parts(cur)
+        if cur_parts[: len(boundary_parts)] != boundary_parts:
+            return None
+        gitp = cur / ".git"
+        try:
+            if gitp.is_dir() or gitp.is_file():
+                return str(cur.resolve())
+        except (OSError, ValueError, RuntimeError):
+            pass
+        if cur_parts == boundary_parts:
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def match_project(record_project: str, allow: list[str]) -> str | None:
+    """Tagastab konkreetse lubatud projekti tee.
+
+    Kui allowlistis on üldine juurkaust (nt `~/projects`), otsime iga logikirje cwd-st
+    ülespoole päris Git tööpuu juure, kuid ainult sobiva allowlisti juure piires. Nii ei
+    koondu kõik kirjed üldise `projects` projekti alla. Git worktree puhul piisab `.git`
+    failist. Kui olemasoleva allowlisti alamkausta alt Git-rooti ei leita, jäetakse kirje
+    vahele; olematute test/legacy teede puhul säilib vana otsene sobitamine.
+    """
+    rp = _resolve_path_loose(record_project)
+    direct = _best_allow_root_for_path(rp, allow)
     if direct is not None:
-        return direct
+        git_root = _git_root_within(rp, direct)
+        if git_root is not None:
+            return git_root
+        try:
+            exists = rp.exists()
+        except OSError:
+            exists = False
+        # Hoia tagasiühilduvus olematute logiteede/testidega ja täpselt allowlisti lisatud
+        # mitte-Git kaustaga; sügavad mitte-Git alamkaustad üldjuure all jätame vahele.
+        if not exists or _norm_parts(rp) == _norm_parts(_resolve_path_loose(direct)):
+            return direct
+        return None
 
+    # Tagasiühilduvus: kui lubatud on põhirepo `/repo`, loe sibling worktree `/repo-123`
+    # samaks projektiks, kui `.git` fail viitab põhirepo `.git/worktrees/...` alla.
     main = _git_worktree_main(record_project)
     if main:
-        return _best_for(Path(os.path.normcase(main)).parts)
+        return _best_allow_root_for_path(main, allow)
     return None
 
 

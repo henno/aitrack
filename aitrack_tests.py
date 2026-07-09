@@ -167,11 +167,31 @@ fb = " ".join(fbi.values())
 check("ei sisalda toorest prompti", "SALAJANE" not in fb and "sk-12345" not in fb)
 check("näitab promptide arvu", "2" in fbi["objekt"])
 
-# ============ TEST 11: match_project — subpath jah, sibling ei ============
-print("TEST 11: match_project tabab subpath'i, mitte sibling'it")
+# ============ TEST 11: match_project — subpath jah, sibling ei, allow-juure all Git-repod eraldi ============
+print("TEST 11: match_project tabab subpath'i, mitte sibling'it, ja eristab allow-juure all Git-repod")
 allow = ["/home/x/proj"]
 check("subpath sobib", A.match_project("/home/x/proj/src", allow) == "/home/x/proj")
 check("sibling EI sobi", A.match_project("/home/x/proj2", allow) is None)
+allow_root = CFG / "allow-root"
+repo_a = allow_root / "client-a"
+repo_b = allow_root / "nested" / "client-b"
+repo_wt = allow_root / "client-worktree"
+for p in (repo_a / "src", repo_b / "app", repo_wt / "src", allow_root / "nogit" / "deep"):
+    p.mkdir(parents=True, exist_ok=True)
+(repo_a / ".git").mkdir(exist_ok=True)
+(repo_b / ".git").mkdir(exist_ok=True)
+(repo_wt / ".git").write_text("gitdir: /tmp/aitrack-worktree/gitdir\n", encoding="utf-8")
+check("allowlisti juur leiab sügava Git repo A", A.match_project(str(repo_a / "src"), [str(allow_root)]) == str(repo_a.resolve()))
+check("allowlisti juur leiab sügava Git repo B", A.match_project(str(repo_b / "app"), [str(allow_root)]) == str(repo_b.resolve()))
+check("allowlisti juur tunneb .git failiga worktree ära", A.match_project(str(repo_wt / "src"), [str(allow_root)]) == str(repo_wt.resolve()))
+check("allowlisti alamkaust ilma Git-rootita jäetakse vahele", A.match_project(str(allow_root / "nogit" / "deep"), [str(allow_root)]) is None)
+reset_sink()
+setup([A.Record("Pi", str(repo_a / "src"), D(11), "repo a töö"), A.Record("Pi", str(repo_b / "app"), D(11), "repo b töö")], allow=[str(allow_root)])
+cfg = A.load_config(); cfg["group_by"] = "project"; allow = A.load_projects()
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+objs = sorted(r[2] for r in ADDED)
+check("tunnipõhine run ei koonda kõike allow-juure nime alla", objs == ["OBJ[client-a]", "OBJ[client-b]"])
 
 # ============ TEST 12: backfill jätab juba-olemas tunni summeerimata (kuluvõit) ============
 print("TEST 12: backfill ei summeeri tunde, mis on juba lehel")

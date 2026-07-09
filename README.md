@@ -296,9 +296,13 @@ curl -H "X-Aitrack-Token: TOKEN" \
 - **Windows:** Task Scheduler → ülesanne `aitrack` · käsitsi: `schtasks /Run /TN aitrack`
 
 ## Märkused / piirangud
-- **Projekti tuvastus käib `cwd`/`workspace` järgi.** Kui käivitad AI-d kodukaustast
-  (`/home/sina`) mitte projektikaustast, ei saa tööd projektidesse jagada.
-  **Käivita AI projektikaustast** (`cd projekt && claude`), et filtreerimine töötaks.
+- **Projekti tuvastus käib `cwd`/`workspace` järgi.** Kui allowlistis on konkreetne Git repo,
+  seotakse selle alamkaustad sama repoga. Kui allowlistis on üldine juurkaust (nt `~/projects`),
+  otsib aitrack iga logikirje `cwd`-st ülespoole lähima Git tööpuu juure (`.git` kataloog või `.git`
+  fail worktree puhul), aga ainult allowlisti juure piires. Nii eristuvad `~/projects/a` ja
+  `~/projects/team/b` eraldi projektidena. Kui `cwd` on allowlisti juure all, aga Git tööpuud ei leita,
+  jäetakse see kirje vaikimisi vahele. **Käivita AI projektikaustast** (`cd projekt && pi/claude`), et
+  filtreerimine töötaks.
 - **Kaks faili.** Sisemine tunnipõhine algandmestik `~/.config/aitrack/hours.csv`
   (veerud `Kuupäev | Tund | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised | Tööriist | _key`)
   on **allikas** — dedup ja päevavaate renderdamine. Kasutaja kleebitav **päevavaade**
