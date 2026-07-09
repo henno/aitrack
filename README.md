@@ -65,6 +65,17 @@ kõik ühe vooluga:
 2. **Soovitab projekte** sinu logidest (valid linnukestega — ei pea teid trükkima).
 3. Seadistab tunniajasti, valikuliselt **päevase kokkuvõtte-teavituse**, ja teeb testi.
 
+Kui kasutad **keskserverit** (mitme kasutaja vaade), tee pärast tavalist paigaldust lisaks:
+
+```bash
+aitrack connect --url https://aitrack.example.com --token TOKEN
+aitrack add /tee/projektini
+aitrack install --minute-tracking --pi-extension
+```
+
+Pi sees tee seejärel `/reload` või ava uus Pi sessioon. `aitrack add` on oluline: globaalne Pi extension
+logib ainult lisatud projektides, mitte kõiki arvutis avatud repo'sid.
+
 > Juba seadistatud? Kõik on edaspidi käsuga **`aitrack <...>`** (lühivorm; ka `python3 aitrack.py <...>` töötab).
 
 ## Käsud
@@ -80,8 +91,8 @@ kõik ühe vooluga:
 | `aitrack work start/done/status/switch` | Serveripõhine work-session ajamõõtmine ühe projekti/issue all; mitu kasutajat/agentit võivad sama issue all paralleelselt töötada. |
 | `aitrack tick` | Saada kõigi aktiivsete work-session'ite jooksva minuti heartbeat serverisse. |
 | `https://SERVER/activity` | Serveri veebivaade work session'ite, prompt-eventide ja tegevuste vaatamiseks. |
-| `aitrack install --minute-tracking` | Lisa tavapärase tunniajasti kõrvale OS-i iga-minuti tick timer. |
-| `aitrack install --pi-extension` | Paigalda globaalne Pi extension, mis saadab prompt/tool-call raw evente enne ja pärast tööriistu. |
+| `aitrack install --minute-tracking` | Lisa tavapärase tunniajasti kõrvale OS-i iga-minuti tick timer aktiivsete work-session'ite heartbeat'iks. |
+| `aitrack install --pi-extension` | Paigalda globaalne Pi extension, mis saadab prompt/tool-call raw evente ja lühikokkuvõtteid. Logib ainult `aitrack add` projektides. |
 | `aitrack watchdog --stale-minutes N --stuck-minutes N` | Märgi progressita või liiga kaua tooli sees olevad sessioonid `stale`/`stuck` olekusse. |
 | `aitrack cleanup --older-than 90d [--apply]` | Retention cleanup: raw eventid ja rollupitud vanad minute tickid; vaikimisi dry-run. |
 | `aitrack events status/flush` | Lokaalse offline raw-event outboxi olek ja uuestisaatmine. |
@@ -175,6 +186,11 @@ aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser suunatakse vajadusel
 `/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.
 Tavakasutaja näeb enda work session'eid, prompt-evente ja tegevuste ajalugu; admin näeb kõiki kasutajaid.
+Activity vaates saab filtreerida projekti, kasutaja, issue, tööriista, agent'i ja staatuse järgi ning
+kuupäevakalendris valida ühe päeva või vahemiku (1. klikk algus, 2. klikk lõpp). Staatused:
+`active` = hiljutise progressiga töö, `stale` = üle 10 minuti progressita töö, `stuck` = üle 10 minuti
+pooleliolev tool-call.
+
 Admini kasutajavaade on `https://aitrack.example.com/admin`: seal saab kasutajaid lisada, paroole seada,
 web-sessioone tühistada ja turvaauditit vaadata. Loginid, ebaõnnestunud loginid, paroolimuudatused,
 admin-toimingud, rate-limit ban'id ja kahtlased probe'id lähevad `security_events` tabelisse.
@@ -195,9 +211,14 @@ Pi automaatjälgimiseks:
 
 ```bash
 aitrack connect --url https://aitrack.example.com --token TOKEN
+aitrack add /tee/projektini
 aitrack install --minute-tracking --pi-extension
 # Pi sees: /reload või ava uus pi session
 ```
+
+Pi extension saadab promptide alguse/lõpu, tool-call'id ja harnessi lühikokkuvõtted serverisse.
+Kui Pi kasutab `bash` tooli, proovib aitrack käsu põhjal kuvada päris tegevuse (`testid`, `ssh`,
+`docker compose`, `git`, `read`, `write` jne), mitte ainult `bash`.
 
 Arve jaoks server dokumenti ei tee, vaid annab export-andmed välisele arvegeneraatorile. Vana
 `/api/billing/invoice-lines` endpoint jääb ühilduvuseks alles, kuid vastuses on `deprecated: true`;
@@ -226,11 +247,45 @@ curl -H "X-Aitrack-Token: TOKEN" \
 | "Alustasin uut projekti" | `aitrack add ~/uus-projekt` |
 | "Arvuti oli paar tundi kinni" | `aitrack backfill --hours 4` |
 
+## Uue keskserveri kasutaja juhend
+
+1. **Logi veebis sisse.** Ava `https://aitrack.example.com/login`, sisesta kasutajanimi ja ajutine parool.
+   Mine `Kasutaja` lehele ja vaheta ajutine parool kohe ära.
+2. **Paigalda klient oma arvutisse.** Klooni/ava repo ja käivita `install.sh` või `install.ps1`.
+3. **Ühenda klient serveriga.** Admin annab kasutajale API tokeni turvalise kanali kaudu.
+
+   ```bash
+   aitrack connect --url https://aitrack.example.com --token TOKEN
+   ```
+
+4. **Lisa ainult need projektid, mida tohib jälgida.**
+
+   ```bash
+   aitrack add ~/Projects/pp-finar
+   aitrack list
+   ```
+
+   Pi extension on globaalne, aga aitrack saadab serverisse ainult `aitrack add` kaudu lisatud projektide tegevused.
+5. **Lülita Pi live-jälgimine sisse.**
+
+   ```bash
+   aitrack install --minute-tracking --pi-extension
+   ```
+
+   Pi sees tee `/reload` või ava uus Pi sessioon.
+6. **Issue sidumine.** Anna issue käsitsi `--issue 123` või kasuta branchi nime nagu
+   `fix/123-luhikirjeldus`; aitrack seob töö selle issue'ga automaatselt.
+7. **Vaata tulemusi.** Ava `https://aitrack.example.com/activity`. Filtrid rakenduvad kohe; kuupäevaga saab valida
+   ühe päeva või vahemiku.
+
+Ära pane paroole ega API token'eid README-sse, issue'sse, chatti ega commit'i. Ajutine parool on ainult esimeseks loginiks.
+
 ## Teisele inimesele jagamine
 1. Anna talle see kaust (zip / git).
 2. Tema jooksutab `install.sh` / `install.ps1` ja läbib `setup` nõustaja.
 3. Iga inimese andmed lähevad **tema enda** väljundisse (oma Sheet või oma fail) — privaatne.
    Kokkuvõtted teeb **tema enda** AI-CLI.
+4. Kui kasutate keskserverit, järgi ülal olevat "Uue keskserveri kasutaja juhendit".
 
 ## Ajavöönd
 - Linux/macOS tuvastab IANA-tsooni automaatselt (`/etc/localtime`).
