@@ -755,6 +755,7 @@ check("raw event sisestus on idempotentne", raw_res1["raw_events"]["inserted"] =
 check("raw event ei tekita legacy prompt-eventi", prompt_count == 0)
 check("raw export leiab sündmuse ja seob work_session_uid-ga", raw_export["count"] == 1 and exported_raw.get("work_session_uid") == rstart["work_session_uid"] and exported_raw.get("work_session_id") == rstart["work_session_id"])
 check("activity helper tagastab raw event timeline'i", len(raw_activity.get("raw_events", [])) == 1 and any(x.get("type") == "raw_event" for x in raw_activity.get("activity", [])))
+check("raw event activity tekst on inimloetav, mitte event_type", raw_activity.get("raw_events", [{}])[0].get("summary") == "Käivitasin tööriista read")
 check("activity filter otsib projekti ja kasutajat osalise tekstiga", len(raw_activity_filtered.get("raw_events", [])) == 1)
 check("activity issue filter oskab combobox labelit kasutada", len(raw_activity_issue_filtered.get("raw_events", [])) == 1)
 check("activity autocomplete valikud sisaldavad projekti, kasutajat ja issue pealkirja", any("parkkarl" in p.get("project_key", "") for p in raw_filter_options.get("projects", [])) and any(u.get("name") == "rawuser" for u in raw_filter_options.get("users", [])) and any(i.get("issue_key") == "662" and "Asendaja" in i.get("title", "") for i in raw_filter_options.get("issues", [])))

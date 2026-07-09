@@ -2891,7 +2891,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "payload_json": payload_preview,
             "payload_truncated": payload_truncated,
             "payload_bytes": payload_bytes,
-            "summary": payload_summary or r["event_type"],
+            "summary": _raw_event_display_summary(r["event_type"], r["tool_name"] or "", payload_summary),
         }
         raw_items.append(item)
         activity.append({**item, "at": r["occurred_at_utc"], "label": "raw_event"})
@@ -3558,6 +3558,40 @@ def _event_summary_text(e: dict, *, limit: int = 1000) -> str:
     if not summary and isinstance(payload, dict):
         summary = _event_text(payload, "summary", "done_summary", "change_summary", "changes", "result_summary")
     return _safe_day_prompt_snippet(summary, limit) if summary else ""
+
+
+def _raw_event_display_summary(event_type: str, tool_name: str = "", payload_summary: str = "") -> str:
+    """Activity vaate inimloetav tekst raw-eventile, mitte tehniline event_type."""
+    event = str(event_type or "").strip()
+    summary = _safe_day_prompt_snippet(payload_summary, 500).strip()
+    if summary and summary != event:
+        return summary
+    tool = str(tool_name or "").strip()
+    tool_part = f" {tool}" if tool else ""
+    mapping = {
+        "prompt_started": "Alustasin AI-prompti täitmist",
+        "prompt_finished": "Lõpetasin AI-prompti töö",
+        "agent_started": "AI-agent alustas tööülesannet",
+        "agent_finished": "AI-agent lõpetas tööülesande",
+        "agent_heartbeat": "Töö käis edasi",
+        "subagent_started": "Alam-agent alustas oma osa",
+        "subagent_finished": "Alam-agent lõpetas oma osa",
+        "turn_start": "Alustasin järgmist tööetappi",
+        "turn_end": "Lõpetasin tööetapi",
+        "before_tool_call": f"Käivitasin tööriista{tool_part}",
+        "after_tool_call": f"Kontrollisin tööriista{tool_part} tulemuse",
+        "tool_output": f"Tööriist{tool_part} andis väljundi",
+        "tool_error": f"Tööriist{tool_part} lõppes veaga",
+        "session_shutdown": "Lõpetasin AI sessiooni",
+        "session_stale": "Töö jäi lõpetamata, sest uut progressi ei tulnud",
+        "session_marked_stale": "Töö jäi lõpetamata, sest uut progressi ei tulnud",
+        "session_orphaned": "Tööprotsess kadus enne korrektset lõpetamist",
+        "session_marked_orphan": "Tööprotsess kadus enne korrektset lõpetamist",
+        "agent_marked_stuck": "Tööriist jäi liiga kauaks pooleli",
+        "subagent_stuck": "Alam-agent jäi liiga kauaks pooleli",
+        "agent_recovered": "AI-agent jätkas pärast tõrget",
+    }
+    return mapping.get(event, event.replace("_", " ") or "Sündmus salvestati")
 
 
 def _raw_event_occurred_at(e: dict, now: str) -> str:
