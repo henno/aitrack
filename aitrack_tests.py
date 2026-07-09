@@ -592,6 +592,12 @@ check("SSH ja HTTPS URL normaliseeruvad samaks",
       "github.com/puhastusproff/pp-finar")
 check("branchist leitakse issue number", A._issue_from_branch("fix/662-asendaja-puhadetasu") == "662")
 check("issue combobox labelist leitakse issue number", A._normalise_issue_key("662 - Asendaja pühadetasu") == "662")
+hook_allowed = CFG / "hook-allowed"
+hook_other = CFG / "hook-other"
+(hook_allowed / "sub").mkdir(parents=True, exist_ok=True)
+hook_other.mkdir(parents=True, exist_ok=True)
+A.save_projects([str(hook_allowed)])
+check("Pi hook logib ainult aitrack allowlistis oleva projekti", A._hook_project_tracked({"cwd": str(hook_allowed / "sub"), "local_path": str(hook_allowed)}) is True and A._hook_project_tracked({"cwd": str(hook_other), "local_path": str(hook_other)}) is False)
 
 # ============ TEST 43: 3NF work_session + invoice/practice vaated ============
 print("TEST 43: serveri normaliseeritud work_session'id toidavad arve- ja praktikavaadet")

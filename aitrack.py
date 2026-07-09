@@ -6030,9 +6030,22 @@ def _hook_owner_start(owner_pid) -> str:
     return _process_start_time(pid)
 
 
+def _hook_project_tracked(ctx: dict) -> bool:
+    """Automaatne Pi hook logib ainult aitrack allowlistis olevaid projekte."""
+    allow = load_projects()
+    if not allow:
+        return False
+    for candidate in (ctx.get("cwd"), ctx.get("local_path")):
+        if candidate and match_project(str(candidate), allow):
+            return True
+    return False
+
+
 def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tuple[dict | None, dict]:
     _require_server_cfg(cfg)
     ctx = _project_context(getattr(args, "cwd", None) or ".", getattr(args, "issue", None))
+    if not _hook_project_tracked(ctx):
+        return None, {**ctx, "_tracking_skipped": True, "_skip_reason": "project not in aitrack allowlist"}
     tool = _detect_cli(getattr(args, "tool", None) or "pi")
     active = _active_work_sessions(tool=tool, checkout_id=ctx["checkout_id"])
     if active:
@@ -6101,6 +6114,14 @@ def cmd_hook(args, cfg):
     action = args.hook_cmd
     start = action in {"prompt-start", "agent-start"}
     session, ctx = _hook_get_or_start_session(args, cfg, start_if_missing=start)
+    if ctx.get("_tracking_skipped"):
+        payload = {"ok": True, "skipped": True, "reason": ctx.get("_skip_reason", "tracking skipped"),
+                   "project_key": ctx.get("project_key", ""), "cwd": ctx.get("cwd", "")}
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"hook skipped: {payload['reason']} ({payload['project_key']})")
+        return
     event_map = {
         "prompt-start": "prompt_started",
         "agent-start": "agent_started",
