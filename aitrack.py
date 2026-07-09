@@ -80,9 +80,9 @@ SERVER_DB = CONFIG_DIR / "server.db"  # keskserveri SQLite andmebaas (aitrack se
 WEB_SESSION_COOKIE = "aitrack_session"
 WEB_SESSION_DAYS = 30
 RATE_WINDOW_SECONDS = 60
-# Tavakasutus ei tohi IP-banni anda. 600/min on piisav ka NAT-i taga mitme brauseri
-# ja CLI-kliendi jaoks; ületamisel throttlime lühidalt, mitte ei lukusta IP-d.
-RATE_MAX_REQUESTS = 600
+# Tavakasutus ei tohi IP-banni anda. Hoia limiit konservatiivne ja throttli lühidalt,
+# mitte ära lukusta IP-d.
+RATE_MAX_REQUESTS = 180
 # Agent/hook tracking may legitimately send many events/tool heartbeats in bursts.
 # Keep these out of the normal browser/API bucket and throttle without banning.
 RATE_MAX_AGENT_REQUESTS = 3000
