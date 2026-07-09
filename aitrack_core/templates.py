@@ -61,6 +61,7 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
   <section class="panel toolbar">
     <label>Kuupäev <input type="date" id="dateInput"></label>
     <select id="daySelect" title="Olemasolevad päevad"></select>
+    <label id="userSelectLabel" hidden>Kasutaja <select id="userSelect"></select></label>
     __TOKEN_CONTROL__
     <button onclick="loadDay()">Ava</button>
     <button onclick="addRow()">+ Lisa rida</button>
@@ -84,10 +85,14 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 <script>
 let currentDate = '';
 let days = [];
+let currentUserName = '';
+let selectedUserName = '';
 const $ = (id) => document.getElementById(id);
 const SERVER_MODE = __SERVER_MODE__;
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
 function authToken() { return $('tokenInput') ? $('tokenInput').value.trim() : ''; }
+function selectedUserParam() { return SERVER_MODE && $('userSelect') && $('userSelect').value ? $('userSelect').value : ''; }
+function userQueryParams() { const q = new URLSearchParams(); const u = selectedUserParam(); if (u) q.set('user', u); return q; }
 async function api(path, opts={}) {
   opts.headers = Object.assign({}, opts.headers || {});
   const tok = authToken();
@@ -153,12 +158,30 @@ async function init() {
     $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
     $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
   }
-  const data = await api('/api/days');
-  days = data.days;
-  currentDate = data.today;
-  $('dateInput').value = currentDate;
+  await initUserSelect();
+  await loadDays(false);
   renderDaySelect();
   await loadDay();
+}
+async function initUserSelect() {
+  if (!SERVER_MODE) return;
+  const me = await api('/api/me');
+  currentUserName = me.user ? me.user.name : '';
+  selectedUserName = currentUserName;
+  if (!me.user || me.user.role !== 'admin') return;
+  const data = await api('/api/activity/filters');
+  const users = data.users || [];
+  $('userSelect').innerHTML = users.map(u => `<option value="${escapeHtml(u.name || '')}">${escapeHtml(u.name || '')} (${escapeHtml(u.role || '')})</option>`).join('');
+  $('userSelect').value = currentUserName;
+  $('userSelectLabel').hidden = false;
+  $('userSelect').onchange = async () => { selectedUserName = $('userSelect').value; await loadDays(false); renderDaySelect(); await loadDay(); };
+}
+async function loadDays(resetToToday=false) {
+  const q = userQueryParams();
+  const data = await api('/api/days' + (q.toString() ? '?' + q.toString() : ''));
+  days = data.days || [];
+  if (resetToToday || !currentDate) currentDate = data.today;
+  $('dateInput').value = currentDate;
 }
 function renderDaySelect() {
   $('daySelect').innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
@@ -170,9 +193,11 @@ function renderDaySelect() {
 async function loadDay() {
   currentDate = $('dateInput').value || currentDate;
   setStatus('Laen…');
-  const data = await api('/api/day?date=' + encodeURIComponent(currentDate));
+  const q = userQueryParams();
+  q.set('date', currentDate);
+  const data = await api('/api/day?' + q.toString());
   renderRows(data.rows || []);
-  setStatus(`Avatud ${currentDate}`);
+  setStatus(`Avatud ${currentDate}${selectedUserParam() ? ' · ' + selectedUserParam() : ''}`);
 }
 function addRow() {
   const body = $('rowsBody');
@@ -184,7 +209,9 @@ async function saveDay(show=true) {
   currentDate = $('dateInput').value || currentDate;
   const rows = collectRows();
   setStatus('Salvestan…');
-  const data = await api('/api/day', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({date: currentDate, rows})});
+  const body = {date: currentDate, rows};
+  if (selectedUserParam()) body.user = selectedUserParam();
+  const data = await api('/api/day', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   renderRows(data.rows || []);
   if (!days.includes(currentDate)) { days.push(currentDate); days.sort(); renderDaySelect(); }
   if (show) setStatus('Salvestatud');
@@ -206,7 +233,10 @@ async function copyRich(html, text) {
 }
 async function copyDay(full) {
   await saveDay(false);
-  const data = await api('/api/copy?date=' + encodeURIComponent(currentDate) + '&full=' + (full ? '1' : '0'));
+  const q = userQueryParams();
+  q.set('date', currentDate);
+  q.set('full', full ? '1' : '0');
+  const data = await api('/api/copy?' + q.toString());
   await copyRich(data.html, data.text);
   setStatus(full ? 'Kopeeritud A–G. Kleebi Sheetsis A-lahtrisse.' : 'Kopeeritud D–G. Kleebi Sheetsis D-lahtrisse.');
 }

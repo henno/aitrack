@@ -669,6 +669,7 @@ check("activity kuupäevafilter toetab kalendri vahemikku", "datePicker" in acti
 server_start_page = A._start_page_html(server_mode=True)
 check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server token" not in server_start_page and "credentials:'same-origin'" in server_start_page and "const SERVER_MODE = true" in server_start_page)
 check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)
+check("serveri päevavaates saab admin kasutajat valida", "userSelect" in server_start_page and "/api/activity/filters" in server_start_page and "selectedUserParam" in server_start_page)
 account_page = A._account_page_html()
 check("kasutaja lehel saab parooli muuta", "/api/me/password" in account_page and "current-password" in account_page and "new-password" in account_page)
 check("kasutaja lehel on kolme OS-i installikäsk", "/api/install-code" in account_page and "install-client.sh" in account_page and "install-client.ps1" in account_page and "Linux" in account_page and "macOS" in account_page and "Windows" in account_page)
@@ -711,6 +712,14 @@ try:
 except PermissionError:
     install_reuse_failed = True
 check("installikood vahetub tokeniks ja on ühekordne", install_exchange.get("token") == ltok and install_reuse_failed is True)
+admin_tok = A._db_add_user(ldb, "admin2", "admin")
+target_tok = A._db_add_user(ldb, "targetuser")
+A._db_ingest_rows(ldb, target_tok, [["2026-06-16", "09:00–10:00", "target objekt", "target saavutus", "Ei olnud", "target teadmine", "Pi"]], ["k:target:1"])
+admin_target_rows = A._db_rows_for_day(ldb, admin_tok, "2026-06-16", None, {"user": ["targetuser"]})
+admin_target_days = A._db_days(ldb, admin_tok, {"user": ["targetuser"]})
+non_admin_rows = A._db_rows_for_day(ldb, target_tok, "2026-06-16", None, {"user": ["admin2"]})
+check("admin saab päevavaates teise kasutaja praktikat vaadata", admin_target_rows and admin_target_rows[0][2] == "target objekt" and "2026-06-16" in admin_target_days)
+check("tavakasutaja ei saa user parameetriga teise päevikut lugeda", non_admin_rows and non_admin_rows[0][2] == "target objekt")
 
 # ============ TEST 48: serveri rate-limit ja IP-ban abid ============
 print("TEST 48: rate limiter tuvastab kahtlased päringud ja login failure ban'i")

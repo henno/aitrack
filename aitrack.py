@@ -3532,30 +3532,55 @@ def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) ->
     return sorted(rows, key=lambda r: (r[1], r[7]))
 
 
-def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None) -> list[list]:
+def _db_target_user_for_query(conn: sqlite3.Connection, user: sqlite3.Row, q: dict | None) -> sqlite3.Row:
+    """Admin saab serveri päevavaates valida teise kasutaja; tavakasutaja näeb alati ennast."""
+    if user["role"] != "admin" or not q:
+        return user
+    target_id = _qval(q, "user_id")
+    target_name = _qval(q, "user") or _qval(q, "name")
+    if not target_id and not target_name:
+        return user
+    if target_id:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (int(target_id),)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM users WHERE name = ?", (target_name,)).fetchone()
+    if row is None:
+        raise ValueError("kasutajat ei leitud")
+    return row
+
+
+def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None, q: dict | None = None) -> list[list]:
     _db_init(path)
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
+        target_user = _db_target_user_for_query(conn, user, q)
         rows_db = conn.execute(
             "SELECT date, hour, objekt, saavutus, takistus, teadmine, tool, row_key "
             "FROM hour_rows WHERE user_id = ? AND date = ? ORDER BY hour, row_key",
-            (user["id"], date),
+            (target_user["id"], date),
         ).fetchall()
         rows = [[r["date"], r["hour"], r["objekt"], r["saavutus"], r["takistus"],
                  r["teadmine"], r["tool"], r["row_key"]] for r in rows_db]
-        derived_work = _db_work_session_day_rows(conn, user, date, rows, cfg)
+        derived_work = _db_work_session_day_rows(conn, target_user, date, rows, cfg)
         rows = _merge_day_rows_with_work_sessions(rows, derived_work)
-        derived_prompts = _db_prompt_event_day_rows(conn, user, date, rows, cfg)
+        derived_prompts = _db_prompt_event_day_rows(conn, target_user, date, rows, cfg)
     return _merge_day_rows_with_work_sessions(rows, derived_prompts)
 
 
-def _db_days(path: Path, token: str) -> list[str]:
+def _db_days(path: Path, token: str, q: dict | None = None) -> list[str]:
     _db_init(path)
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        rows = conn.execute("SELECT DISTINCT date FROM hour_rows WHERE user_id = ? ORDER BY date",
-                            (user["id"],)).fetchall()
-    return [r["date"] for r in rows]
+        target_user = _db_target_user_for_query(conn, user, q)
+        rows = conn.execute("""
+            SELECT DISTINCT date FROM hour_rows WHERE user_id = ?
+            UNION
+            SELECT DISTINCT substr(started_at, 1, 10) AS date FROM work_sessions WHERE user_id = ?
+            UNION
+            SELECT DISTINCT substr(started_at, 1, 10) AS date FROM prompt_events WHERE user_id = ?
+            ORDER BY date
+        """, (target_user["id"], target_user["id"], target_user["id"])).fetchall()
+    return [r["date"] for r in rows if r["date"]]
 
 
 def _db_keys(path: Path, token: str) -> set[str]:
@@ -3583,14 +3608,15 @@ def _db_ingest_rows(path: Path, token: str, rows: list[list], keys: list[str]) -
             )
 
 
-def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict]) -> None:
+def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict], q: dict | None = None) -> None:
     if not _valid_date(date):
         raise ValueError("vigane kuupäev")
     _db_init(path)
     now = _now_utc().isoformat()
     with _db_connect(path) as conn:
         user = _db_user_by_token(conn, token)
-        conn.execute("DELETE FROM hour_rows WHERE user_id = ? AND date = ?", (user["id"], date))
+        target_user = _db_target_user_for_query(conn, user, q)
+        conn.execute("DELETE FROM hour_rows WHERE user_id = ? AND date = ?", (target_user["id"], date))
         used: set[str] = set()
         for item in items:
             hour = str(item.get("hour", "")).strip() or "00:00–01:00"
@@ -3609,7 +3635,7 @@ def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict]) -
                 "INSERT INTO hour_rows "
                 "(user_id, date, hour, objekt, saavutus, takistus, teadmine, tool, row_key, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (user["id"], date, hour, _cell_safe(objekt), _cell_safe(saavutus or _NA),
+                (target_user["id"], date, hour, _cell_safe(objekt), _cell_safe(saavutus or _NA),
                  _cell_safe(takistus or _NA), _cell_safe(teadmine or _NA), _cell_safe(tool), key, now, now),
             )
 
@@ -5674,7 +5700,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/days":
                 today = _today_local_str(self.cfg)
                 if self._server_mode():
-                    days = sorted(set(_db_days(self._db_path(), self._token(q))) | {today})
+                    days = sorted(set(_db_days(self._db_path(), self._token(q), q)) | {today})
                 else:
                     days = sorted(set(_read_raw_days().keys()) | {today})
                 self._json({"ok": True, "today": today, "days": days})
@@ -5685,7 +5711,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": "vigane kuupäev"}, 400)
                     return
                 if self._server_mode():
-                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date, self.cfg)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date, self.cfg, q)
                     rows = [
                         {"key": r[7], "hour": r[1], "objekt": r[2], "saavutus": r[3],
                          "takistus": r[4], "teadmine": r[5], "tool": r[6]}
@@ -5702,7 +5728,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": "vigane kuupäev"}, 400)
                     return
                 if self._server_mode():
-                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date, self.cfg)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(q), date, self.cfg, q)
                     day = _day_row(date, db_rows) if db_rows else [date, 0, _weekday_letter(date), "", "", "", ""]
                     cols = slice(None) if full else slice(3, 7)
                     selected = day[cols]
@@ -5880,8 +5906,8 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 date = str(data.get("date") or _today_local_str(self.cfg))
                 rows = data.get("rows") if isinstance(data.get("rows"), list) else []
                 if self._server_mode():
-                    _db_replace_day_rows(self._db_path(), self._token(data=data), date, rows)
-                    db_rows = _db_rows_for_day(self._db_path(), self._token(data=data), date, self.cfg)
+                    _db_replace_day_rows(self._db_path(), self._token(data=data), date, rows, data)
+                    db_rows = _db_rows_for_day(self._db_path(), self._token(data=data), date, self.cfg, data)
                     ui_rows = [
                         {"key": r[7], "hour": r[1], "objekt": r[2], "saavutus": r[3],
                          "takistus": r[4], "teadmine": r[5], "tool": r[6]}
