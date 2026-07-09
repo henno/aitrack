@@ -664,6 +664,7 @@ check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
 check("activity leht sisaldab raw event timeline'i", "Raw eventid" in activity_page and "renderRawEvents" in activity_page and "raw_events" in activity_page)
 check("activity filtrid jõustuvad automaatselt ja status on nupud", "setSessionStatusFilter('active')" in activity_page and "scheduleActivityLoad" in activity_page and ">Ava</button>" not in activity_page)
+check("activity kuupäevafilter toetab kalendri vahemikku", "datePicker" in activity_page and "selectDateRangeDay" in activity_page and "params.set('from', dateRangeStart)" in activity_page and "params.set('to', dateRangeEnd)" in activity_page)
 server_start_page = A._start_page_html(server_mode=True)
 check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server token" not in server_start_page and "credentials:'same-origin'" in server_start_page and "const SERVER_MODE = true" in server_start_page)
 check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)

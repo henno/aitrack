@@ -461,6 +461,16 @@ button.icon { padding:4px 8px; border-radius:8px; color:var(--muted); }
 .filter-group { display:flex; gap:6px; align-items:center; }
 .filter-toggle { padding:7px 10px; border-radius:999px; color:var(--muted); }
 .filter-toggle.active { background:var(--accent); border-color:var(--accent); color:white; }
+.date-wrap { position:relative; }
+.date-picker { position:absolute; top:100%; left:0; z-index:20; width:310px; margin-top:6px; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:10px; box-shadow:0 18px 60px rgba(0,0,0,.35); }
+.date-picker[hidden] { display:none; }
+.date-picker-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+.date-weekdays, .date-days { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; }
+.date-weekdays span { text-align:center; color:var(--muted); font-size:12px; padding:3px 0; }
+.date-day { padding:7px 0; border-radius:9px; text-align:center; }
+.date-day.outside { color:var(--muted); opacity:.65; }
+.date-day.in-range { background:rgba(56,189,248,.16); }
+.date-day.selected { background:var(--accent); border-color:var(--accent); color:white; }
 input, select { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
 .small { color:var(--muted); font-size:13px; }
 .status { color:var(--muted); min-height:20px; }
@@ -496,7 +506,15 @@ body.modal-open { overflow:hidden; }
 </header>
 <main>
   <section class="panel toolbar">
-    <label>Kuupäev <input type="date" id="dateInput"></label>
+    <div class="date-wrap" id="dateWrap">
+      <label>Kuupäev <input id="dateInput" readonly placeholder="vali päev või vahemik" style="width:210px" autocomplete="off"></label>
+      <div id="datePicker" class="date-picker" hidden onclick="event.stopPropagation()">
+        <div class="date-picker-head"><button type="button" class="icon" onclick="moveCalendarMonth(-1)">‹</button><b id="datePickerTitle"></b><button type="button" class="icon" onclick="moveCalendarMonth(1)">›</button></div>
+        <div class="date-weekdays"><span>E</span><span>T</span><span>K</span><span>N</span><span>R</span><span>L</span><span>P</span></div>
+        <div id="datePickerDays" class="date-days"></div>
+        <div class="toolbar" style="margin-top:8px"><button type="button" class="icon" onclick="setTodayRange()">Täna</button><span class="small">1. klikk algus, 2. klikk lõpp</span></div>
+      </div>
+    </div>
     <label>Projekt <input id="projectInput" list="projectOptions" placeholder="otsi projekti" autocomplete="off"><datalist id="projectOptions"></datalist></label>
     <label>Kasutaja <input id="userInput" list="userOptions" placeholder="kasutajanimi" style="width:130px" autocomplete="off"><datalist id="userOptions"></datalist></label>
     <label>Issue <input id="issueInput" list="issueOptions" placeholder="issue nr / pealkiri" style="width:220px" autocomplete="off"><datalist id="issueOptions"></datalist></label>
@@ -552,6 +570,60 @@ async function api(path, opts={}) {
   }
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data;
+}
+let dateRangeStart = '';
+let dateRangeEnd = '';
+let calendarMonth = null;
+function pad2(n) { return String(n).padStart(2, '0'); }
+function localDateString(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+function parseDateString(s) { const [y, m, d] = String(s || '').split('-').map(Number); return new Date(y || 1970, (m || 1) - 1, d || 1); }
+function updateDateInput() {
+  $('dateInput').value = dateRangeStart && dateRangeEnd && dateRangeStart !== dateRangeEnd ? `${dateRangeStart} – ${dateRangeEnd}` : dateRangeStart;
+}
+function openDatePicker() {
+  calendarMonth = calendarMonth || parseDateString(dateRangeStart || localDateString(new Date()));
+  renderDatePicker();
+  $('datePicker').hidden = false;
+}
+function closeDatePicker() { $('datePicker').hidden = true; }
+function moveCalendarMonth(delta) {
+  calendarMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + delta, 1);
+  renderDatePicker();
+}
+function setTodayRange() {
+  dateRangeStart = localDateString(new Date());
+  dateRangeEnd = '';
+  calendarMonth = parseDateString(dateRangeStart);
+  updateDateInput(); renderDatePicker(); closeDatePicker(); scheduleActivityLoad(0);
+}
+function selectDateRangeDay(day) {
+  if (!dateRangeStart || dateRangeEnd) {
+    dateRangeStart = day; dateRangeEnd = '';
+  } else {
+    if (day < dateRangeStart) { dateRangeEnd = dateRangeStart; dateRangeStart = day; }
+    else { dateRangeEnd = day; }
+    closeDatePicker();
+  }
+  updateDateInput(); renderDatePicker(); scheduleActivityLoad(0);
+}
+function renderDatePicker() {
+  const month = calendarMonth || parseDateString(dateRangeStart || localDateString(new Date()));
+  calendarMonth = new Date(month.getFullYear(), month.getMonth(), 1);
+  $('datePickerTitle').textContent = calendarMonth.toLocaleDateString('et-EE', {month:'long', year:'numeric'});
+  const first = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1);
+  const startOffset = (first.getDay() + 6) % 7;
+  const gridStart = new Date(first); gridStart.setDate(first.getDate() - startOffset);
+  const days = [];
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(gridStart); d.setDate(gridStart.getDate() + i);
+    const value = localDateString(d);
+    const outside = d.getMonth() !== calendarMonth.getMonth();
+    const selected = value === dateRangeStart || value === dateRangeEnd;
+    const inRange = dateRangeStart && dateRangeEnd && value > dateRangeStart && value < dateRangeEnd;
+    const cls = ['date-day', outside ? 'outside' : '', selected ? 'selected' : '', inRange ? 'in-range' : ''].filter(Boolean).join(' ');
+    days.push(`<button type="button" class="${cls}" onclick="selectDateRangeDay('${value}')">${d.getDate()}</button>`);
+  }
+  $('datePickerDays').innerHTML = days.join('');
 }
 function renderIssueOptions(issues) {
   $('issueOptions').innerHTML = (issues || []).map(i => {
@@ -636,7 +708,8 @@ async function showDetail(type, id, sessionUid) {
     $('detailPre').textContent = e.message || 'Toorandmete laadimine ebaõnnestus';
   }
 }
-window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('detailModal').hidden) closeDetailModal(); });
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!$('detailModal').hidden) closeDetailModal(); closeDatePicker(); } });
+document.addEventListener('click', (e) => { if (!$('dateWrap').contains(e.target)) closeDatePicker(); });
 function renderMetrics(data) {
   const minutes = (data.sessions || []).reduce((a, s) => a + Number(s.minutes || 0), 0);
   $('metrics').innerHTML = `
@@ -707,7 +780,8 @@ function renderWaiting(message) {
 async function loadActivity() {
   clearTimeout(activityLoadTimer);
   const params = new URLSearchParams();
-  params.set('date', $('dateInput').value || '');
+  if (dateRangeStart && dateRangeEnd && dateRangeStart !== dateRangeEnd) { params.set('from', dateRangeStart); params.set('to', dateRangeEnd); }
+  else if (dateRangeStart) { params.set('date', dateRangeStart); }
   params.set('limit', $('limitInput').value || '200');
   if ($('projectInput').value) params.set('project_key', $('projectInput').value);
   if ($('userInput').value) params.set('user', $('userInput').value);
@@ -730,8 +804,12 @@ async function logout() {
   location.href = '/login?next=/activity';
 }
 async function init() {
-  $('dateInput').value = new Date().toISOString().slice(0, 10);
-  $('dateInput').addEventListener('change', () => scheduleActivityLoad(0));
+  dateRangeStart = localDateString(new Date());
+  dateRangeEnd = '';
+  calendarMonth = parseDateString(dateRangeStart);
+  updateDateInput();
+  $('dateInput').addEventListener('click', (e) => { e.stopPropagation(); openDatePicker(); });
+  $('dateInput').addEventListener('focus', openDatePicker);
   $('projectInput').addEventListener('input', () => { scheduleIssueOptions(); scheduleActivityLoad(); });
   $('projectInput').addEventListener('change', () => { loadIssueOptions(); scheduleActivityLoad(0); });
   for (const id of ['userInput', 'issueInput', 'toolInput', 'agentInput', 'limitInput']) {
