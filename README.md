@@ -65,7 +65,11 @@ kõik ühe vooluga:
 2. **Soovitab projekte** sinu logidest (valid linnukestega — ei pea teid trükkima).
 3. Seadistab tunniajasti, valikuliselt **päevase kokkuvõtte-teavituse**, ja teeb testi.
 
-Kui kasutad **keskserverit** (mitme kasutaja vaade), tee pärast tavalist paigaldust lisaks:
+Kui kasutad **keskserverit** (mitme kasutaja vaade), ava veebis `Kasutaja → Installi aitrack arvutisse`.
+Leht loob ühekordse 15-minutilise installikoodi ja annab ühe käsu Linuxile, macOS-ile või Windowsile.
+See käsk kloonib GitHubi repo, ühendab kliendi serveriga ning paigaldab minute-trackingu ja Pi extensioni.
+
+Käsitsi sama töövoog on:
 
 ```bash
 aitrack connect --url https://aitrack.example.com --token TOKEN
@@ -251,14 +255,10 @@ curl -H "X-Aitrack-Token: TOKEN" \
 
 1. **Logi veebis sisse.** Ava `https://aitrack.example.com/login`, sisesta kasutajanimi ja ajutine parool.
    Mine `Kasutaja` lehele ja vaheta ajutine parool kohe ära.
-2. **Paigalda klient oma arvutisse.** Klooni/ava repo ja käivita `install.sh` või `install.ps1`.
-3. **Ühenda klient serveriga.** Admin annab kasutajale API tokeni turvalise kanali kaudu.
-
-   ```bash
-   aitrack connect --url https://aitrack.example.com --token TOKEN
-   ```
-
-4. **Lisa ainult need projektid, mida tohib jälgida.**
+2. **Installi klient ühe käsuga.** Ava `Kasutaja → Installi aitrack arvutisse`, vali oma OS ja kopeeri käsk terminali.
+   Installikood on ühekordne ja aegub 15 minutiga. Skript kloonib repo, teeb `aitrack connect`, küsib projekti tee ning
+   paigaldab `--minute-tracking --pi-extension`.
+3. **Lisa ainult need projektid, mida tohib jälgida.** Kui jätsid installi ajal projekti lisamata, tee hiljem:
 
    ```bash
    aitrack add ~/Projects/pp-finar
@@ -266,16 +266,10 @@ curl -H "X-Aitrack-Token: TOKEN" \
    ```
 
    Pi extension on globaalne, aga aitrack saadab serverisse ainult `aitrack add` kaudu lisatud projektide tegevused.
-5. **Lülita Pi live-jälgimine sisse.**
-
-   ```bash
-   aitrack install --minute-tracking --pi-extension
-   ```
-
-   Pi sees tee `/reload` või ava uus Pi sessioon.
-6. **Issue sidumine.** Anna issue käsitsi `--issue 123` või kasuta branchi nime nagu
+4. **Pi reload.** Pi sees tee `/reload` või ava uus Pi sessioon.
+5. **Issue sidumine.** Anna issue käsitsi `--issue 123` või kasuta branchi nime nagu
    `fix/123-luhikirjeldus`; aitrack seob töö selle issue'ga automaatselt.
-7. **Vaata tulemusi.** Ava `https://aitrack.example.com/activity`. Filtrid rakenduvad kohe; kuupäevaga saab valida
+6. **Vaata tulemusi.** Ava `https://aitrack.example.com/activity`. Filtrid rakenduvad kohe; kuupäevaga saab valida
    ühe päeva või vahemiku.
 
 Ära pane paroole ega API token'eid README-sse, issue'sse, chatti ega commit'i. Ajutine parool on ainult esimeseks loginiks.

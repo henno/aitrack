@@ -88,6 +88,8 @@ RAW_EVENT_STRING_MAX_CHARS = 4000
 RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "authorization", "cookie"}
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
+INSTALL_CODE_TTL_MINUTES = 15
+AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -1515,6 +1517,16 @@ def _db_init(path: Path) -> None:
           expires_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON web_sessions(user_id, expires_at);
+        CREATE TABLE IF NOT EXISTS install_codes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          code_hash TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          used_at TEXT,
+          used_ip TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS install_codes_user_idx ON install_codes(user_id, expires_at);
         CREATE TABLE IF NOT EXISTS security_events (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -1859,6 +1871,60 @@ def _db_destroy_session(path: Path, session_token: str) -> None:
     _db_init(path)
     with _db_connect(path) as conn:
         conn.execute("DELETE FROM web_sessions WHERE session_hash = ?", (_session_hash(session_token),))
+
+
+def _install_code_hash(code: str) -> str:
+    return hashlib.sha256(str(code or "").encode("utf-8")).hexdigest()
+
+
+def _new_install_code() -> str:
+    # URL-safe ja piisavalt pikk, et brute force pole praktiline; kuvatakse ainult ühekordses installikäsus.
+    return secrets.token_urlsafe(18)
+
+
+def _db_create_install_code(path: Path, token: str, *, ip: str = "", req_path: str = "") -> dict:
+    """Loo sisselogitud kasutajale lühiajaline ühekordne installikood."""
+    _db_init(path)
+    now_dt = _now_utc()
+    now = now_dt.isoformat()
+    expires = (now_dt + dt.timedelta(minutes=INSTALL_CODE_TTL_MINUTES)).isoformat()
+    code = _new_install_code()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        conn.execute("DELETE FROM install_codes WHERE expires_at <= ? OR (used_at IS NOT NULL AND used_at <= ?)", (now, now))
+        conn.execute(
+            "INSERT INTO install_codes(code_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (_install_code_hash(code), int(user["id"]), now, expires),
+        )
+        _db_record_security_event_conn(conn, int(user["id"]), "install_code_created", ip=ip, path=req_path,
+                                       success=True, detail=f"expires_at={expires}", created_at=now)
+    return {"ok": True, "code": code, "expires_at": expires, "ttl_minutes": INSTALL_CODE_TTL_MINUTES}
+
+
+def _db_exchange_install_code(path: Path, code: str, *, ip: str = "", req_path: str = "") -> dict:
+    """Vaheta ühekordne installikood kasutaja API tokeni vastu ja märgi kood kasutatuks."""
+    _db_init(path)
+    code = str(code or "").strip()
+    if not code:
+        raise PermissionError("installikood puudub")
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        row = conn.execute("""
+            SELECT c.id AS code_id, u.id AS user_id, u.name, u.role, u.token
+            FROM install_codes c JOIN users u ON u.id = c.user_id
+            WHERE c.code_hash = ? AND c.used_at IS NULL AND c.expires_at > ?
+        """, (_install_code_hash(code), now)).fetchone()
+        if row is None:
+            _db_record_security_event_conn(conn, None, "install_code_exchange_failed", ip=ip, path=req_path,
+                                           detail="invalid or expired code", created_at=now)
+            raise PermissionError("installikood on vale või aegunud")
+        cur = conn.execute("UPDATE install_codes SET used_at = ?, used_ip = ? WHERE id = ? AND used_at IS NULL",
+                           (now, ip, int(row["code_id"])))
+        if cur.rowcount != 1:
+            raise PermissionError("installikood on juba kasutatud")
+        _db_record_security_event_conn(conn, int(row["user_id"]), "install_code_exchanged", ip=ip, path=req_path,
+                                       success=True, detail="client install", created_at=now)
+        return {"ok": True, "token": row["token"], "user": {"id": int(row["user_id"]), "name": row["name"], "role": row["role"]}}
 
 
 def _db_admin_users(path: Path, token: str) -> dict:
@@ -5386,6 +5452,22 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _text(self, text: str, *, content_type: str = "text/plain; charset=utf-8", status: int = 200) -> None:
+        data = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _request_base_url(self) -> str:
+        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").strip()
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip()
+        if not proto:
+            proto = "http" if host.startswith(("127.0.0.1", "localhost")) else "https"
+        return f"{proto}://{host}".rstrip("/") if host else ""
+
     def _redirect(self, location: str, status: int = 302) -> None:
         self.send_response(status)
         self.send_header("Location", location)
@@ -5583,6 +5665,12 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 self.send_response(204)
                 self.end_headers()
                 return
+            if u.path == "/install-client.sh" and self._server_mode():
+                self._text(_install_client_sh(self._request_base_url()), content_type="text/x-shellscript; charset=utf-8")
+                return
+            if u.path == "/install-client.ps1" and self._server_mode():
+                self._text(_install_client_ps1(self._request_base_url()), content_type="text/plain; charset=utf-8")
+                return
             if u.path == "/api/days":
                 today = _today_local_str(self.cfg)
                 if self._server_mode():
@@ -5726,6 +5814,14 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     _db_record_security_event(self._db_path(), int(user["id"]), "password_change_failed",
                                               ip=self._client_ip(), req_path=u.path, detail=str(e))
                     self._json({"ok": False, "error": str(e)}, 400)
+                return
+            if u.path == "/api/install-code" and self._server_mode():
+                self._json(_db_create_install_code(self._db_path(), self._token(data=data), ip=self._client_ip(), req_path=u.path))
+                return
+            if u.path == "/api/install-code/exchange" and self._server_mode():
+                body = _db_exchange_install_code(self._db_path(), str(data.get("code") or ""), ip=self._client_ip(), req_path=u.path)
+                body["server_url"] = self._request_base_url()
+                self._json(body)
                 return
             if u.path == "/api/admin/users" and self._server_mode():
                 self._json(_db_admin_add_user(self._db_path(), self._token(data=data), data))
@@ -6371,6 +6467,180 @@ def cmd_init(args, cfg):
     print("  1. aitrack test-sink           # kontrolli Sheetsi ühendust")
     print("  2. aitrack add <projekti-tee>  # lisa jälgitav projekt")
     print("  3. aitrack install             # seadista tunniajasti")
+
+
+def _install_client_sh(base_url: str) -> str:
+    server_url = str(base_url or "").rstrip("/")
+    repo_url = AITRACK_REPO_URL
+    return f'''#!/usr/bin/env bash
+set -euo pipefail
+SERVER_URL="{server_url}"
+REPO_URL="{repo_url}"
+INSTALL_DIR="${{AITRACK_INSTALL_DIR:-$HOME/.local/share/aitrack}}"
+CODE=""
+PROJECT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --code) CODE="${{2:-}}"; shift 2 ;;
+    --project) PROJECT="${{2:-}}"; shift 2 ;;
+    --dir) INSTALL_DIR="${{2:-}}"; shift 2 ;;
+    -h|--help) echo "Kasutus: bash <(curl -fsSL $SERVER_URL/install-client.sh) --code KOOD [--project /tee/projektini]"; exit 0 ;;
+    *) echo "Tundmatu argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$CODE" ]]; then
+  echo "VIGA: --code puudub. Loo kood aitrack veebis: Kasutaja → Installi arvutisse." >&2
+  exit 2
+fi
+if ! command -v git >/dev/null 2>&1; then echo "VIGA: git puudub. Paigalda git ja proovi uuesti." >&2; exit 1; fi
+PY=""
+for c in python3 python; do if command -v "$c" >/dev/null 2>&1; then PY="$(command -v "$c")"; break; fi; done
+if [[ -z "$PY" ]]; then echo "VIGA: Python 3.9+ puudub." >&2; exit 1; fi
+"$PY" - <<'PY' >/dev/null
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
+PY
+if [[ $? -ne 0 ]]; then echo "VIGA: vajalik on Python 3.9 või uuem." >&2; exit 1; fi
+
+echo "==> Vahetan installikoodi tokeniks"
+TOKEN="$($PY - "$SERVER_URL" "$CODE" <<'PY'
+import json, sys, urllib.request, urllib.error
+server, code = sys.argv[1].rstrip('/'), sys.argv[2]
+body = json.dumps({{"code": code}}).encode('utf-8')
+req = urllib.request.Request(server + '/api/install-code/exchange', data=body, headers={{'Content-Type': 'application/json', 'User-Agent': 'aitrack-install'}})
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode('utf-8'))
+except urllib.error.HTTPError as e:
+    try:
+        data = json.loads(e.read().decode('utf-8'))
+    except Exception:
+        data = {{'error': str(e)}}
+if not data.get('ok') or not data.get('token'):
+    print(data.get('error') or 'installikoodi vahetamine ebaõnnestus', file=sys.stderr)
+    raise SystemExit(1)
+print(data['token'])
+PY
+)"
+
+mkdir -p "$(dirname "$INSTALL_DIR")"
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+  echo "==> Uuendan olemasolevat repo: $INSTALL_DIR"
+  git -C "$INSTALL_DIR" pull --ff-only
+elif [[ -e "$INSTALL_DIR" ]]; then
+  echo "VIGA: $INSTALL_DIR on olemas, aga ei ole git repo. Vali teine --dir või eemalda kaust." >&2
+  exit 1
+else
+  echo "==> Laen aitrack repo: $INSTALL_DIR"
+  git clone "$REPO_URL" "$INSTALL_DIR"
+fi
+chmod +x "$INSTALL_DIR/aitrack.py" || true
+mkdir -p "$HOME/.local/bin"
+ln -sf "$INSTALL_DIR/aitrack.py" "$HOME/.local/bin/aitrack"
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "NB! Lisa PATH-i: export PATH=\"$HOME/.local/bin:$PATH\"" ;; esac
+
+echo "==> Ühendan kliendi serveriga"
+"$PY" "$INSTALL_DIR/aitrack.py" connect --url "$SERVER_URL" --token "$TOKEN"
+
+if [[ -z "$PROJECT" && -t 0 ]]; then
+  read -r -p "Jälgitava projekti tee (Enter jätab vahele): " PROJECT || true
+fi
+if [[ -n "$PROJECT" ]]; then
+  echo "==> Lisan projekti: $PROJECT"
+  "$PY" "$INSTALL_DIR/aitrack.py" add "$PROJECT"
+else
+  echo "NB! Projekti saad hiljem lisada: aitrack add /tee/projektini"
+fi
+
+echo "==> Paigaldan minute-trackingu ja Pi extensioni"
+"$PY" "$INSTALL_DIR/aitrack.py" install --minute-tracking --pi-extension
+
+echo ""
+echo "✓ aitrack on paigaldatud. Pi sees tee /reload või ava uus Pi sessioon."
+'''
+
+
+def _install_client_ps1(base_url: str) -> str:
+    server_url = str(base_url or "").rstrip("/")
+    repo_url = AITRACK_REPO_URL
+    return f'''function Install-AitrackClient {{
+  param(
+    [Parameter(Mandatory=$true)][string]$Code,
+    [string]$Project = "",
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "aitrack")
+  )
+  $ErrorActionPreference = "Stop"
+  $ServerUrl = "{server_url}"
+  $RepoUrl = "{repo_url}"
+
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {{ throw "git puudub. Paigalda Git ja proovi uuesti." }}
+  $PyCmd = Get-Command py -ErrorAction SilentlyContinue
+  $UsePyLauncher = $true
+  if (-not $PyCmd) {{ $PyCmd = Get-Command python -ErrorAction SilentlyContinue; $UsePyLauncher = $false }}
+  if (-not $PyCmd) {{ throw "Python 3.9+ puudub. Paigalda Python ja märgi 'Add Python to PATH'." }}
+  $Py = $PyCmd.Source
+  function Invoke-Python([string[]]$Args) {{
+    if ($UsePyLauncher) {{ & $Py -3 @Args }} else {{ & $Py @Args }}
+    if ($LASTEXITCODE -ne 0) {{ throw "Pythoni käsk ebaõnnestus" }}
+  }}
+  function Invoke-Aitrack([string[]]$Args) {{
+    $script = Join-Path $InstallDir "aitrack.py"
+    if ($UsePyLauncher) {{ & $Py -3 $script @Args }} else {{ & $Py $script @Args }}
+    if ($LASTEXITCODE -ne 0) {{ throw "aitrack käsk ebaõnnestus: $($Args -join ' ')" }}
+  }}
+
+  Write-Host "==> Vahetan installikoodi tokeniks"
+  $resp = Invoke-RestMethod -Method Post -Uri ($ServerUrl + "/api/install-code/exchange") -ContentType "application/json" -Body (@{{code=$Code}} | ConvertTo-Json -Compress)
+  if (-not $resp.ok -or -not $resp.token) {{
+    if ($resp.error) {{ throw $resp.error }}
+    throw "installikoodi vahetamine ebaõnnestus"
+  }}
+  $Token = [string]$resp.token
+
+  if (Test-Path (Join-Path $InstallDir ".git")) {{
+    Write-Host "==> Uuendan olemasolevat repo: $InstallDir"
+    git -C $InstallDir pull --ff-only
+    if ($LASTEXITCODE -ne 0) {{ throw "git pull ebaõnnestus" }}
+  }} elseif (Test-Path $InstallDir) {{
+    throw "$InstallDir on olemas, aga ei ole git repo. Vali teine -InstallDir või eemalda kaust."
+  }} else {{
+    Write-Host "==> Laen aitrack repo: $InstallDir"
+    git clone $RepoUrl $InstallDir
+    if ($LASTEXITCODE -ne 0) {{ throw "git clone ebaõnnestus" }}
+  }}
+
+  $BinDir = Join-Path $env:LOCALAPPDATA "Microsoft\\WindowsApps"
+  if (-not (Test-Path $BinDir)) {{ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null }}
+  $Shim = Join-Path $BinDir "aitrack.cmd"
+  $Script = Join-Path $InstallDir "aitrack.py"
+  if ($UsePyLauncher) {{
+    Set-Content -Path $Shim -Encoding ASCII -Value "@echo off`r`n`"$Py`" -3 `"$Script`" %*"
+  }} else {{
+    Set-Content -Path $Shim -Encoding ASCII -Value "@echo off`r`n`"$Py`" `"$Script`" %*"
+  }}
+  Write-Host "==> Loodud käsk: $Shim"
+
+  Write-Host "==> Ühendan kliendi serveriga"
+  Invoke-Aitrack @("connect", "--url", $ServerUrl, "--token", $Token)
+
+  if (-not $Project -and [Environment]::UserInteractive) {{
+    $Project = Read-Host "Jälgitava projekti tee (Enter jätab vahele)"
+  }}
+  if ($Project) {{
+    Write-Host "==> Lisan projekti: $Project"
+    Invoke-Aitrack @("add", $Project)
+  }} else {{
+    Write-Host "NB! Projekti saad hiljem lisada: aitrack add C:\\tee\\projektini"
+  }}
+
+  Write-Host "==> Paigaldan minute-trackingu ja Pi extensioni"
+  Invoke-Aitrack @("install", "--minute-tracking", "--pi-extension")
+  Write-Host ""
+  Write-Host "✓ aitrack on paigaldatud. Pi sees tee /reload või ava uus Pi sessioon."
+}}
+'''
 
 
 def _pi_extension_text() -> str:

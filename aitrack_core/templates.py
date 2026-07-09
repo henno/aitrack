@@ -329,6 +329,8 @@ input { width:min(420px,100%); background:transparent; color:var(--text); border
 .bad { color:var(--bad); }
 .ok { color:var(--ok); }
 .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-size:12px; }
+pre.install-command { white-space:pre-wrap; word-break:break-word; border:1px solid var(--line); border-radius:12px; padding:10px; background:rgba(148,163,184,.08); user-select:all; }
+.tabs button.active { background:var(--accent); color:white; border-color:var(--accent); }
 </style>
 </head>
 <body>
@@ -350,6 +352,21 @@ input { width:min(420px,100%); background:transparent; color:var(--text); border
     </form>
     <div id="status" class="status"></div>
   </section>
+  <section class="panel">
+    <h2>Installi aitrack arvutisse</h2>
+    <p class="small">Loo ühekordne installikood ja kopeeri üks käsk terminali. Käsk laeb GitHubist repo, ühendab kliendi serveriga ning paigaldab minute-trackingu ja Pi extensioni.</p>
+    <div class="toolbar"><button class="primary" onclick="createInstallCode()">Loo installikäsk</button><span id="installStatus" class="status"></span></div>
+    <div id="installBox" hidden>
+      <div class="toolbar tabs" style="margin-top:12px">
+        <button id="installTabLinux" onclick="showInstallCommand('linux')">Linux</button>
+        <button id="installTabMac" onclick="showInstallCommand('mac')">macOS</button>
+        <button id="installTabWindows" onclick="showInstallCommand('windows')">Windows</button>
+      </div>
+      <pre id="installCommand" class="install-command"></pre>
+      <div class="toolbar"><button onclick="copyInstallCommand()">Kopeeri käsk</button><span class="small" id="installExpires"></span></div>
+      <p class="small">Pärast paigaldust tee Pi sees <code>/reload</code>. Projekti küsib installiskript ise või saad hiljem teha <code>aitrack add /tee/projektini</code>.</p>
+    </div>
+  </section>
   <section class="panel small">
     Tulevikus saab siia lisada kasutaja eelistused, teavitused ja muud seaded.
   </section>
@@ -367,6 +384,39 @@ async function api(path, opts={}) {
   }
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data;
+}
+let installCommands = {};
+let selectedInstallOs = 'linux';
+function setInstallStatus(msg, cls='') { $('installStatus').className = 'status ' + cls; $('installStatus').textContent = msg; }
+function psQuote(s) { return String(s).replace(/'/g, "''"); }
+function showInstallCommand(os) {
+  selectedInstallOs = os;
+  $('installCommand').textContent = installCommands[os] || '';
+  for (const name of ['Linux', 'Mac', 'Windows']) $('installTab' + name).classList.toggle('active', os.toLowerCase().startsWith(name.toLowerCase().slice(0, 3)) || (os === 'mac' && name === 'Mac'));
+}
+async function createInstallCode() {
+  setInstallStatus('Loon koodi…');
+  try {
+    const data = await api('/api/install-code', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const base = location.origin;
+    const code = data.code;
+    installCommands = {
+      linux: `bash <(curl -fsSL ${base}/install-client.sh) --code ${code}`,
+      mac: `bash <(curl -fsSL ${base}/install-client.sh) --code ${code}`,
+      windows: `powershell -ExecutionPolicy Bypass -Command "iex (iwr -UseBasicParsing '${base}/install-client.ps1').Content; Install-AitrackClient -Code '${psQuote(code)}'"`,
+    };
+    $('installBox').hidden = false;
+    $('installExpires').textContent = data.expires_at ? 'Kehtib kuni ' + new Date(data.expires_at).toLocaleString() : '';
+    showInstallCommand(/win/i.test(navigator.platform) ? 'windows' : /mac/i.test(navigator.platform) ? 'mac' : 'linux');
+    setInstallStatus('Installikäsk valmis', 'ok');
+  } catch (err) {
+    setInstallStatus(err.message || 'Installikoodi loomine ebaõnnestus', 'bad');
+  }
+}
+async function copyInstallCommand() {
+  const text = $('installCommand').textContent;
+  try { await navigator.clipboard.writeText(text); setInstallStatus('Kopeeritud', 'ok'); }
+  catch (_) { setInstallStatus('Kopeeri käsitsi käsukastist', 'bad'); }
 }
 $('passwordForm').addEventListener('submit', async (e) => {
   e.preventDefault();

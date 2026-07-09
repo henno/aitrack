@@ -671,6 +671,8 @@ check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server to
 check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)
 account_page = A._account_page_html()
 check("kasutaja lehel saab parooli muuta", "/api/me/password" in account_page and "current-password" in account_page and "new-password" in account_page)
+check("kasutaja lehel on kolme OS-i installikäsk", "/api/install-code" in account_page and "install-client.sh" in account_page and "install-client.ps1" in account_page and "Linux" in account_page and "macOS" in account_page and "Windows" in account_page)
+check("installiskriptid ühendavad serveriga ja paigaldavad Pi extensioni", "install --minute-tracking --pi-extension" in A._install_client_sh("https://aitrack.example.com") and "Install-AitrackClient" in A._install_client_ps1("https://aitrack.example.com"))
 check("login leht postitab /api/login endpointi", "/api/login" in A._login_page_html() and "password" in A._login_page_html())
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
 
@@ -701,6 +703,14 @@ except PermissionError:
     wrong_change = True
 check("kasutaja saab praeguse parooliga parooli muuta", change.get("ok") is True and login2.get("ok") is True)
 check("vana parooliga muutmine enam ei õnnestu", wrong_change is True)
+install_code = A._db_create_install_code(ldb, ltok, ip="127.0.0.1", req_path="/api/install-code")
+install_exchange = A._db_exchange_install_code(ldb, install_code["code"], ip="127.0.0.1", req_path="/api/install-code/exchange")
+install_reuse_failed = False
+try:
+    A._db_exchange_install_code(ldb, install_code["code"], ip="127.0.0.1", req_path="/api/install-code/exchange")
+except PermissionError:
+    install_reuse_failed = True
+check("installikood vahetub tokeniks ja on ühekordne", install_exchange.get("token") == ltok and install_reuse_failed is True)
 
 # ============ TEST 48: serveri rate-limit ja IP-ban abid ============
 print("TEST 48: rate limiter tuvastab kahtlased päringud ja login failure ban'i")
