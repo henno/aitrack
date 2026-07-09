@@ -431,8 +431,8 @@ async function createInstallCode() {
     const base = location.origin;
     const code = data.code;
     installCommands = {
-      linux: `bash <(curl -fsSL ${base}/install-client.sh) --code ${code}`,
-      mac: `bash <(curl -fsSL ${base}/install-client.sh) --code ${code}`,
+      linux: `curl -fsSL ${base}/install-client.sh | bash -s -- --code ${code}`,
+      mac: `curl -fsSL ${base}/install-client.sh | bash -s -- --code ${code}`,
       windows: `powershell -ExecutionPolicy Bypass -Command "iex (iwr -UseBasicParsing '${base}/install-client.ps1').Content; Install-AitrackClient -Code '${psQuote(code)}'"`,
     };
     $('installBox').hidden = false;

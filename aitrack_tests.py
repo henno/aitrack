@@ -673,6 +673,7 @@ check("serveri päevavaates saab admin kasutajat valida", "userSelect" in server
 account_page = A._account_page_html()
 check("kasutaja lehel saab parooli muuta", "/api/me/password" in account_page and "current-password" in account_page and "new-password" in account_page)
 check("kasutaja lehel on kolme OS-i installikäsk", "/api/install-code" in account_page and "install-client.sh" in account_page and "install-client.ps1" in account_page and "Linux" in account_page and "macOS" in account_page and "Windows" in account_page)
+check("Linux/macOS installikäsk sobib ka fish shellile", "bash <(" not in account_page and "| bash -s -- --code" in account_page)
 check("installiskriptid ühendavad serveriga ja paigaldavad Pi extensioni", "install --minute-tracking --pi-extension" in A._install_client_sh("https://aitrack.example.com") and "Install-AitrackClient" in A._install_client_ps1("https://aitrack.example.com"))
 check("login leht postitab /api/login endpointi", "/api/login" in A._login_page_html() and "password" in A._login_page_html())
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)

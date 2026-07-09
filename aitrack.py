@@ -6511,7 +6511,7 @@ while [[ $# -gt 0 ]]; do
     --code) CODE="${{2:-}}"; shift 2 ;;
     --project) PROJECT="${{2:-}}"; shift 2 ;;
     --dir) INSTALL_DIR="${{2:-}}"; shift 2 ;;
-    -h|--help) echo "Kasutus: bash <(curl -fsSL $SERVER_URL/install-client.sh) --code KOOD [--project /tee/projektini]"; exit 0 ;;
+    -h|--help) echo "Kasutus: curl -fsSL $SERVER_URL/install-client.sh | bash -s -- --code KOOD [--project /tee/projektini]"; exit 0 ;;
     *) echo "Tundmatu argument: $1" >&2; exit 2 ;;
   esac
 done
