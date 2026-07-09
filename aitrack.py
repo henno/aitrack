@@ -2785,6 +2785,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         raw_rows = conn.execute(f"""
             SELECT re.*, u.name AS user_name, ws.session_uid AS linked_session_uid,
                    ws.local_path AS session_local_path, ws.cwd AS session_cwd,
+                   ws.summary AS session_summary, wi.title AS work_title,
                    p.project_key, p.name AS project_name, i.issue_key
             FROM raw_events re
             JOIN users u ON u.id = re.user_id
@@ -2891,7 +2892,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "payload_json": payload_preview,
             "payload_truncated": payload_truncated,
             "payload_bytes": payload_bytes,
-            "summary": _raw_event_display_summary(r["event_type"], r["tool_name"] or "", payload_summary),
+            "summary": _raw_event_display_summary(r["event_type"], r["tool_name"] or "", payload_summary, r["session_summary"] or r["work_title"] or ""),
         }
         raw_items.append(item)
         activity.append({**item, "at": r["occurred_at_utc"], "label": "raw_event"})
@@ -3560,10 +3561,12 @@ def _event_summary_text(e: dict, *, limit: int = 1000) -> str:
     return _safe_day_prompt_snippet(summary, limit) if summary else ""
 
 
-def _raw_event_display_summary(event_type: str, tool_name: str = "", payload_summary: str = "") -> str:
+def _raw_event_display_summary(event_type: str, tool_name: str = "", payload_summary: str = "", session_summary: str = "") -> str:
     """Activity vaate inimloetav tekst raw-eventile, mitte tehniline event_type."""
     event = str(event_type or "").strip()
     summary = _safe_day_prompt_snippet(payload_summary, 500).strip()
+    if not summary:
+        summary = _safe_day_prompt_snippet(session_summary, 500).strip()
     if summary and summary != event:
         return summary
     tool = str(tool_name or "").strip()
@@ -6353,10 +6356,18 @@ function textParts(content: unknown): string[] {
   });
 }
 
+function compactSummary(text: string): string {
+  let s = String(text || "").replace(/\s+/g, " ").trim();
+  s = s.replace(/^(tehtud|valmis|ok|okei)[.!:\s-]*/i, "").trim();
+  s = s.replace(/^[-*]\s+/, "").trim();
+  return s.length > 260 ? `${s.slice(0, 257)}...` : s;
+}
+
 function doneSummary(event: any): string {
   const messages = Array.isArray(event?.messages) ? event.messages : [];
   const assistantTexts: string[] = [];
   const changedFiles = new Set<string>();
+  const toolNames = new Set<string>();
   for (const entry of messages) {
     const message = entry?.message || entry;
     if (message?.role !== "assistant") continue;
@@ -6366,12 +6377,15 @@ function doneSummary(event: any): string {
       const block = part as ContentBlock;
       const name = String(block?.name || "");
       const args = (block?.arguments || {}) as Record<string, unknown>;
+      if (name) toolNames.add(name);
       if (["edit", "write"].includes(name) && typeof args.path === "string") changedFiles.add(args.path);
     }
   }
-  const finalText = assistantTexts.length ? assistantTexts[assistantTexts.length - 1] : "";
-  const fileText = changedFiles.size ? `Muudetud failid: ${Array.from(changedFiles).join(", ")}` : "";
-  return [finalText, fileText].filter(Boolean).join("\n").slice(0, 1000);
+  const finalText = assistantTexts.length ? compactSummary(assistantTexts[assistantTexts.length - 1]) : "";
+  if (finalText) return finalText;
+  if (changedFiles.size) return compactSummary(`Muutsin faile: ${Array.from(changedFiles).join(", ")}`);
+  if (toolNames.size) return compactSummary(`Kasutasin tööriistu: ${Array.from(toolNames).join(", ")}`);
+  return "";
 }
 
 export default function (pi: ExtensionAPI) {
