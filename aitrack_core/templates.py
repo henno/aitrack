@@ -557,6 +557,10 @@ input, select { background:transparent; color:var(--text); border:1px solid var(
 table { width:100%; border-collapse:collapse; }
 th, td { border-top:1px solid var(--line); padding:8px; vertical-align:top; }
 th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
+tr.session-colored { background:var(--row-bg-dark); }
+tr.session-colored td:first-child { border-left:4px solid var(--row-accent-dark); }
+tr.session-colored:hover { filter:brightness(1.08); }
+@media (prefers-color-scheme: light) { tr.session-colored { background:var(--row-bg-light); } tr.session-colored td:first-child { border-left-color:var(--row-accent-light); } }
 pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; }
 .bad { color:var(--bad); }
 .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-size:12px; }
@@ -750,6 +754,32 @@ function setSessionStatusFilter(value) {
   updateStatusFilterButtons();
   scheduleActivityLoad(0);
 }
+const SESSION_ROW_PALETTE = [
+  {darkBg:'#122033', darkAccent:'#38bdf8', lightBg:'#e0f2fe', lightAccent:'#0284c7'},
+  {darkBg:'#171f3f', darkAccent:'#818cf8', lightBg:'#e0e7ff', lightAccent:'#4f46e5'},
+  {darkBg:'#221b36', darkAccent:'#c084fc', lightBg:'#f3e8ff', lightAccent:'#9333ea'},
+  {darkBg:'#102a2c', darkAccent:'#2dd4bf', lightBg:'#ccfbf1', lightAccent:'#0f766e'},
+  {darkBg:'#2a1827', darkAccent:'#f472b6', lightBg:'#fce7f3', lightAccent:'#db2777'},
+  {darkBg:'#2a2112', darkAccent:'#f59e0b', lightBg:'#fef3c7', lightAccent:'#d97706'},
+  {darkBg:'#132719', darkAccent:'#4ade80', lightBg:'#dcfce7', lightAccent:'#16a34a'},
+  {darkBg:'#2c171b', darkAccent:'#fb7185', lightBg:'#ffe4e6', lightAccent:'#e11d48'},
+  {darkBg:'#14223a', darkAccent:'#60a5fa', lightBg:'#dbeafe', lightAccent:'#2563eb'},
+  {darkBg:'#112821', darkAccent:'#34d399', lightBg:'#d1fae5', lightAccent:'#059669'},
+  {darkBg:'#261d15', darkAccent:'#fb923c', lightBg:'#ffedd5', lightAccent:'#ea580c'},
+  {darkBg:'#1f2430', darkAccent:'#94a3b8', lightBg:'#f1f5f9', lightAccent:'#64748b'},
+];
+function sessionColorSeed(x) { return String(x?.work_session_uid || x?.session_uid || x?.work_session_id || ''); }
+function paletteIndex(seed) {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return Math.abs(h >>> 0) % SESSION_ROW_PALETTE.length;
+}
+function rowColorAttrs(x) {
+  const seed = sessionColorSeed(x);
+  if (!seed) return '';
+  const c = SESSION_ROW_PALETTE[paletteIndex(seed)];
+  return ` class="session-colored" style="--row-bg-dark:${c.darkBg};--row-accent-dark:${c.darkAccent};--row-bg-light:${c.lightBg};--row-accent-light:${c.lightAccent}"`;
+}
 function detailButton(x) {
   const type = x.type || 'work_session';
   const id = x.id || x.work_session_id || '';
@@ -806,11 +836,11 @@ function renderActivity(rows) {
       : x.type === 'raw_event'
         ? `${x.summary && x.summary !== x.event_type ? '<pre>' + esc(x.summary) + '</pre>' : esc(x.event_type || '')}<div class="small">${esc(x.event_type || '')}${x.agent_uid ? ' · ' + esc(x.agent_uid) : ''}</div>`
         : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
-    return `<tr><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td><td data-label="Toorandmed">${detailButton(x)}</td></tr>`;
+    return `<tr${rowColorAttrs(x)}><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td><td data-label="Toorandmed">${detailButton(x)}</td></tr>`;
   }).join('') : '<tr><td class="empty" colspan="7">Tegevusi pole.</td></tr>';
 }
 function renderSessions(rows) {
-  $('sessionsBody').innerHTML = rows.length ? rows.map(x => `<tr>
+  $('sessionsBody').innerHTML = rows.length ? rows.map(x => `<tr${rowColorAttrs(x)}>
     <td data-label="Session UID"><code>${esc(x.work_session_uid || '')}</code></td>
     <td data-label="Aeg">${fmtTime(x.started_at)}<div class="small">${x.ended_at ? fmtTime(x.ended_at) : 'aktiivne / lõpp puudub'}</div></td>
     <td data-label="Kasutaja">${esc(x.user || '')}<div class="small">${esc(x.device || '')}</div></td>
@@ -822,7 +852,7 @@ function renderSessions(rows) {
   </tr>`).join('') : '<tr><td class="empty" colspan="8">Sessioone pole.</td></tr>';
 }
 function renderPrompts(rows) {
-  $('promptsBody').innerHTML = rows.length ? rows.map(x => `<tr>
+  $('promptsBody').innerHTML = rows.length ? rows.map(x => `<tr${rowColorAttrs(x)}>
     <td data-label="Aeg">${fmtTime(x.started_at)}</td>
     <td data-label="Kasutaja">${esc(x.user || '')}</td>
     <td data-label="Projekt">${projectLabel(x)}<div class="small">${esc(x.work_session_uid || '')}</div></td>
@@ -839,7 +869,7 @@ function renderAgentTree(rows) {
   $('agentTree').innerHTML = rows && rows.length ? rows.map(x => renderAgentNode(x, 0)).join('') : 'Agent/subagent seoseid pole.';
 }
 function renderRawEvents(rows) {
-  $('rawEventsBody').innerHTML = rows.length ? rows.map(x => `<tr>
+  $('rawEventsBody').innerHTML = rows.length ? rows.map(x => `<tr${rowColorAttrs(x)}>
     <td data-label="Aeg">${fmtTime(x.occurred_at_utc)}</td>
     <td data-label="Kasutaja">${esc(x.user || '')}</td>
     <td data-label="Event"><span class="pill">${esc(x.event_type || '')}</span><div class="small">${esc(x.event_key || '')}</div></td>
