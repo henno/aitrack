@@ -2789,7 +2789,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
                    p.project_key, p.name AS project_name, i.issue_key
             FROM raw_events re
             JOIN users u ON u.id = re.user_id
-            LEFT JOIN work_sessions ws ON ws.id = re.work_session_id
+            LEFT JOIN work_sessions ws ON ws.id = re.work_session_id OR (re.work_session_id IS NULL AND ws.session_uid = re.work_session_uid AND ws.user_id = re.user_id)
             LEFT JOIN work_items wi ON wi.id = ws.work_item_id
             LEFT JOIN projects p ON p.id = wi.project_id
             LEFT JOIN issues i ON i.id = wi.issue_id
@@ -2923,7 +2923,7 @@ def _db_event_detail(path: Path, token: str, q: dict) -> dict:
                        p.project_key, p.name AS project_name, i.issue_key, i.provider AS issue_provider
                 FROM raw_events re
                 JOIN users u ON u.id = re.user_id
-                LEFT JOIN work_sessions ws ON ws.id = re.work_session_id
+                LEFT JOIN work_sessions ws ON ws.id = re.work_session_id OR (re.work_session_id IS NULL AND ws.session_uid = re.work_session_uid AND ws.user_id = re.user_id)
                 LEFT JOIN work_items wi ON wi.id = ws.work_item_id
                 LEFT JOIN projects p ON p.id = wi.project_id
                 LEFT JOIN issues i ON i.id = wi.issue_id
