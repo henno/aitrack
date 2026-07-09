@@ -1114,5 +1114,42 @@ check("detail modal värvib JSON-i süntaksit", "syntaxHighlightJson" in activit
 check("activity filtreerib worksessionid järgi", len(filtered_activity["sessions"]) == 1 and len(filtered_activity["raw_events"]) == 1 and not miss_activity["sessions"] and not miss_activity["raw_events"])
 check("activity HTML sisaldab worksessionid filtrit", "workSessionInput" in activity_html and "work_session_uid" in activity_html)
 
+# ============ TEST 61: aitrack add vajab päris terminali ==========
+print("TEST 61: aitrack add vajab päris terminali")
+class _TTY:
+    def __init__(self, value):
+        self.value = value
+    def isatty(self):
+        return self.value
+
+add_target = CFG / "human-add-project"
+add_target.mkdir(parents=True, exist_ok=True)
+A.save_projects([])
+_orig_stdin = A.sys.stdin
+_orig_sync_allowed = A._sync_allowed_projects
+_orig_env = {k: os.environ.get(k) for k in A._AGENT_ENV_KEYS}
+A._sync_allowed_projects = lambda *a, **kw: True
+blocked_add = False
+try:
+    A.sys.stdin = _TTY(False)
+    try:
+        A.cmd_add(types.SimpleNamespace(path=str(add_target)), A.load_config())
+    except SystemExit as e:
+        blocked_add = "päris terminalist" in str(e)
+    for k in A._AGENT_ENV_KEYS:
+        os.environ.pop(k, None)
+    A.sys.stdin = _TTY(True)
+    A.cmd_add(types.SimpleNamespace(path=str(add_target)), A.load_config())
+finally:
+    A.sys.stdin = _orig_stdin
+    A._sync_allowed_projects = _orig_sync_allowed
+    for k, v in _orig_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+check("non-TTY/agent ei saa projekti lisada", blocked_add)
+check("päris terminalist lisamine töötab", str(add_target.resolve()) in A.load_projects())
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

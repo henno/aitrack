@@ -93,7 +93,7 @@ RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", 
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
-CLIENT_VERSION = 2
+CLIENT_VERSION = 3
 AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
@@ -706,6 +706,23 @@ def _detect_cli(explicit: str | None = None) -> str:
         if val:
             return val.lower()
     return "manual"
+
+
+_AGENT_ENV_KEYS = (
+    "PI_CODING_AGENT", "CLAUDECODE", "CLAUDE_CODE", "CODEX_SANDBOX",
+    "OPENAI_CODEX", "CURSOR_AGENT", "AIDER_AGENT", "GEMINI_CLI",
+)
+
+
+def _agent_context_detected() -> bool:
+    return any(str(os.environ.get(k, "")).strip() for k in _AGENT_ENV_KEYS)
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
 
 
 # --- state ------------------------------------------------------------------
@@ -2604,7 +2621,7 @@ def _db_project_allowed_conn(conn: sqlite3.Connection, user_id: int, payload: di
 
 def _db_require_project_allowed_conn(conn: sqlite3.Connection, user: sqlite3.Row, payload: dict) -> None:
     if not _db_project_allowed_conn(conn, int(user["id"]), payload):
-        raise PermissionError("projekt ei ole aitrack allowlistis; käivita selles projektis: aitrack add <tee>")
+        raise PermissionError("projekt ei ole aitrack allowlistis; kasutaja peab selle päris terminalis lisama: aitrack add <tee>")
 
 
 def _db_upsert_issue(conn: sqlite3.Connection, project_id: int, issue: dict, default_provider: str, now: str) -> int | None:
@@ -5664,9 +5681,21 @@ def cmd_backfill(args, cfg):
     run_once(cfg, load_projects(), backfill_hours=args.hours)
 
 
+def _require_human_project_add(path: str) -> None:
+    if _stdin_is_tty() and not _agent_context_detected():
+        return
+    raise SystemExit(
+        "Turvapiirang: 'aitrack add' peab tulema päris terminalist.\n"
+        "AI agent ega skript ei tohi uut projekti ise jälgimisse lisada.\n"
+        "Kui tahad seda projekti jälgida, käivita ise terminalis:\n"
+        f"  aitrack add {path}"
+    )
+
+
 def cmd_add(args, cfg):
     paths = load_projects()
     new = str(Path(args.path).expanduser().resolve())
+    _require_human_project_add(new)
     if not Path(new).is_dir():
         log(f"add: hoiatus — tee ei ole olemasolev kaust: {new}")
     paths.append(new)
@@ -6693,7 +6722,13 @@ def cmd_work(args, cfg):
             raise SystemExit("Kasuta: aitrack work start [--issue N] 'töö kirjeldus'")
         payload, ctx, client = _work_payload_from_args(args, cfg, summary=summary)
         if not getattr(args, "force_untracked", False) and not _local_project_tracked(ctx):
-            raise SystemExit(f"Projekt ei ole aitrack allowlistis: {ctx.get('cwd', '')}\nLisa enne: aitrack add {ctx.get('local_path') or ctx.get('cwd')}")
+            add_path = ctx.get("local_path") or ctx.get("cwd")
+            raise SystemExit(
+                f"Projekt ei ole aitrack allowlistis: {ctx.get('cwd', '')}\n"
+                "Turvalisuse tõttu agent/skript seda ise lisada ei saa.\n"
+                "Kui tahad seda projekti jälgida, ava päris terminal ja käivita:\n"
+                f"  aitrack add {add_path}"
+            )
         _sync_allowed_projects(cfg, load_projects(), quiet=True)
         tool = payload["session"]["tool"]
         active = _active_work_sessions(tool=tool, checkout_id=ctx["checkout_id"])
@@ -7482,7 +7517,7 @@ Põhikäsud
   { _cli_base_cmd() } note                   näita käsitsi märkmeid
   { _cli_base_cmd() } preview --hours 8      vaata, mida tracker leiaks
   { _cli_base_cmd() } suggest --days 7       soovita logidest projektikaustu
-  { _cli_base_cmd() } add <tee>              lisa projekt jälgimisse
+  { _cli_base_cmd() } add <tee>              lisa projekt jälgimisse (päris terminalist)
   { _cli_base_cmd() } list                   näita jälgitavaid projekte
   { _cli_base_cmd() } backfill --hours 12    töötle tagantjärele viimased tunnid
 

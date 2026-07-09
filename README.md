@@ -77,9 +77,10 @@ aitrack add /tee/projektini
 aitrack install --minute-tracking --pi-extension
 ```
 
-Pi sees tee seejärel `/reload` või ava uus Pi sessioon. `aitrack add` on oluline: globaalne Pi extension,
-`aitrack work start`, `aitrack tick` ja serveri vastuvõtt lubavad vaikimisi ainult lisatud projekte. Nii ei logita
-kogemata mõnda muud arvutis avatud repo't.
+Pi sees tee seejärel `/reload` või ava uus Pi sessioon. `aitrack add` on oluline ja käib ainult päris
+terminalist: globaalne Pi extension, `aitrack work start`, `aitrack tick` ja serveri vastuvõtt lubavad vaikimisi
+ainult lisatud projekte. Nii ei logita kogemata mõnda muud arvutis avatud repo't ning AI agent ei saa uut projekti
+ise allowlisti lisada.
 
 > Juba seadistatud? Kõik on edaspidi käsuga **`aitrack <...>`** (lühivorm; ka `python3 aitrack.py <...>` töötab).
 
@@ -105,7 +106,7 @@ kogemata mõnda muud arvutis avatud repo't.
 | `aitrack project assign-customer PROJECT_KEY CUSTOMER` | Seo olemasolev projekt kliendiga. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
 | `aitrack suggest [--days N]` | Näita logidest aktiivseid projektikaustu (pingerida). |
-| `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt; serverirežiimis sünkroniseerib ka serveripoolse allowlisti. |
+| `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt; `add` peab tulema päris terminalist, mitte AI agendi käsust; serverirežiimis sünkroniseerib ka serveripoolse allowlisti. |
 | `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Läheb "Uued teadmised" veergu. Tühjalt = kuva märkmed. |
 | `aitrack day [KUUPÄEV]` | **Prindi päeva sisuveerud D–G** (Objekt/Saavutused/Takistused/Uued teadmised, tab-eraldus) — vali Sheetsis lahter `D<rida>` ja Ctrl+V. Vaikimisi viimane päev; `--all` = kõik; `--header` = päiserida; `--full` = kõik 7 veergu; `--html` = clipboardi jaoks, säilitab punktid lahtris eri ridadel; `--flat` = üks füüsiline rida. |
 | `aitrack digest [--days N] [--notify]` | Päeva/nädala kokkuvõte (valikuliselt töölaua-teavitus). |
@@ -304,7 +305,8 @@ curl -H "X-Aitrack-Token: TOKEN" \
   `~/projects/team/b` eraldi projektidena. Kui `cwd` on allowlisti juure all, aga Git tööpuud ei leita,
   jäetakse see kirje vaikimisi vahele. **Käivita AI projektikaustast** (`cd projekt && pi/claude`), et
   filtreerimine töötaks.
-- **Server kaitseb samuti allowlistiga.** `aitrack add` saadab lubatud juure serverisse. Kui klient või agent proovib
+- **Server kaitseb samuti allowlistiga.** `aitrack add` saadab lubatud juure serverisse ja peab tulema päris
+  terminalist; AI agenti või skripti käest uut projekti jälgimisse ei lisata. Kui klient või agent proovib
   `work start`/evente saata projektist, mida pole lisatud, server ei salvesta neid. Kui lisasid projekti enne serveriga
   ühendamist, tee pärast `aitrack connect` uuesti `aitrack add /tee/projektini` või käivita mõni tavaline aitrack käsk,
   mis allowlisti sünkroniseerib.
