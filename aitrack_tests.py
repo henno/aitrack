@@ -601,6 +601,33 @@ with A._db_connect(sdb) as conn:
 check("server salvestas prompt-eventi", ev_count == 2)
 check("serveri päevavaade asendab prompt placeholderi lihtrahva tekstiga", any("Promptid:" not in r[3] and "automaatkokkuvõte" not in r[3] and not str(r[2]).startswith("Praktika -") for r in prompt_day_rows if r[1] == "11:00–12:00"))
 check("serveri päevavaade tuletab promptidest uued teadmised", any(r[5] != A._NA for r in prompt_day_rows if r[1] == "11:00–12:00"))
+merged_same_hour = A._merge_same_hour_day_rows([
+    ["2026-06-16", "09:00–10:00", "obj1", "saav1", A._NA, "tead1", "Pi", "k:m1"],
+    ["2026-06-16", "09:00–10:00", "obj2", "saav2", "tak2", A._NA, "Claude", "k:m2"],
+])
+merged_day = A._day_row("2026-06-16", merged_same_hour)
+check("sama tunni mitu teemat kuvatakse ühe tunnirea sees", len(merged_same_hour) == 1 and "• obj2" in merged_same_hour[0][2] and merged_same_hour[0][6] == "Pi, Claude")
+check("päevarea punktide arv loeb sama tunni üheks punktiks", merged_day[1] == 1)
+A._db_upsert_day_summary(sdb, tok, "2026-06-16", "Päev oli arusaadav ja tulemustega.", source="test", model="stub")
+day_summary = A._db_day_summary(sdb, tok, "2026-06-16")
+check("server salvestab päeva tervikkokkuvõtte", day_summary["summary"]["summary"] == "Päev oli arusaadav ja tulemustega." and day_summary["summary"]["source"] == "test")
+check("päevade nimekiri sisaldab ka ainult kokkuvõttega päeva", "2026-06-16" in A._db_days(sdb, tok))
+fallback_day_text = A._fallback_day_summary("2026-06-16", [{"objekt": "aitrack - päevavaate kokkuvõte", "saavutus": "kokkuvõtte väli lisatud", "takistus": "Ei olnud", "teadmine": "Kuidas mitte-tehnilisele lugejale tööpäeva kirjeldada", "tool": "Pi"}])
+check("päeva fallback-kokkuvõte on loetav terviktekst", "kokkuvõtte väli lisatud" in fallback_day_text and "toorprompt" not in fallback_day_text.lower())
+old_get, old_post, old_gen = A._server_get, A._server_post, A._generate_day_summary
+posted_day_summary = {}
+try:
+    A._server_get = lambda op, params, cfg: {"ok": True, "rows": [{"hour": "10:00–11:00", "objekt": "aitrack", "saavutus": "valmis"}]}
+    A._generate_day_summary = lambda date, rows, cfg: ("Lokaalne kokkuvõte", "stub", "mudel")
+    def fake_day_summary_post(op, payload, cfg):
+        posted_day_summary.update({"op": op, "payload": payload})
+        return {"ok": True, "summary": {"summary": payload["summary"]}}
+    A._server_post = fake_day_summary_post
+    with _contextlib.redirect_stdout(_io.StringIO()):
+        A.cmd_day_summary(types.SimpleNamespace(date="2026-06-16", user="", model=None, print_only=False, allow_empty=False), {"sink": {"type": "server", "server_url": "http://srv", "token": "tok"}})
+finally:
+    A._server_get, A._server_post, A._generate_day_summary = old_get, old_post, old_gen
+check("day-summary käsk küsib serverist päeva ja postitab kokkuvõtte", posted_day_summary.get("op") == "day-summary" and posted_day_summary.get("payload", {}).get("summary") == "Lokaalne kokkuvõte")
 check("praktikapäeviku heuristika täidab takistuse/teadmise", A._infer_takistus_from_texts(["paranda activity mittekuvamine"]) != A._NA and A._infer_teadmine_from_texts(["selgita heartbeat mudelit"]) != A._NA)
 check("praktikapäeviku takistuse heuristika ei pea failiteed/faili veaks", A._infer_takistus_from_texts(["näita activity vaates failitee issue all", "ava claude.md fail"]) == A._NA)
 learn_tail = A._infer_teadmine_from_texts(["kas tailscale töötab?", "kuidas ta saab minu võrku tulla?"])
@@ -726,6 +753,8 @@ server_start_page = A._start_page_html(server_mode=True)
 check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server token" not in server_start_page and "credentials:'same-origin'" in server_start_page and "const SERVER_MODE = true" in server_start_page)
 check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)
 check("serveri päevavaates saab admin kasutajat valida", "userSelect" in server_start_page and "/api/activity/filters" in server_start_page and "selectedUserParam" in server_start_page)
+check("serveri päevavaates on tervikkokkuvõtte väli ja kopeeri nupp", "daySummaryPanel" in server_start_page and "/api/day-summary" in server_start_page and "copyDaySummary" in server_start_page)
+check("päevavaate tunni päises kuvatakse tänaste tundide arv", "hoursHeader" in server_start_page and "Tund (${rows.length} h)" in server_start_page)
 account_page = A._account_page_html()
 check("kasutaja lehel saab parooli muuta", "/api/me/password" in account_page and "current-password" in account_page and "new-password" in account_page)
 check("kasutaja lehel on kolme OS-i installikäsk", "/api/install-code" in account_page and "install-client.sh" in account_page and "install-client.ps1" in account_page and "Linux" in account_page and "macOS" in account_page and "Windows" in account_page)

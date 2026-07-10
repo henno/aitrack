@@ -49,8 +49,11 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 .hour { width:120px; }
 .tool { width:110px; }
 .actions { width:74px; text-align:right; }
+.summary-row { display:flex; gap:10px; align-items:flex-start; }
+.summary-row textarea { flex:1; min-height:140px; max-height:none; resize:vertical; }
+.summary-row button { white-space:nowrap; }
 .empty { text-align:center; color:var(--muted); padding:30px; }
-@media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } .hour, .tool { width:100%; } }
+@media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } .hour, .tool { width:100%; } .summary-row { flex-direction:column; } .summary-row button { width:100%; } }
 </style>
 </head>
 <body>
@@ -71,9 +74,20 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
     <button class="good" onclick="copyDay(true)">Kopeeri A–G</button>
     <span class="status" id="status"></span>
   </section>
+  <section class="panel" id="daySummaryPanel" hidden>
+    <div class="toolbar" style="justify-content:space-between; align-items:flex-end; margin-bottom:8px">
+      <div><b>Päeva tervikkokkuvõte</b><div class="small">Lokaalne harness loob selle käsuga <code>aitrack day-summary</code> serveri päevavaate andmetest.</div></div>
+      <span class="small" id="daySummaryMeta"></span>
+    </div>
+    <div class="summary-row">
+      <textarea id="daySummaryText" readonly placeholder="Kokkuvõtet pole veel. Käivita oma arvutis: aitrack day-summary YYYY-MM-DD"></textarea>
+      <button class="good" id="copyDaySummaryBtn" onclick="copyDaySummary()">Kopeeri</button>
+    </div>
+    <div class="small" id="daySummaryEmpty"></div>
+  </section>
   <section class="panel">
     <table id="rowsTable">
-      <thead><tr><th>Tund</th><th>Objekt ja ülesanne</th><th>Saavutused</th><th>Takistused</th><th>Uued teadmised</th><th>Tööriist</th><th></th></tr></thead>
+      <thead><tr><th id="hoursHeader">Tund</th><th>Objekt ja ülesanne</th><th>Saavutused</th><th>Takistused</th><th>Uued teadmised</th><th>Tööriist</th><th></th></tr></thead>
       <tbody id="rowsBody"><tr><td class="empty" colspan="7">Laen…</td></tr></tbody>
     </table>
   </section>
@@ -153,8 +167,42 @@ function collectRows() {
   }));
 }
 function renderRows(rows) {
+  if ($('hoursHeader')) $('hoursHeader').textContent = rows.length ? `Tund (${rows.length} h)` : 'Tund';
   $('rowsBody').innerHTML = rows.length ? rows.map(rowTemplate).join('') : '<tr><td class="empty" colspan="7">Sellel päeval pole veel ridu. Vajuta “+ Lisa rida”.</td></tr>';
   wireTextareas($('rowsBody'));
+}
+function renderDaySummary(summary={}) {
+  if (!$('daySummaryPanel')) return;
+  $('daySummaryPanel').hidden = !SERVER_MODE;
+  if (!SERVER_MODE) return;
+  const text = summary.summary || '';
+  $('daySummaryText').value = text;
+  $('copyDaySummaryBtn').disabled = !text;
+  $('daySummaryEmpty').textContent = text ? '' : `Kokkuvõtet pole veel. Loo see käsuga: aitrack day-summary ${currentDate}${selectedUserParam() ? ' --user ' + selectedUserParam() : ''}`;
+  $('daySummaryMeta').textContent = summary.updated_at ? 'Uuendatud ' + new Date(summary.updated_at).toLocaleString() : '';
+  autoResizeTextarea($('daySummaryText'));
+}
+async function loadDaySummary() {
+  if (!SERVER_MODE || !$('daySummaryPanel')) return;
+  const q = userQueryParams();
+  q.set('date', currentDate);
+  try {
+    const data = await api('/api/day-summary?' + q.toString());
+    renderDaySummary(data.summary || {});
+  } catch (e) {
+    renderDaySummary({summary: ''});
+    $('daySummaryEmpty').textContent = e.message || 'Kokkuvõtte laadimine ebaõnnestus';
+  }
+}
+async function copyDaySummary() {
+  const text = $('daySummaryText').value.trim();
+  if (!text) { setStatus('Päeva kokkuvõtet pole veel.', true); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    $('daySummaryText').focus(); $('daySummaryText').select(); document.execCommand('copy');
+  }
+  setStatus('Päeva kokkuvõte kopeeritud.');
 }
 async function init() {
   currentDate = new Date().toISOString().slice(0, 10);
@@ -202,6 +250,7 @@ async function loadDay() {
   q.set('date', currentDate);
   const data = await api('/api/day?' + q.toString());
   renderRows(data.rows || []);
+  await loadDaySummary();
   setStatus(`Avatud ${currentDate}${selectedUserParam() ? ' · ' + selectedUserParam() : ''}`);
 }
 function addRow() {

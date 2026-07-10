@@ -109,6 +109,7 @@ ise allowlisti lisada.
 | `aitrack add/remove <tee>` | Lisa/eemalda jälgitav projekt; `add` peab tulema päris terminalist, mitte AI agendi käsust; serverirežiimis sünkroniseerib ka serveripoolse allowlisti. |
 | `aitrack note "<tekst>"` | **Lisa käsitsi-märge praegusele tunnile** (nt õpitu, koosolek). Läheb "Uued teadmised" veergu. Tühjalt = kuva märkmed. |
 | `aitrack day [KUUPÄEV]` | **Prindi päeva sisuveerud D–G** (Objekt/Saavutused/Takistused/Uued teadmised, tab-eraldus) — vali Sheetsis lahter `D<rida>` ja Ctrl+V. Vaikimisi viimane päev; `--all` = kõik; `--header` = päiserida; `--full` = kõik 7 veergu; `--html` = clipboardi jaoks, säilitab punktid lahtris eri ridadel; `--flat` = üks füüsiline rida. |
+| `aitrack day-summary [KUUPÄEV]` | Keskserveri päevavaate ridade põhjal loob lokaalne AI-harness loetava tervikkokkuvõtte ja salvestab selle veebis vastava päeva ridade kohale kopeeritavasse välja. |
 | `aitrack digest [--days N] [--notify]` | Päeva/nädala kokkuvõte (valikuliselt töölaua-teavitus). |
 | `aitrack status` | Näita platvormi, mootorit, väljundit ja logiallikaid. |
 | `aitrack preview --hours N` | Kuiv vaade — mida kirjutataks, väljundisse saatmata. |
@@ -188,6 +189,12 @@ aitrack tick
 
 aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 ```
+
+Serveri päevavaates (`https://aitrack.example.com/`) saab lisaks tunniridadele näha päeva tervikkokkuvõtet.
+See tekst ei teki serveris ise: käivita oma ühendatud kliendis `aitrack day-summary YYYY-MM-DD` ning lokaalne
+AI-harness küsib serverist selle päeva read, kirjutab mitte-tehnilisele lugejale sobiva kokkuvõtte ja salvestab selle
+vastava päeva ridade kohale. Välja kõrval on `Kopeeri` nupp. Admin saab koostada teise kasutaja päeva kohta:
+`aitrack day-summary YYYY-MM-DD --user kasutajanimi`.
 
 Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser suunatakse vajadusel
 `/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.

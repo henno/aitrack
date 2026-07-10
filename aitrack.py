@@ -1719,6 +1719,7 @@ def _read_raw_days() -> "dict[str, list[list]]":
 
 def _day_row(date: str, hour_rows: list[list]) -> list:
     """Kokku üks päevarida: iga tund = nummerdatud punkt, numbrid kõigis 4 veerus kohakuti."""
+    hour_rows = _merge_same_hour_day_rows(hour_rows)
     # eemalda välja SEEST reavahetused → ainsad reavahetused on punktide vahel (join),
     # nii ei teki kleepimisel valeridu ega peitunud valemisüsti (=… uue rea alguses)
     clean = lambda s: str(s).replace("\r", " ").replace("\n", " ").strip()  # noqa: E731
@@ -2089,6 +2090,18 @@ def _db_init(path: Path) -> None:
           UNIQUE(user_id, row_key)
         );
         CREATE INDEX IF NOT EXISTS hour_rows_user_date_idx ON hour_rows(user_id, date, hour);
+        CREATE TABLE IF NOT EXISTS day_summaries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          summary TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT '',
+          model TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, date)
+        );
+        CREATE INDEX IF NOT EXISTS day_summaries_user_date_idx ON day_summaries(user_id, date);
         CREATE TABLE IF NOT EXISTS prompt_events (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2140,6 +2153,8 @@ def _db_init(path: Path) -> None:
         _db_add_column_if_missing(conn, "work_sessions", "owner_cli", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "work_sessions", "status_detail", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "work_sessions", "rollup_finalized_at", "TEXT")
+        _db_add_column_if_missing(conn, "day_summaries", "source", "TEXT NOT NULL DEFAULT ''")
+        _db_add_column_if_missing(conn, "day_summaries", "model", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "prompt_events", "project_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "issue_id", "INTEGER REFERENCES issues(id) ON DELETE SET NULL")
         _db_add_column_if_missing(conn, "prompt_events", "work_item_id", "INTEGER REFERENCES work_items(id) ON DELETE SET NULL")
@@ -4112,6 +4127,41 @@ def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) ->
     return sorted(rows, key=lambda r: (r[1], r[7]))
 
 
+def _join_same_hour_values(values: list[str], *, collapse_na: bool = False) -> str:
+    cleaned = _unique_limited([str(v or "").strip() for v in values], 20)
+    if collapse_na:
+        non_na = [v for v in cleaned if v and v != _NA]
+        cleaned = non_na or [_NA]
+    cleaned = [v for v in cleaned if v]
+    if not cleaned:
+        return _NA if collapse_na else ""
+    return _cell_safe(cleaned[0] + "".join(f"\n• {v}" for v in cleaned[1:]))
+
+
+def _merge_same_hour_day_rows(rows: list[list]) -> list[list]:
+    """Kuva/salvesta üks tabelirida ühe tunni kohta; sama tunni eri teemad lähevad lahtri sees bulletitena."""
+    groups: dict[str, list[list]] = {}
+    for row in sorted([r for r in rows if len(r) >= len(RAW_HEADER)], key=lambda r: (r[1], r[7])):
+        groups.setdefault(str(row[1]), []).append(row)
+    out: list[list] = []
+    for hour, items in groups.items():
+        if len(items) == 1:
+            out.append(items[0])
+            continue
+        first = items[0]
+        tools = _unique_limited([str(r[6] or "").strip() for r in items], 10)
+        out.append([
+            first[0], hour,
+            _join_same_hour_values([r[2] for r in items]),
+            _join_same_hour_values([r[3] for r in items]),
+            _join_same_hour_values([r[4] for r in items], collapse_na=True),
+            _join_same_hour_values([r[5] for r in items], collapse_na=True),
+            ", ".join(tools),
+            first[7],
+        ])
+    return sorted(out, key=lambda r: (r[1], r[7]))
+
+
 def _db_target_user_for_query(conn: sqlite3.Connection, user: sqlite3.Row, q: dict | None) -> sqlite3.Row:
     """Admin saab serveri päevavaates valida teise kasutaja; tavakasutaja näeb alati ennast."""
     if user["role"] != "admin" or not q:
@@ -4144,7 +4194,7 @@ def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None,
         derived_work = _db_work_session_day_rows(conn, target_user, date, rows, cfg)
         rows = _merge_day_rows_with_work_sessions(rows, derived_work)
         derived_prompts = _db_prompt_event_day_rows(conn, target_user, date, rows, cfg)
-    return _merge_day_rows_with_work_sessions(rows, derived_prompts)
+    return _merge_same_hour_day_rows(_merge_day_rows_with_work_sessions(rows, derived_prompts))
 
 
 def _db_days(path: Path, token: str, q: dict | None = None) -> list[str]:
@@ -4158,9 +4208,52 @@ def _db_days(path: Path, token: str, q: dict | None = None) -> list[str]:
             SELECT DISTINCT substr(started_at, 1, 10) AS date FROM work_sessions WHERE user_id = ?
             UNION
             SELECT DISTINCT substr(started_at, 1, 10) AS date FROM prompt_events WHERE user_id = ?
+            UNION
+            SELECT DISTINCT date FROM day_summaries WHERE user_id = ?
             ORDER BY date
-        """, (target_user["id"], target_user["id"], target_user["id"])).fetchall()
+        """, (target_user["id"], target_user["id"], target_user["id"], target_user["id"])).fetchall()
     return [r["date"] for r in rows if r["date"]]
+
+
+def _db_day_summary(path: Path, token: str, date: str, q: dict | None = None) -> dict:
+    """Tagasta ühe päeva tervikkokkuvõte kasutaja õiguste piires."""
+    if not _valid_date(date):
+        raise ValueError("vigane kuupäev")
+    _db_init(path)
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        target_user = _db_target_user_for_query(conn, user, q)
+        row = conn.execute(
+            "SELECT date, summary, source, model, created_at, updated_at FROM day_summaries WHERE user_id = ? AND date = ?",
+            (int(target_user["id"]), date),
+        ).fetchone()
+    summary = dict(row) if row is not None else {"date": date, "summary": "", "source": "", "model": "", "created_at": "", "updated_at": ""}
+    return {"ok": True, "date": date, "summary": summary}
+
+
+def _db_upsert_day_summary(path: Path, token: str, date: str, summary: str,
+                           q: dict | None = None, *, source: str = "", model: str = "") -> dict:
+    """Salvesta lokaalse harnessi loodud päeva tervikkokkuvõte serverisse."""
+    if not _valid_date(date):
+        raise ValueError("vigane kuupäev")
+    text = str(summary or "").strip()
+    if not text:
+        raise ValueError("kokkuvõte puudub")
+    if len(text) > 12000:
+        text = text[:12000].rstrip() + "…"
+    _db_init(path)
+    now = _now_utc().isoformat()
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        target_user = _db_target_user_for_query(conn, user, q)
+        conn.execute(
+            "INSERT INTO day_summaries(user_id, date, summary, source, model, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET summary = excluded.summary, "
+            "source = excluded.source, model = excluded.model, updated_at = excluded.updated_at",
+            (int(target_user["id"]), date, text, str(source or "")[:120], str(model or "")[:120], now, now),
+        )
+    return _db_day_summary(path, token, date, q)
 
 
 def _db_keys(path: Path, token: str) -> set[str]:
@@ -5996,7 +6089,7 @@ def _today_local_str(cfg: dict) -> str:
 
 
 def _ui_day_rows(date: str) -> list[dict]:
-    rows = _read_raw_days().get(date, [])
+    rows = _merge_same_hour_day_rows(_read_raw_days().get(date, []))
     return [
         {
             "key": r[7],
@@ -6088,7 +6181,7 @@ def _html_table_for_day(date: str, full: bool = False) -> tuple[str, str]:
 
 def _client_version_endpoint(path: str) -> bool:
     return path in {
-        "/api/keys", "/api/ingest", "/api/events", "/api/projects/allow", "/api/projects/unallow",
+        "/api/keys", "/api/ingest", "/api/events", "/api/day-summary", "/api/projects/allow", "/api/projects/unallow",
         "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard",
         "/api/work/status", "/api/watchdog", "/api/cleanup",
         "/api/prompt/start", "/api/prompt/done", "/api/agent/heartbeat", "/api/agent/tool-start",
@@ -6408,6 +6501,10 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     rows = _ui_day_rows(date)
                 self._json({"ok": True, "date": date, "rows": rows})
                 return
+            if u.path == "/api/day-summary" and self._server_mode():
+                date = (q.get("date") or [_today_local_str(self.cfg)])[0]
+                self._json(_db_day_summary(self._db_path(), self._token(q), date, q))
+                return
             if u.path == "/api/copy":
                 date = (q.get("date") or [_today_local_str(self.cfg)])[0]
                 full = (q.get("full") or ["0"])[0] in ("1", "true", "yes")
@@ -6613,6 +6710,12 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     ui_rows = _ui_day_rows(date)
                 self._json({"ok": True, "date": date, "rows": ui_rows})
                 return
+            if u.path == "/api/day-summary" and self._server_mode():
+                date = str(data.get("date") or _today_local_str(self.cfg))
+                text = str(data.get("summary") or data.get("text") or "")
+                self._json(_db_upsert_day_summary(self._db_path(), self._token(data=data), date, text, data,
+                                                  source=str(data.get("source") or ""), model=str(data.get("model") or "")))
+                return
             if u.path == "/api/run":
                 if self._server_mode():
                     self._json({"ok": False, "error": "server ei loe kliendi lokaalseid logisid"}, 400)
@@ -6779,6 +6882,140 @@ def _require_server_cfg(cfg: dict) -> None:
     sink = cfg.get("sink", {})
     if sink.get("type") != "server" or not sink.get("server_url") or not sink.get("token"):
         raise SystemExit("See käsk vajab keskserverit: aitrack connect --url URL --token TOKEN")
+
+
+def _day_summary_rows_text(rows: list[dict]) -> str:
+    lines = []
+    for row in rows:
+        hour = str(row.get("hour") or "").strip()
+        parts = [
+            ("Objekt", row.get("objekt")),
+            ("Saavutus", row.get("saavutus")),
+            ("Takistus", row.get("takistus")),
+            ("Uus teadmine", row.get("teadmine")),
+            ("Tööriist", row.get("tool")),
+        ]
+        detail = "; ".join(f"{label}: {_safe_day_prompt_snippet(str(value or ''), 1200)}" for label, value in parts if str(value or "").strip())
+        lines.append(f"- {hour or 'tund teadmata'} — {detail}")
+    return "\n".join(lines)
+
+
+def _meaningful_day_values(rows: list[dict], key: str, *, limit: int = 5) -> list[str]:
+    values = []
+    for row in rows:
+        text = _safe_day_prompt_snippet(str(row.get(key) or ""), 600).strip()
+        if not text or text == _NA or _placeholder_day_text(text):
+            continue
+        values.append(text)
+    return _unique_limited(values, limit)
+
+
+def _fallback_day_summary(date: str, rows: list[dict]) -> str:
+    """Lihtne terviktekst juhuks, kui kohalik AI-harness pole saadaval."""
+    if not rows:
+        return f"{date} kohta ei ole päevavaates veel töö ridu, seega sisulist päevakokkuvõtet ei saa veel koostada."
+    objects = _meaningful_day_values(rows, "objekt", limit=3)
+    achievements = _meaningful_day_values(rows, "saavutus", limit=5)
+    blockers = [x for x in _meaningful_day_values(rows, "takistus", limit=3) if x.lower() != "ei olnud"]
+    learnings = [x for x in _meaningful_day_values(rows, "teadmine", limit=3) if x.lower() != "ei olnud"]
+    tools = _unique_limited([str(r.get("tool") or "").strip() for r in rows], 4)
+
+    focus = ", ".join(objects[:2]) if objects else "mitme tööteema korrastamine ja kontrollimine"
+    text = [f"{date} töö keskendus peamiselt teemale: {focus}."]
+    if achievements:
+        text.append("Päeva jooksul jõuti konkreetsete tulemusteni: " + "; ".join(achievements[:4]).rstrip(".") + ".")
+    if blockers:
+        text.append("Tähelepanu vajasid ka takistused: " + "; ".join(blockers[:2]).rstrip(".") + ".")
+    else:
+        text.append("Suuri eraldi takistusi päevavaates kirjas ei olnud; töö kulges pigem lahenduste kontrollimise ja viimistlemise rütmis.")
+    if learnings:
+        text.append("Päev andis juurde kasulikke teadmisi: " + "; ".join(learnings[:2]).rstrip(".") + ".")
+    if tools:
+        text.append("Töö tegemisel kasutati abiks: " + ", ".join(tools) + ".")
+    return "\n\n".join(text)
+
+
+def _clean_day_summary_text(text: str) -> str:
+    text = str(text or "").strip()
+    text = re.sub(r"^```(?:\w+)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"(?i)^päeva\s+kokkuvõte\s*:\s*", "", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) > 5000:
+        text = text[:5000].rstrip() + "…"
+    return text
+
+
+def _generate_day_summary(date: str, rows: list[dict], cfg: dict) -> tuple[str, str, str]:
+    """Loo serveri päevavaate ridadest mitte-tehnilisele lugejale sobiv terviktekst."""
+    engine, exe = resolve_engine(cfg)
+    model = str(cfg.get("summarizer", {}).get("model", "") or "")
+    if engine == "none" or exe is None:
+        return _fallback_day_summary(date, rows), "fallback", ""
+
+    rows_text = _day_summary_rows_text(rows)
+    if len(rows_text) > 24000:
+        rows_text = rows_text[:24000] + "\n…(kärbitud)"
+    prompt = (
+        "Kirjuta eestikeelne terviklik päevakokkuvõte aitrack päevavaate tunniridade põhjal. "
+        "Lugeja võib olla mitte-tehniline juht, klient või praktikajuhendaja: tekst peab olema selge, "
+        "inimlik ja huvitav, mitte sisemine arendaja logi.\n"
+        "Kasuta ainult allolevaid fakte; ära mõtle tulemusi juurde. Tõlgi tehniline sõnavara vajadusel "
+        "lihtsasse keelde. Ära maini failiteid, käsurea detaile, token'eid, toorprompte ega tööriista sisemisi samme, "
+        "kui need pole lugejale töö sisu mõistmiseks vajalikud.\n"
+        "Kirjuta 2–4 lühikest lõiku või 4–6 ladusat punkti. Too välja: päeva põhifookus, olulisemad tulemused, "
+        "takistused või riskid, ning mida uut selgus. Hoia pikkus umbes 900–1600 tähemärki. "
+        "Ära lisa pealkirja ega meta-kommentaari.\n\n"
+        f"Kuupäev: {date}\n"
+        f"Päevavaate tunniread:\n{rows_text or '- ridu pole'}"
+    )
+    cmd, stdin_text = _engine_cmd(engine, exe, prompt, model)
+    try:
+        res = subprocess.run(
+            cmd, input=stdin_text, capture_output=True, text=True,
+            timeout=int(cfg.get("summarizer", {}).get("timeout", 120)),
+            cwd=tempfile.gettempdir(),
+        )
+        text = _clean_day_summary_text(res.stdout or "")
+        if res.returncode == 0 and text:
+            return text, engine, model
+        log(f"day-summary: {engine} rc={res.returncode} err={(res.stderr or '')[:200]}")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log(f"day-summary: {engine} ebaõnnestus ({e}) — kasutan varvarianti")
+    return _fallback_day_summary(date, rows), "fallback", ""
+
+
+def cmd_day_summary(args, cfg):
+    """Küsi serverist päevavaate read, loo lokaalse harnessiga tervikkokkuvõte ja salvesta serverisse."""
+    _require_server_cfg(cfg)
+    date = getattr(args, "date", None) or _today_local_str(cfg)
+    if not _valid_date(date):
+        raise SystemExit("Kuupäev peab olema kujul YYYY-MM-DD")
+    params = {"date": date}
+    user_name = str(getattr(args, "user", "") or "").strip()
+    if user_name:
+        params["user"] = user_name
+    body = _server_get("day", params, cfg)
+    if not body or not body.get("ok"):
+        raise SystemExit(f"päevavaate laadimine ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+    rows = body.get("rows") if isinstance(body.get("rows"), list) else []
+    if not rows and not getattr(args, "allow_empty", False):
+        raise SystemExit(f"Serveri päevavaates pole {date} kohta ridu. Lisa --allow-empty, kui tahad tühja päeva teksti salvestada.")
+    run_cfg = copy.deepcopy(cfg)
+    if getattr(args, "model", None):
+        run_cfg.setdefault("summarizer", {})["model"] = args.model
+    summary, source_engine, model = _generate_day_summary(date, rows, run_cfg)
+    if getattr(args, "print_only", False):
+        print(summary)
+        return
+    payload = {"date": date, "summary": summary, "source": f"aitrack day-summary ({source_engine})", "model": model}
+    if user_name:
+        payload["user"] = user_name
+    saved = _server_post("day-summary", payload, cfg)
+    if not saved or not saved.get("ok"):
+        raise SystemExit(f"kokkuvõtte salvestamine ebaõnnestus: {saved.get('error') if saved else 'server ei vastanud'}")
+    print(summary)
+    print(f"\nSalvestatud serverisse: {date}" + (f" · kasutaja {user_name}" if user_name else ""))
 
 
 def _work_payload_from_args(args, cfg: dict, *, summary: str = "") -> tuple[dict, dict, dict]:
@@ -7605,6 +7842,7 @@ Kõige sagedasem: kopeeri päeva väljund Google Sheetsi
 Põhikäsud
   { _cli_base_cmd() } status                 näita seadistust ja logiallikaid
   { _cli_base_cmd() } day {date_hint}        prindi päeva D–G väljund terminali
+  { _cli_base_cmd() } day-summary {date_hint}  loo serveri päevavaate kohale loetav tervikkokkuvõte
   { _cli_base_cmd() } start                  ava brauseris visuaalne päevavaade/editor
   { _cli_base_cmd() } serve                  käivita keskserver SQLite andmebaasiga
   { _cli_base_cmd() } user password NIMI     sea brauseri login'i parool
@@ -8000,6 +8238,14 @@ def main():
     dy.add_argument("--flat", action="store_true", help="clipboard-kindel üks füüsiline TSV-rida (sisemised reavahetused → ·)")
     dy.add_argument("--html", action="store_true", help="HTML-tabel clipboardi jaoks (säilitab punktid lahtris eri ridadel)")
     dy.set_defaults(fn=cmd_day)
+
+    ds = sub.add_parser("day-summary", help="loo serveri päevavaatest loetav päeva tervikkokkuvõte ja salvesta see veebilehele")
+    ds.add_argument("date", nargs="?", help="kuupäev YYYY-MM-DD (vaikimisi täna)")
+    ds.add_argument("--user", help="adminina teise kasutaja nimi")
+    ds.add_argument("--model", help="ühekordne AI-mudeli override lokaalsele kokkuvõtjale")
+    ds.add_argument("--print-only", "--dry-run", action="store_true", dest="print_only", help="prindi kokkuvõte, aga ära salvesta serverisse")
+    ds.add_argument("--allow-empty", action="store_true", help="luba teksti koostamine ka siis, kui päevavaate ridu pole")
+    ds.set_defaults(fn=cmd_day_summary)
 
     args = p.parse_args()
     if not hasattr(args, "fn"):
