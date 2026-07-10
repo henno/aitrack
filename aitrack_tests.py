@@ -581,6 +581,7 @@ page = A._start_page_html()
 check("Kustuta kasutab deleteRow kinnitusega", "function deleteRow" in page and "confirm('Kas kustutan selle rea?" in page)
 check("textarea autosize olemas", "function autoResizeTextarea" in page and "scrollHeight" in page)
 check("textarea overflow hidden", "overflow:hidden" in page)
+check("lahtri klikk/fookus avab kogu tekstiala", "textarea.expanded" in page and "addEventListener('focus'" in page and "addEventListener('click'" in page)
 
 # ============ TEST 41: SQLite keskserveri helperid ============
 print("TEST 41: SQLite keskserver salvestab tunniread ja prompt-eventid tokeniga")
@@ -607,6 +608,9 @@ learn_gnome = A._infer_teadmine_from_texts(["mis gnome mul on?", "tõmba https:/
 check("praktikapäeviku teadmise heuristika annab loetava teksti", "Selgus, kas" not in learn_tail and "Tailscale" in learn_tail and "https://" not in learn_gnome)
 plain = A._plain_day_summary_from_texts(["aitrack uuenda globaalseid agent juhiseid", "aitrack work start ja tick käsuahel", "server login kasutajatele"], ["aitrack"])
 check("praktikapäeviku fallback kasutab projekti nime ja ei kuva toorprompti", "aitrack uuenda" not in plain["objekt"] and plain["objekt"].startswith("aitrack -"))
+long_summary = "Rebase tehtud. " + "Haru oli ajakohane ja kontrollitud. " * 20
+long_plain = A._plain_day_summary_from_texts(["AI agenti töö", long_summary], ["Puhastusproff - Finar"])
+check("praktikapäeviku kopeeritav saavutus ei lõppe varase kolme punktiga", "..." not in long_plain["saavutus"] and "…" not in long_plain["saavutus"])
 check("praktikapäeviku merge tunneb toorpromptliku lahtri ära", A._rawish_day_text("aitrack uuenda juhiseid; aitrack work start käsuahel"))
 
 # ============ TEST 42: repo URL normaliseerimine projektivõtmeks ============
@@ -1116,6 +1120,12 @@ check("activity HTML sisaldab detail modalit ja nuppe", "detailModal" in activit
 check("detail modal värvib JSON-i süntaksit", "syntaxHighlightJson" in activity_html and "json-key" in activity_html and "json-string" in activity_html)
 check("activity filtreerib worksessionid järgi", len(filtered_activity["sessions"]) == 1 and len(filtered_activity["raw_events"]) == 1 and not miss_activity["sessions"] and not miss_activity["raw_events"])
 check("activity HTML sisaldab worksessionid filtrit", "workSessionInput" in activity_html and "work_session_uid" in activity_html)
+
+# ============ TEST 60B: Pi extension ei lõika valmis-kokkuvõtet 260 märgi pealt ==========
+print("TEST 60B: Pi extension jätab valmis-kokkuvõtte kopeerimiseks alles")
+extension_text = A._pi_extension_text()
+check("Pi extension ei tee 260 märgi '...' lõiget", "s.length > 260" not in extension_text and "slice(0, 257)" not in extension_text)
+check("Pi extension lubab pikema summary serverisse", "summary.slice(0, 4000)" in extension_text)
 
 # ============ TEST 61: aitrack add vajab päris terminali ==========
 print("TEST 61: aitrack add vajab päris terminali")

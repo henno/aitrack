@@ -92,7 +92,7 @@ RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", 
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
-CLIENT_VERSION = 4
+CLIENT_VERSION = 5
 ALLOWLIST_SYNC_TTL_SECONDS = 10 * 60
 AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
@@ -3855,7 +3855,7 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
     prompt-eventidest/work-sessionitest. Eesmärk: mitte näidata toorprompte ega
     sisemisi failinimesid, vaid kirjeldada töö mõtet lihtsas keeles.
     """
-    safe_texts = [_safe_day_prompt_snippet(t, 500) for t in texts if str(t or "").strip()]
+    safe_texts = [_safe_day_prompt_snippet(t, 4000) for t in texts if str(t or "").strip()]
     combined = " ".join(s.lower() for s in safe_texts)
     project_blob = " ".join(str(p or "").lower() for p in (projects or []))
     prefix = _project_prefix_from_context(projects, combined)
@@ -3894,14 +3894,15 @@ def _plain_day_summary_from_texts(texts: list[str], projects: list[str] | None =
         return row("AI-tööpäeviku süsteemi arendamine",
                    "Tööpäeviku süsteemi täiendatud ja kontrollitud, et tegevused jõuaksid ülevaatesse arusaadavalt")
 
-    topics = _unique_limited([_topic_from_work_text(t, 90) for t in safe_texts], 2)
-    objekt = _object_with_project(prefix, topics[0]) if topics else (prefix or "Tööülesande lahendamine")
-    saavutus = "; ".join(topics) if topics else "Tegeldi praktikaga seotud tööülesandega"
-    return {"objekt": _cell_safe(objekt[:400]), "saavutus": _cell_safe(saavutus[:400])}
+    object_topics = _unique_limited([_topic_from_work_text(t, 90) for t in safe_texts], 2)
+    achievement_topics = _unique_limited([_topic_from_work_text(t, 1200) for t in safe_texts], 2)
+    objekt = _object_with_project(prefix, object_topics[0]) if object_topics else (prefix or "Tööülesande lahendamine")
+    saavutus = "; ".join(achievement_topics) if achievement_topics else "Tegeldi praktikaga seotud tööülesandega"
+    return {"objekt": _cell_safe(objekt[:400]), "saavutus": _cell_safe(saavutus)}
 
 
 def _learning_sentence_from_text(text: str) -> str:
-    topic = _topic_from_work_text(text, 120)
+    topic = _topic_from_work_text(text, 600)
     if not topic:
         return ""
     low = topic.lower()
@@ -3935,11 +3936,11 @@ def _infer_teadmine_from_texts(texts: list[str]) -> str:
     if domain:
         return _cell_safe("; ".join(domain)[:400])
     sentences = _unique_limited([_learning_sentence_from_text(t) for t in texts], 2)
-    return _cell_safe("; ".join(sentences)[:400]) if sentences else _NA
+    return _cell_safe("; ".join(sentences)[:1200]) if sentences else _NA
 
 
 def _blocker_sentence_from_text(text: str) -> str:
-    topic = _topic_from_work_text(text, 120)
+    topic = _topic_from_work_text(text, 600)
     if not topic:
         return ""
     low = topic.lower()
@@ -3968,7 +3969,7 @@ def _infer_takistus_from_texts(texts: list[str]) -> str:
         if any(marker in low for marker in _BLOCKER_MARKERS):
             hits.append(_blocker_sentence_from_text(t))
     sentences = _unique_limited(hits, 2)
-    return _cell_safe("; ".join(sentences)[:400]) if sentences else _NA
+    return _cell_safe("; ".join(sentences)[:1200]) if sentences else _NA
 
 
 def _prompt_to_work_sentence(text: str) -> str:
@@ -4193,7 +4194,7 @@ def _event_text(e: dict, *keys: str) -> str:
     return ""
 
 
-def _event_summary_text(e: dict, *, limit: int = 1000) -> str:
+def _event_summary_text(e: dict, *, limit: int = 4000) -> str:
     summary = _event_text(e, "summary", "done_summary", "change_summary", "changes", "result_summary", "prompt_text")
     payload = e.get("payload")
     if not summary and isinstance(payload, dict):
@@ -6951,7 +6952,7 @@ def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tu
         return active[0], ctx
     if not start_if_missing:
         return None, ctx
-    summary = _safe_day_prompt_snippet(getattr(args, "summary", None) or getattr(args, "prompt", "") or "AI agenti töö", 180)
+    summary = _safe_day_prompt_snippet(getattr(args, "summary", None) or getattr(args, "prompt", "") or "AI agenti töö", 1000)
     ns = argparse.Namespace(cwd=ctx["cwd"], issue=getattr(args, "issue", None), tool=tool,
                             summary=[summary], non_billable=False,
                             agent_uid=getattr(args, "agent_uid", ""), parent_agent_uid=getattr(args, "parent_agent_uid", ""),
@@ -6984,7 +6985,7 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
     tool_name = str(getattr(args, "tool_name", "") or getattr(args, "tool", "") or "pi")
     tool_call_id = str(getattr(args, "tool_call_id", "") or "")
     agent_uid = str(getattr(args, "agent_uid", "") or "")
-    summary_text = _safe_day_prompt_snippet(getattr(args, "summary", "") or getattr(args, "prompt", "") or "", 1000)
+    summary_text = _safe_day_prompt_snippet(getattr(args, "summary", "") or getattr(args, "prompt", "") or "", 4000)
     event = {
         "event_key": f"hook:{event_type}:{session_uid}:{agent_uid}:{tool_call_id}:{now}",
         "event_type": event_type,
@@ -6999,7 +7000,7 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
                     "name": ctx.get("name", ""), "local_path": ctx.get("local_path", ""),
                     "checkout_id": ctx.get("checkout_id", ""), "branch": ctx.get("branch", "")},
         "issue_key": ctx.get("issue_key", ""),
-        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 500)},
+        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 4000)},
     }
     tool_input = getattr(args, "tool_input", "")
     if tool_input:
@@ -7008,7 +7009,7 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
         except json.JSONDecodeError:
             event["payload"]["tool_input"] = str(tool_input)[:2000]
     if event_type in {"prompt_started", "prompt_finished"}:
-        event["prompt_text"] = _safe_day_prompt_snippet(getattr(args, "prompt", "") or getattr(args, "summary", "") or "", 500)
+        event["prompt_text"] = _safe_day_prompt_snippet(getattr(args, "prompt", "") or getattr(args, "summary", "") or "", 4000)
         event["tool"] = tool_name
         event["started_at"] = now
         event["ended_at"] = now
@@ -7362,8 +7363,8 @@ function common(ctx: any, agentUid: string, prompt?: string, summary?: string): 
     "--agent-uid", agentUid,
     "--owner-pid", String(process.ppid || process.pid),
     "--owner-command", process.argv.join(" ").slice(0, 500),
-    ...(prompt ? ["--prompt", prompt.slice(0, 500)] : []),
-    ...(summary ? ["--summary", summary.slice(0, 1000)] : []),
+    ...(prompt ? ["--prompt", prompt.slice(0, 2000)] : []),
+    ...(summary ? ["--summary", summary.slice(0, 4000)] : []),
   ];
 }
 
@@ -7391,7 +7392,7 @@ function compactSummary(text: string): string {
   let s = String(text || "").replace(/\s+/g, " ").trim();
   s = s.replace(/^(tehtud|valmis|ok|okei)[.!:\s-]*/i, "").trim();
   s = s.replace(/^[-*]\s+/, "").trim();
-  return s.length > 260 ? `${s.slice(0, 257)}...` : s;
+  return s;
 }
 
 function doneSummary(event: any): string {

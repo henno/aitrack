@@ -39,7 +39,8 @@ button.good { background:var(--ok); color:white; border-color:var(--ok); }
 button.warn { border-color:var(--bad); color:var(--bad); }
 button:hover { filter:brightness(1.08); }
 input, select, textarea { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
-textarea { width:100%; min-height:92px; resize:none; line-height:1.35; overflow:hidden; }
+textarea { width:100%; min-height:92px; max-height:92px; resize:none; line-height:1.35; overflow:hidden; }
+textarea.expanded, textarea:focus { max-height:none; overflow:auto; }
 .small { color:var(--muted); font-size:13px; }
 .status { color:var(--muted); min-height:20px; }
 table { width:100%; border-collapse:collapse; }
@@ -129,8 +130,12 @@ function autoResizeAll() {
 function wireTextareas(scope=document) {
   scope.querySelectorAll('textarea').forEach(el => {
     autoResizeTextarea(el);
+    el.addEventListener('focus', () => { el.classList.add('expanded'); autoResizeTextarea(el); });
+    el.addEventListener('click', () => { el.classList.add('expanded'); autoResizeTextarea(el); });
     el.addEventListener('input', () => autoResizeTextarea(el));
   });
+  requestAnimationFrame(autoResizeAll);
+  setTimeout(autoResizeAll, 0);
 }
 function deleteRow(button) {
   if (!confirm('Kas kustutan selle rea? Salvestamiseks vajuta pärast ka “Salvesta”.')) return;
