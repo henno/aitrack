@@ -378,14 +378,47 @@ def _git_root_within(record_project: str | Path, boundary: str | Path) -> str | 
     return None
 
 
+def _first_child_under_boundary(record_project: str | Path, boundary: str | Path) -> str | None:
+    """Gitita allow-juure all kasuta projektina esimest alamkausta.
+
+    Näide: allow `/home/me/praktika`, cwd `/home/me/praktika/ttjo` või
+    `/home/me/praktika/ttjo/src` → projekt `/home/me/praktika/ttjo`.
+    """
+    start = _resolve_path_loose(record_project)
+    boundary_p = _resolve_path_loose(boundary)
+    try:
+        if start.exists() and start.is_file():
+            start = start.parent
+    except OSError:
+        pass
+    boundary_parts = _norm_parts(boundary_p)
+    cur = start
+    while True:
+        cur_parts = _norm_parts(cur)
+        if cur_parts[: len(boundary_parts)] != boundary_parts:
+            return None
+        if cur_parts == boundary_parts:
+            return None
+        parent = cur.parent
+        if _norm_parts(parent) == boundary_parts:
+            try:
+                return str(cur.resolve())
+            except (OSError, ValueError, RuntimeError):
+                return str(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
 def match_project(record_project: str, allow: list[str]) -> str | None:
     """Tagastab konkreetse lubatud projekti tee.
 
     Kui allowlistis on üldine juurkaust (nt `~/projects`), otsime iga logikirje cwd-st
     ülespoole päris Git tööpuu juure, kuid ainult sobiva allowlisti juure piires. Nii ei
     koondu kõik kirjed üldise `projects` projekti alla. Git worktree puhul piisab `.git`
-    failist. Kui olemasoleva allowlisti alamkausta alt Git-rooti ei leita, jäetakse kirje
-    vahele; olematute test/legacy teede puhul säilib vana otsene sobitamine.
+    failist. Kui olemasoleva allowlisti alamkausta alt Git-rooti ei leita, kasutatakse
+    projektina allow-juure esimest alamkausta; olematute test/legacy teede puhul säilib
+    vana otsene sobitamine.
     """
     rp = _resolve_path_loose(record_project)
     direct = _best_allow_root_for_path(rp, allow)
@@ -398,10 +431,11 @@ def match_project(record_project: str, allow: list[str]) -> str | None:
         except OSError:
             exists = False
         # Hoia tagasiühilduvus olematute logiteede/testidega ja täpselt allowlisti lisatud
-        # mitte-Git kaustaga; sügavad mitte-Git alamkaustad üldjuure all jätame vahele.
+        # mitte-Git kaustaga. Olemasoleva gitita alamkausta puhul ära koonda tööd
+        # üldjuure alla: projektiks on allow-juure esimene alamkaust (nt praktika/ttjo).
         if not exists or _norm_parts(rp) == _norm_parts(_resolve_path_loose(direct)):
             return direct
-        return None
+        return _first_child_under_boundary(rp, direct)
 
     # Tagasiühilduvus: kui lubatud on põhirepo `/repo`, loe sibling worktree `/repo-123`
     # samaks projektiks, kui `.git` fail viitab põhirepo `.git/worktrees/...` alla.

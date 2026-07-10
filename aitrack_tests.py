@@ -188,14 +188,14 @@ for p in (repo_a / "src", repo_b / "app", repo_wt / "src", allow_root / "nogit" 
 check("allowlisti juur leiab sügava Git repo A", A.match_project(str(repo_a / "src"), [str(allow_root)]) == str(repo_a.resolve()))
 check("allowlisti juur leiab sügava Git repo B", A.match_project(str(repo_b / "app"), [str(allow_root)]) == str(repo_b.resolve()))
 check("allowlisti juur tunneb .git failiga worktree ära", A.match_project(str(repo_wt / "src"), [str(allow_root)]) == str(repo_wt.resolve()))
-check("allowlisti alamkaust ilma Git-rootita jäetakse vahele", A.match_project(str(allow_root / "nogit" / "deep"), [str(allow_root)]) is None)
+check("allowlisti gitita alamkaust muutub eraldi projektiks", A.match_project(str(allow_root / "nogit" / "deep"), [str(allow_root)]) == str((allow_root / "nogit").resolve()))
 reset_sink()
-setup([A.Record("Pi", str(repo_a / "src"), D(11), "repo a töö"), A.Record("Pi", str(repo_b / "app"), D(11), "repo b töö")], allow=[str(allow_root)])
+setup([A.Record("Pi", str(repo_a / "src"), D(11), "repo a töö"), A.Record("Pi", str(repo_b / "app"), D(11), "repo b töö"), A.Record("Pi", str(allow_root / "nogit" / "deep"), D(11), "gitita töö")], allow=[str(allow_root)])
 cfg = A.load_config(); cfg["group_by"] = "project"; allow = A.load_projects()
 A._now_utc = lambda: dt.datetime(2026, 6, 16, 12, 15, tzinfo=UTC)
 A.run_once(cfg, allow)
 objs = sorted(r[2] for r in ADDED)
-check("tunnipõhine run ei koonda kõike allow-juure nime alla", objs == ["OBJ[client-a]", "OBJ[client-b]"])
+check("tunnipõhine run ei koonda kõike allow-juure nime alla", objs == ["OBJ[client-a]", "OBJ[client-b]", "OBJ[nogit]"])
 
 # ============ TEST 12: backfill jätab juba-olemas tunni summeerimata (kuluvõit) ============
 print("TEST 12: backfill ei summeeri tunde, mis on juba lehel")

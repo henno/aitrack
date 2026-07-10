@@ -303,8 +303,8 @@ curl -H "X-Aitrack-Token: TOKEN" \
   otsib aitrack iga logikirje `cwd`-st ülespoole lähima Git tööpuu juure (`.git` kataloog või `.git`
   fail worktree puhul), aga ainult allowlisti juure piires. Nii eristuvad `~/projects/a` ja
   `~/projects/team/b` eraldi projektidena. Kui `cwd` on allowlisti juure all, aga Git tööpuud ei leita,
-  jäetakse see kirje vaikimisi vahele. **Käivita AI projektikaustast** (`cd projekt && pi/claude`), et
-  filtreerimine töötaks.
+  kasutatakse projektina allowlisti juure esimest alamkausta: `~/praktika/ttjo` → `ttjo`.
+  **Käivita AI projektikaustast** (`cd projekt && pi/claude`), et filtreerimine töötaks.
 - **Server kaitseb samuti allowlistiga.** `aitrack add` saadab lubatud juure serverisse ja peab tulema päris
   terminalist; AI agenti või skripti käest uut projekti jälgimisse ei lisata. Kui klient või agent proovib
   `work start`/evente saata projektist, mida pole lisatud, server ei salvesta neid. Kui lisasid projekti enne serveriga
