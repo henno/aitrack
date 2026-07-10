@@ -1209,5 +1209,57 @@ finally:
     A._server_post = _orig_server_post
 check("muutumatu täis-allowlist saadetakse cache'i ajal ainult korra", [c[0] for c in sync_calls].count("projects/allow") == 2)
 
+# ============ TEST 63: monthly report grupeerib issue ja annab evidence ==========
+print("TEST 63: monthly report koondab issue-põhise aja, töö ja põhjenduse")
+rdb = CFG / "server-monthly-report.db"
+rdb.unlink(missing_ok=True)
+rtok = A._db_add_user(rdb, "reporter")
+allow_server_project(rdb, rtok, "/tmp/pp-finar-report", "github.com/puhastusproff/pp-finar", "pp-finar")
+base_payload = {
+    "project": {"project_key": "github.com/puhastusproff/pp-finar", "repo_url": "git@github.com:Puhastusproff/pp-finar.git", "name": "pp-finar", "local_path": "/tmp/pp-finar-report", "checkout_id": "co-report", "branch": "main"},
+    "session": {"client_id": "client-report", "device_name": "reportbox", "platform": "linux", "checkout_id": "co-report", "tool": "pi", "local_path": "/tmp/pp-finar-report", "cwd": "/tmp/pp-finar-report", "branch": "main"},
+    "started_at": HFL(12).isoformat(),
+}
+explicit = A._db_work_start(rdb, rtok, {
+    **base_payload,
+    "issue": {"provider": "github", "issue_key": "701", "title": "Kasutajana tahan kuuraporti eksporti", "url": "https://github.com/example/issues/701", "body": "Põhjendus issue body põhjal"},
+    "work": {"title": "kuuraporti eksport", "summary": "alustasin #701", "billable": True},
+})
+A._db_work_tick(rdb, rtok, {"work_session_uid": explicit["work_session_uid"], "tick_at": HFL(12).isoformat()})
+A._db_work_tick(rdb, rtok, {"work_session_uid": explicit["work_session_uid"], "tick_at": (HFL(12) + dt.timedelta(minutes=1)).isoformat()})
+A._db_ingest_events(rdb, rtok, [{"event_key": "report-raw-1", "event_type": "agent_finished", "work_session_uid": explicit["work_session_uid"], "summary": "lisatud monthly report API", "occurred_at_utc": (HFL(12) + dt.timedelta(minutes=1)).isoformat()}])
+A._db_work_finish(rdb, rtok, {"work_session_uid": explicit["work_session_uid"], "summary": "explicit #701 valmis", "ended_at": (HFL(12) + dt.timedelta(minutes=2)).isoformat(), "result": "kept"})
+inferred_payload = {
+    **base_payload,
+    "session": {**base_payload["session"], "checkout_id": "co-report-2"},
+    "work": {"title": "paranda issue 701 järelkontroll", "summary": "teen GH-701 järelkontrolli", "billable": True},
+    "started_at": HFL(13).isoformat(),
+}
+inferred = A._db_work_start(rdb, rtok, inferred_payload)
+for offset in range(3):
+    A._db_work_tick(rdb, rtok, {"work_session_uid": inferred["work_session_uid"], "tick_at": (HFL(13) + dt.timedelta(minutes=offset)).isoformat()})
+A._db_work_finish(rdb, rtok, {"work_session_uid": inferred["work_session_uid"], "summary": "järelkontroll #701 valmis", "ended_at": (HFL(13) + dt.timedelta(minutes=3)).isoformat(), "result": "kept"})
+other_tok = A._db_add_user(rdb, "other-reporter")
+allow_server_project(rdb, other_tok, "/tmp/pp-finar-report", "github.com/puhastusproff/pp-finar", "pp-finar")
+other = A._db_work_start(rdb, other_tok, {
+    **base_payload,
+    "session": {**base_payload["session"], "client_id": "client-other", "checkout_id": "co-other"},
+    "issue": {"provider": "github", "issue_key": "702", "title": "Teise kasutaja töö"},
+    "work": {"title": "teise kasutaja töö", "summary": "teise kasutaja #702", "billable": True},
+})
+A._db_work_tick(rdb, other_tok, {"work_session_uid": other["work_session_uid"], "tick_at": HFL(14).isoformat()})
+A._db_work_finish(rdb, other_tok, {"work_session_uid": other["work_session_uid"], "summary": "teise kasutaja töö valmis", "ended_at": (HFL(14) + dt.timedelta(minutes=1)).isoformat(), "result": "kept"})
+admin_tok = A._db_add_user(rdb, "report-admin", role="admin")
+report = A._db_monthly_report(rdb, rtok, {"period": ["2026-06"], "project_key": ["github.com/puhastusproff/pp-finar"], "hourly_rate": ["82"]})
+admin_report = A._db_monthly_report(rdb, admin_tok, {"period": ["2026-06"], "project_key": ["github.com/puhastusproff/pp-finar"], "hourly_rate": ["82"]})
+line = report["lines"][0] if report.get("lines") else {}
+check("monthly report tagastab ühe issue rea", report.get("count") == 1 and line.get("issue") == "#701")
+check("monthly report summeerib explicit ja tekstist tuvastatud issue minutid", line.get("minutes") == 5 and line.get("time") == "00:05")
+check("monthly report arvutab summa", line.get("amount") == 6.83 and report.get("amount") == 6.83)
+check("monthly report sisaldab issue põhjenduse body't", line.get("issue_body") == "Põhjendus issue body põhjal" and line.get("problem_text") == "Põhjendus issue body põhjal")
+check("monthly report sisaldab tehtud töö kokkuvõtteid", "explicit #701 valmis" in line.get("work_done", []) and "järelkontroll #701 valmis" in line.get("work_done", []))
+check("monthly report sisaldab sessiooni ja raw-event evidence'it", len(line.get("evidence", {}).get("work_session_uids", [])) == 2 and len(line.get("evidence", {}).get("raw_event_ids", [])) == 1)
+check("monthly report tavakasutaja näeb ainult enda ridu ja admin kõiki", report.get("count") == 1 and admin_report.get("count") == 2)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

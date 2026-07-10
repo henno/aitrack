@@ -505,6 +505,27 @@ def _normalise_issue_key(value: str | None) -> str:
     return v.strip()
 
 
+_ISSUE_KEY_TEXT_PATTERNS = (
+    re.compile(r"(?<![\w/.-])#(\d{1,7})(?![\w/.-])"),
+    re.compile(r"(?i)\b(?:issue|gh)[\s:#-]+(\d{1,7})(?![\w/.-])"),
+)
+
+
+def _issue_key_from_texts(*texts: str) -> str:
+    """Leia tekstidest üks üheselt tuvastatav issue number."""
+    found: list[str] = []
+    for text in texts:
+        raw = str(text or "")
+        if not raw:
+            continue
+        for pattern in _ISSUE_KEY_TEXT_PATTERNS:
+            for match in pattern.finditer(raw):
+                key = _normalise_issue_key(match.group(1))
+                if key and key not in found:
+                    found.append(key)
+    return found[0] if len(found) == 1 else ""
+
+
 def _issue_from_branch(branch: str) -> str:
     b = branch or ""
     # Eelista haru alguses või kaldkriipsu järel olevat issue numbrit: 662-x, gh-662-x, fix/662-x.
@@ -1981,6 +2002,7 @@ def _db_init(path: Path) -> None:
           issue_key TEXT NOT NULL,
           title TEXT NOT NULL DEFAULT '',
           url TEXT NOT NULL DEFAULT '',
+          body TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           UNIQUE(project_id, provider, issue_key)
@@ -2153,6 +2175,7 @@ def _db_init(path: Path) -> None:
         _db_add_column_if_missing(conn, "work_sessions", "owner_cli", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "work_sessions", "status_detail", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "work_sessions", "rollup_finalized_at", "TEXT")
+        _db_add_column_if_missing(conn, "issues", "body", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "day_summaries", "source", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "day_summaries", "model", "TEXT NOT NULL DEFAULT ''")
         _db_add_column_if_missing(conn, "prompt_events", "project_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL")
@@ -2745,15 +2768,16 @@ def _db_upsert_issue(conn: sqlite3.Connection, project_id: int, issue: dict, def
     provider = str(issue.get("provider") or default_provider or "local")
     title = str(issue.get("title") or "")
     url = str(issue.get("url") or "")
+    body = str(issue.get("body") or issue.get("description") or "")
     conn.execute(
-        "INSERT OR IGNORE INTO issues(project_id, provider, issue_key, title, url, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (project_id, provider, issue_key, title, url, now, now),
+        "INSERT OR IGNORE INTO issues(project_id, provider, issue_key, title, url, body, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (project_id, provider, issue_key, title, url, body, now, now),
     )
     conn.execute(
         "UPDATE issues SET title = COALESCE(NULLIF(?, ''), title), url = COALESCE(NULLIF(?, ''), url), "
-        "updated_at = ? WHERE project_id = ? AND provider = ? AND issue_key = ?",
-        (title, url, now, project_id, provider, issue_key),
+        "body = COALESCE(NULLIF(?, ''), body), updated_at = ? WHERE project_id = ? AND provider = ? AND issue_key = ?",
+        (title, url, body, now, project_id, provider, issue_key),
     )
     return _db_one_id(
         conn,
@@ -2841,6 +2865,13 @@ def _db_work_graph(conn: sqlite3.Connection, user: sqlite3.Row, payload: dict, n
     default_provider = str(issue.get("provider") or _issue_provider_for_project_key(str(project.get("project_key") or project.get("key") or "")))
     if not issue.get("issue_key") and not issue.get("key") and session.get("branch"):
         issue = {**issue, "issue_key": _issue_from_branch(str(session.get("branch")))}
+    if not issue.get("issue_key") and not issue.get("key"):
+        inferred_issue_key = _issue_key_from_texts(
+            str(work.get("title") or ""), str(work.get("summary") or ""),
+            str(payload.get("title") or ""), str(payload.get("summary") or ""), str(session.get("branch") or ""),
+        )
+        if inferred_issue_key:
+            issue = {**issue, "issue_key": inferred_issue_key}
     issue_id = _db_upsert_issue(conn, project_id, issue, default_provider, now)
     title = str(work.get("title") or payload.get("title") or issue.get("title") or "").strip()
     billable_default = bool(work.get("billable", payload.get("billable", True)))
@@ -3141,6 +3172,176 @@ def _period_bounds(q: dict) -> tuple[str, str, str]:
     end = end or now
     label = f"{start.astimezone(tz).date()}..{end.astimezone(tz).date()}"
     return start.isoformat(), end.isoformat(), label
+
+
+def _money_amount(minutes: int, hourly_rate: float | None) -> float | None:
+    return round((int(minutes) / 60.0) * hourly_rate, 2) if hourly_rate is not None else None
+
+
+def _report_time(minutes: int) -> str:
+    minutes = int(minutes)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _append_unique_text(items: list[str], value: str, *, limit: int = 50) -> None:
+    text = _safe_day_prompt_snippet(value, 1200).strip()
+    if not text:
+        return
+    if text.lower() in {i.lower() for i in items}:
+        return
+    if len(items) < limit:
+        items.append(text)
+
+
+def _payload_json_dict(text: str) -> dict:
+    try:
+        value = json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _report_raw_event_summary(row: sqlite3.Row, session_summary: str = "") -> str:
+    payload = _payload_json_dict(str(row["payload_json"] or ""))
+    payload_summary = _event_summary_text(payload, limit=500)
+    display_tool = _raw_event_display_tool(str(row["tool_name"] or ""), payload)
+    return _raw_event_display_summary(str(row["event_type"] or ""), display_tool, payload_summary, session_summary)
+
+
+def _db_monthly_report(path: Path, token: str, q: dict) -> dict:
+    _db_init(path)
+    start_iso, end_iso, label = _period_bounds(q)
+    rate_s = _qval(q, "hourly_rate") or _qval(q, "rate")
+    hourly_rate = float(rate_s) if rate_s else None
+    project_filter = _qval(q, "project_key")
+    customer_filter = _qval(q, "customer_id")
+    issue_filter = _normalise_issue_key(_qval(q, "issue"))
+    include_non_billable = str(_qval(q, "include_non_billable") or "").lower() in {"1", "true", "yes", "jah"}
+    limit = max(1, min(int(_qval(q, "limit") or 10000), 50000))
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        where = ["ws.status != 'discarded'", "ws.started_at < ?", "COALESCE(ws.ended_at, ws.last_seen_at, ws.started_at) >= ?"]
+        args: list = [end_iso, start_iso]
+        if not include_non_billable:
+            where.append("ws.billable = 1")
+        if user["role"] != "admin":
+            where.append("ws.user_id = ?")
+            args.append(int(user["id"]))
+        if project_filter:
+            where.append("p.project_key = ?")
+            args.append(project_filter)
+        if customer_filter:
+            where.append("p.customer_id = ?")
+            args.append(int(customer_filter))
+        rows = conn.execute(f"""
+            SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
+                   wi.id AS work_item_id, wi.title AS work_title, p.id AS project_id,
+                   p.project_key, p.name AS project_name, c.name AS customer_name,
+                   i.provider, i.issue_key, i.title AS issue_title, i.url AS issue_url, i.body AS issue_body,
+                   (SELECT COUNT(*) FROM minute_ticks mt WHERE mt.work_session_id = ws.id) AS tick_count,
+                   (SELECT COALESCE(SUM(minutes), 0) FROM work_session_active_intervals wai WHERE wai.work_session_id = ws.id) AS interval_minutes
+            FROM work_sessions ws
+            JOIN users u ON u.id = ws.user_id
+            JOIN devices d ON d.id = ws.device_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN customers c ON c.id = p.customer_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(where)}
+            ORDER BY p.project_key, i.issue_key, wi.title, ws.started_at
+            LIMIT ?
+        """, (*args, limit)).fetchall()
+        session_ids = [int(r["id"]) for r in rows]
+        raw_by_session: dict[int, list[sqlite3.Row]] = {sid: [] for sid in session_ids}
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
+            raw_rows = conn.execute(f"""
+                SELECT * FROM raw_events
+                WHERE work_session_id IN ({placeholders})
+                  AND occurred_at_utc >= ? AND occurred_at_utc < ?
+                ORDER BY occurred_at_utc, id
+            """, (*session_ids, start_iso, end_iso)).fetchall()
+            for raw in raw_rows:
+                sid = int(raw["work_session_id"])
+                raw_by_session.setdefault(sid, []).append(raw)
+        project_ids = sorted({int(r["project_id"]) for r in rows})
+        issue_meta: dict[tuple[int, str, str], dict] = {}
+        if project_ids:
+            placeholders = ",".join("?" for _ in project_ids)
+            for item in conn.execute(f"SELECT * FROM issues WHERE project_id IN ({placeholders})", tuple(project_ids)).fetchall():
+                issue_meta[(int(item["project_id"]), str(item["provider"] or ""), str(item["issue_key"] or ""))] = dict(item)
+    groups: dict[tuple, dict] = {}
+    for r in rows:
+        sid = int(r["id"])
+        raw_rows = raw_by_session.get(sid, [])
+        raw_summaries = [_report_raw_event_summary(raw, str(r["summary"] or r["work_title"] or "")) for raw in raw_rows]
+        provider = str(r["provider"] or _issue_provider_for_project_key(str(r["project_key"] or "")))
+        issue_key = str(r["issue_key"] or "")
+        inference_source = "explicit" if issue_key else ""
+        if not issue_key:
+            issue_key = _issue_key_from_texts(str(r["branch"] or ""), str(r["summary"] or ""), str(r["result"] or ""), str(r["work_title"] or ""), *raw_summaries)
+            inference_source = "text" if issue_key else "none"
+        if issue_filter and issue_key != issue_filter:
+            continue
+        meta = issue_meta.get((int(r["project_id"]), provider, issue_key), {}) if issue_key else {}
+        issue_title = str(meta.get("title") or r["issue_title"] or "")
+        issue_url = str(meta.get("url") or r["issue_url"] or "")
+        issue_body = str(meta.get("body") or r["issue_body"] or "")
+        key = (str(r["project_key"] or ""), provider, issue_key or f"work_item:{r['work_item_id']}")
+        group = groups.setdefault(key, {
+            "project": r["project_name"], "project_key": r["project_key"], "customer": r["customer_name"] or "",
+            "issue": f"#{issue_key}" if issue_key else "", "issue_key": issue_key, "issue_provider": provider if issue_key else "",
+            "issue_title": issue_title, "issue_url": issue_url, "issue_body": issue_body,
+            "title": issue_title or r["work_title"], "problem_text": issue_body or issue_title or r["work_title"],
+            "issue_source": inference_source, "minutes": 0, "time": "00:00", "hourly_rate": hourly_rate, "amount": None,
+            "work_done": [], "sessions": [],
+            "evidence": {"work_item_ids": [], "session_ids": [], "work_session_uids": [], "raw_event_ids": []},
+        })
+        if issue_title and not group["issue_title"]:
+            group["issue_title"] = issue_title
+            group["title"] = issue_title
+        if issue_url and not group["issue_url"]:
+            group["issue_url"] = issue_url
+        if issue_body and not group["issue_body"]:
+            group["issue_body"] = issue_body
+            group["problem_text"] = issue_body
+        minutes = _work_session_minutes(r, int(r["tick_count"] or 0))
+        if minutes <= 0:
+            continue
+        group["minutes"] += minutes
+        _append_unique_text(group["work_done"], str(r["summary"] or ""))
+        if not r["summary"]:
+            _append_unique_text(group["work_done"], str(r["work_title"] or ""))
+        for summary in raw_summaries:
+            if summary and summary not in {"Töö käis edasi", "Sündmus salvestati"}:
+                _append_unique_text(group["work_done"], summary, limit=20)
+        group["sessions"].append({
+            "work_session_id": sid, "work_session_uid": r["session_uid"], "work_item_id": int(r["work_item_id"]),
+            "user": r["user_name"], "tool": r["tool"], "device": r["device_name"], "branch": r["branch"],
+            "started_at": r["started_at"], "ended_at": r["ended_at"], "last_seen_at": r["last_seen_at"],
+            "status": r["status"], "result": r["result"], "summary": r["summary"], "minutes": minutes,
+            "issue_source": inference_source,
+        })
+        if int(r["work_item_id"]) not in group["evidence"]["work_item_ids"]:
+            group["evidence"]["work_item_ids"].append(int(r["work_item_id"]))
+        group["evidence"]["session_ids"].append(sid)
+        group["evidence"]["work_session_uids"].append(r["session_uid"])
+        for raw in raw_rows:
+            group["evidence"]["raw_event_ids"].append(int(raw["id"]))
+    lines = []
+    for group in groups.values():
+        mins = int(group["minutes"])
+        if mins <= 0:
+            continue
+        group["time"] = _report_time(mins)
+        group["amount"] = _money_amount(mins, hourly_rate)
+        lines.append(group)
+    lines.sort(key=lambda x: (str(x.get("project_key") or ""), str(x.get("issue_key") or ""), str(x.get("title") or "")))
+    total_minutes = sum(int(line["minutes"]) for line in lines)
+    return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "count": len(lines), "minutes": total_minutes, "time": _report_time(total_minutes),
+            "hourly_rate": hourly_rate, "amount": _money_amount(total_minutes, hourly_rate), "currency": "EUR",
+            "lines": lines}
 
 
 def _db_invoice_lines(path: Path, token: str, q: dict) -> dict:
@@ -4647,6 +4848,8 @@ def _db_ingest_legacy_prompt_events_conn(conn: sqlite3.Connection, user: sqlite3
                 project_raw = str(project_payload.get("local_path") or project_payload.get("project_key") or project_raw)
                 issue_payload = e.get("issue") if isinstance(e.get("issue"), dict) else {}
                 issue_key = _normalise_issue_key(str(e.get("issue_key") or issue_payload.get("issue_key") or issue_payload.get("key") or ""))
+                if not issue_key:
+                    issue_key = _issue_key_from_texts(str(e.get("prompt_text") or ""), _event_summary_text(e), str(e.get("event_key") or ""))
                 if issue_key:
                     issue_payload = {**issue_payload, "issue_key": issue_key}
                 default_provider = str(issue_payload.get("provider") or _issue_provider_for_project_key(str(project_payload.get("project_key") or "")))
@@ -6562,6 +6765,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
             if u.path == "/api/export/active-intervals" and self._server_mode():
                 self._json(_db_export_active_intervals(self._db_path(), self._token(q), q))
                 return
+            if u.path == "/api/report/monthly" and self._server_mode():
+                self._json(_db_monthly_report(self._db_path(), self._token(q), q))
+                return
             if u.path == "/api/billing/invoice-lines" and self._server_mode():
                 self._json(_db_invoice_lines(self._db_path(), self._token(q), q))
                 return
@@ -7180,6 +7386,53 @@ def cmd_cleanup(args, cfg):
     print(f"Cleanup {mode}: raw_events={body.get('raw_events', 0)} minute_ticks={body.get('minute_ticks', 0)}")
     if body.get("dry_run"):
         print("Päris kustutamiseks lisa --apply")
+
+
+def _monthly_report_params_from_args(args) -> dict:
+    params = {"period": args.period, "format": getattr(args, "format", "json")}
+    if getattr(args, "project_key", ""):
+        params["project_key"] = args.project_key
+    if getattr(args, "customer_id", None):
+        params["customer_id"] = str(args.customer_id)
+    if getattr(args, "issue", ""):
+        params["issue"] = args.issue
+    if getattr(args, "rate", None) is not None:
+        params["hourly_rate"] = str(args.rate)
+    if getattr(args, "tz", ""):
+        params["tz"] = args.tz
+    if getattr(args, "limit", None):
+        params["limit"] = str(args.limit)
+    if getattr(args, "include_non_billable", False):
+        params["include_non_billable"] = "1"
+    return params
+
+
+def _print_monthly_report_markdown(body: dict) -> None:
+    print(f"# aitrack kuuraport {body.get('period', '')}\n")
+    print("| Issue | Aeg | Summa | Pealkiri |")
+    print("|---|---:|---:|---|")
+    for line in body.get("lines", []):
+        issue = line.get("issue") or "—"
+        amount = line.get("amount")
+        amount_s = "" if amount is None else f"{amount:.2f}"
+        title = str(line.get("title") or "").replace("|", "\\|")
+        print(f"| {issue} | {line.get('time', '00:00')} | {amount_s} | {title} |")
+    total_amount = body.get("amount")
+    total_amount_s = "" if total_amount is None else f"{total_amount:.2f}"
+    print(f"| **Kokku** | **{body.get('time', '00:00')}** | **{total_amount_s}** | **{body.get('count', 0)} rida** |")
+
+
+def cmd_report(args, cfg):
+    _require_server_cfg(cfg)
+    if args.report_cmd != "month":
+        raise SystemExit("Kasuta: aitrack report month --period YYYY-MM")
+    body = _server_get("report/monthly", _monthly_report_params_from_args(args), cfg)
+    if not body or not body.get("ok"):
+        raise SystemExit(f"report month ebaõnnestus: {body.get('error') if body else 'server ei vastanud'}")
+    if args.format == "markdown":
+        _print_monthly_report_markdown(body)
+    else:
+        print(json.dumps(body, ensure_ascii=False, indent=2))
 
 
 def cmd_events(args, cfg):
@@ -7852,6 +8105,8 @@ Põhikäsud
   { _cli_base_cmd() } tick                   saada kõigi aktiivsete work_session'ite minut
   { _cli_base_cmd() } install --minute-tracking  lisa OS-i iga-minuti tick timer
   { _cli_base_cmd() } work done "kokkuvõte"  lõpeta aktiivne work_session
+  { _cli_base_cmd() } report month --period 2026-07 --project-key github.com/puhastusproff/pp-finar --rate 82
+                                ekspordi issue-põhine kuuraport serverist
   https://SERVER/activity       serveri activity/log vaade login'iga
   { _cli_base_cmd() } note "tekst"           lisa käsitsi märge praegusele tunnile
   { _cli_base_cmd() } note                   näita käsitsi märkmeid
@@ -8064,6 +8319,20 @@ def main():
     evfl.set_defaults(fn=cmd_events)
     evst = evsub.add_parser("status", help="näita pending eventide arvu")
     evst.set_defaults(fn=cmd_events)
+
+    rpt = sub.add_parser("report", help="serveri aruandluse eksport")
+    rsub = rpt.add_subparsers(dest="report_cmd", required=True)
+    rmonth = rsub.add_parser("month", help="ekspordi issue-põhine kuuraport serverist")
+    rmonth.add_argument("--period", required=True, help="periood kujul YYYY-MM")
+    rmonth.add_argument("--project-key", help="filtreeri projektivõtme järgi")
+    rmonth.add_argument("--customer-id", type=int, help="filtreeri kliendi järgi")
+    rmonth.add_argument("--issue", help="filtreeri issue numbri/võtme järgi")
+    rmonth.add_argument("--rate", type=float, help="tunnihind summa arvutamiseks")
+    rmonth.add_argument("--tz", default="", help="perioodi ajavöönd, nt Europe/Tallinn")
+    rmonth.add_argument("--limit", type=int, default=10000, help="maksimaalne sessioonide arv")
+    rmonth.add_argument("--include-non-billable", action="store_true", help="kaasa ka mittearveldatavad sessioonid")
+    rmonth.add_argument("--format", choices=("json", "markdown"), default="json")
+    rmonth.set_defaults(fn=cmd_report)
 
     hk = sub.add_parser("hook", help="harness hookide sisend (Pi/Claude adapterite jaoks)")
     hksub = hk.add_subparsers(dest="hook_cmd", required=True)
