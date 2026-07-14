@@ -4191,10 +4191,12 @@ def _db_rows_for_day(path: Path, token: str, date: str, cfg: dict | None = None,
         ).fetchall()
         rows = [[r["date"], r["hour"], r["objekt"], r["saavutus"], r["takistus"],
                  r["teadmine"], r["tool"], r["row_key"]] for r in rows_db]
-        derived_work = _db_work_session_day_rows(conn, target_user, date, rows, cfg)
-        rows = _merge_day_rows_with_work_sessions(rows, derived_work)
+        # Praktikapäeviku tekst peab eelistama tunni sisulisi AI-transkripte/prompt-evente.
+        # Work-session/minute heartbeat on aja tõendus ja viimane fallback, mitte põhiline sõnastusallikas.
         derived_prompts = _db_prompt_event_day_rows(conn, target_user, date, rows, cfg)
-    return _merge_same_hour_day_rows(_merge_day_rows_with_work_sessions(rows, derived_prompts))
+        rows = _merge_day_rows_with_work_sessions(rows, derived_prompts)
+        derived_work = _db_work_session_day_rows(conn, target_user, date, rows, cfg)
+    return _merge_same_hour_day_rows(_merge_day_rows_with_work_sessions(rows, derived_work))
 
 
 def _db_days(path: Path, token: str, q: dict | None = None) -> list[str]:

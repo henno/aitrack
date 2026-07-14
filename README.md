@@ -140,8 +140,9 @@ cd ~ && claude                    # ✗ kodukaustast → ei eristu projektiks
 | 18:00 | Pakid asju | 🔔 **Päeva-digest:** *"AI-töö 1p: 4 aktiivset tundi, 47 prompti — kalaradar-mono 2h, parkproduction 2h"* |
 
 **Väljund on üks rida PÄEVA kohta** (praktikapäeviku vorm). Iga tund lisab sellesse päevaritta
-ühe **nummerdatud punkti** ja numbrid on kõigis neljas sisuveerus kohakuti. LLM jagab iga tunni
-nelja välja: *Objekt ja ülesanne / Saavutused / Takistused / Uued teadmised*.
+ühe **nummerdatud punkti** ja numbrid on kõigis neljas sisuveerus kohakuti. Päeviku sõnastus tehakse
+iga tunni AI-transkriptidest / prompt-eventidest; minuti heartbeat'id ja raw-eventid on ainult aja/progressi
+tõenduseks. LLM jagab iga tunni neli välja: *Objekt ja ülesanne / Saavutused / Takistused / Uued teadmised*.
 
 | Kuupäev | Punkte | Nädalapäev | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised |
 |---|---|---|---|---|---|---|
@@ -213,7 +214,8 @@ saavad ajutise IP-ban'i.
 
 Harnessi/hookide jaoks salvestab server append-only `raw_events` ridu. Saada batch `POST /api/events`
 kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/api/prompt/done`,
-`/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Ekspordi raw evente
+`/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Praktikapäeviku fallback eelistab
+sisulisi `prompt_events` ridu ning kasutab work-session/minute infot ainult viimase varuvariandina. Ekspordi raw evente
 `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id piiratakse ning tüüpilised token/parool/saladuse
 võtmed redigeeritakse enne talletamist. `before_tool_call` uuendab jooksva tooli välja ja watchdog saab
 näidata `stuck` sessioone. Work-session'id ja sleep-gap'e arvestavad aktiivsed intervallid on eksporditavad

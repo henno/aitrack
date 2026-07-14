@@ -719,8 +719,8 @@ check("praktikavaade genereerib päeva", len(practice["days"]) == 1 and "pp-fina
 check("activity endpoint helper näitab sessioone ja prompt-evente", len(activity["sessions"]) == 1 and len(activity["prompt_events"]) == 1)
 check("activity sisaldab serveri work_session_uid väärtust", activity["sessions"][0]["work_session_uid"] == start["work_session_uid"])
 check("activity sisaldab checkouti failiteed", activity["sessions"][0]["local_path"] == "/tmp/pp-finar-pi")
-check("serveri päevavaade asendab automaatkokkuvõtte placeholderi work-session kokkuvõttega", "parandus valmis" in day_rows_with_work[0][3])
-check("serveri päevavaade tuletab work-sessionist uued teadmised", day_rows_with_work[0][5] != A._NA)
+check("serveri päevavaade asendab automaatkokkuvõtte placeholderi tunni prompt-event transkriptiga", "tee issue 662" in day_rows_with_work[0][3] and "parandus valmis" not in day_rows_with_work[0][3])
+check("serveri päevavaade tuletab prompt-event transkriptist uued teadmised", day_rows_with_work[0][5] != A._NA)
 
 # ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
 print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")
