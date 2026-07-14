@@ -115,6 +115,15 @@ class Record:
     text: str          # kasutaja prompt
 
 
+@dataclass
+class TranscriptRecord:
+    tool: str          # AI-tööriist
+    project: str       # absoluutne tee, kust AI-d kasutati (cwd / workspace)
+    ts: dt.datetime    # UTC, timezone-aware
+    role: str          # "user" | "assistant" | muu roll, kui logi nii ütleb
+    text: str          # vestluse tekstiosa
+
+
 # --- failisüsteemi abifunktsioonid ------------------------------------------
 def _mkconfdir() -> None:
     """Loo CONFIG_DIR ja piira õigused 0o700 (token elab seal)."""
@@ -1235,6 +1244,49 @@ def claude_records(since: dt.datetime) -> list[Record]:
     return out
 
 
+def claude_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
+    out: list[TranscriptRecord] = []
+    if not CLAUDE_PROJECTS.is_dir():
+        return out
+    cutoff = since.timestamp()
+    for jsonl in CLAUDE_PROJECTS.glob("*/*.jsonl"):
+        try:
+            if jsonl.stat().st_mtime < cutoff - 3600:
+                continue
+        except OSError:
+            continue
+        cwd = ""
+        try:
+            with jsonl.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or ('"user"' not in line and '"assistant"' not in line):
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("isMeta"):
+                        continue
+                    cwd = d.get("cwd") or cwd
+                    msg = d.get("message") or {}
+                    role = str(msg.get("role") or d.get("type") or "").strip().lower()
+                    if role not in {"user", "assistant"}:
+                        continue
+                    ts = parse_iso(d.get("timestamp", ""))
+                    if ts is None or ts <= since:
+                        continue
+                    text = _content_text(msg.get("content"))
+                    if role == "user" and not is_user_prompt(text):
+                        continue
+                    text = re.sub(r"\s+", " ", text or "").strip()
+                    if cwd and text:
+                        out.append(TranscriptRecord("Claude", cwd, ts, role, text))
+        except OSError:
+            continue
+    return out
+
+
 def _codex_cwd_map(needed_ids: set[str]) -> dict[str, str]:
     """session_id -> cwd, AINULT vajalike sessioonide rollout-failidest.
 
@@ -1395,6 +1447,58 @@ def pi_records(since: dt.datetime) -> list[Record]:
     return out
 
 
+def pi_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
+    """Loe Pi sessioonidest nii kasutaja kui assistendi tekstid tunnikokkuvõtteks."""
+    out: list[TranscriptRecord] = []
+    if not PI_SESSIONS.is_dir():
+        return out
+    cutoff = since.timestamp()
+    for jsonl in PI_SESSIONS.rglob("*.jsonl"):
+        try:
+            if jsonl.stat().st_mtime < cutoff - 3600:
+                continue
+        except OSError:
+            continue
+        cwd = ""
+        try:
+            with jsonl.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if '"session"' not in line and '"user"' not in line and '"assistant"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") == "session":
+                        cwd = d.get("cwd") or cwd
+                        continue
+                    if d.get("type") != "message":
+                        continue
+                    msg = d.get("message") or {}
+                    role = str(msg.get("role") or "").strip().lower()
+                    if role not in {"user", "assistant"}:
+                        continue
+                    ts = parse_iso(d.get("timestamp", ""))
+                    if ts is None:
+                        ts_raw = msg.get("timestamp")
+                        if isinstance(ts_raw, (int, float)):
+                            ts = from_epoch(ts_raw, "ms" if ts_raw > 10_000_000_000 else "s")
+                    if ts is None or ts <= since:
+                        continue
+                    text = _content_text(msg.get("content"))
+                    if role == "user" and not is_user_prompt(text):
+                        continue
+                    text = re.sub(r"\s+", " ", text or "").strip()
+                    if cwd and text:
+                        out.append(TranscriptRecord("Pi", cwd, ts, role, text))
+        except OSError:
+            continue
+    return out
+
+
 def opencode_records(since: dt.datetime) -> list[Record]:
     """Loe OpenCode'i SQLite-andmebaasist kasutaja tekstiosad.
 
@@ -1443,9 +1547,68 @@ def opencode_records(since: dt.datetime) -> list[Record]:
     return out
 
 
+def opencode_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
+    out: list[TranscriptRecord] = []
+    if not OPENCODE_DB.exists():
+        return out
+    since_ms = int(since.timestamp() * 1000)
+    try:
+        db = OPENCODE_DB.resolve()
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return out
+    try:
+        cur = conn.execute(
+            "SELECT p.time_created, s.directory, p.data, m.data "
+            "FROM part p "
+            "JOIN message m ON p.message_id = m.id "
+            "JOIN session s ON p.session_id = s.id "
+            "WHERE p.time_created > ? "
+            "ORDER BY p.time_created",
+            (since_ms,),
+        )
+        for ts_raw, directory, part_data, msg_data in cur:
+            try:
+                msg = json.loads(msg_data or "{}")
+                part = json.loads(part_data or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            role = str(msg.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"} or part.get("type") != "text":
+                continue
+            ts = from_epoch(float(ts_raw), "ms")
+            if ts <= since:
+                continue
+            text = re.sub(r"\s+", " ", str(part.get("text") or "")).strip()
+            if role == "user" and not is_user_prompt(text):
+                continue
+            if directory and text:
+                out.append(TranscriptRecord("OpenCode", str(directory), ts, role, text))
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
 def collect_records(since: dt.datetime) -> list[Record]:
     recs = (claude_records(since) + codex_records(since) + antigravity_records(since) +
             pi_records(since) + opencode_records(since))
+    recs.sort(key=lambda r: r.ts)
+    return recs
+
+
+def collect_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
+    """Loe lokaalsed vestluse tekstiosad tunnikokkuvõtteks.
+
+    Serverisse ei saadeta tervet transkripti; seda kasutatakse lokaalselt tunni päevikurea
+    koostamiseks. Tööriistadel, mille täielikku vestlust me ei oska lugeda, jääb fallbackiks
+    kasutaja prompti tekst.
+    """
+    recs = (claude_transcript_records(since) + pi_transcript_records(since) +
+            opencode_transcript_records(since))
+    recs.extend(TranscriptRecord(r.tool, r.project, r.ts, "user", r.text)
+                for r in (codex_records(since) + antigravity_records(since)))
     recs.sort(key=lambda r: r.ts)
     return recs
 
@@ -1552,14 +1715,15 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
     if engine == "none" or exe is None:
         return _fallback_item(prompts)
 
-    joined = "\n".join(f"- {p[:300]}" for p in prompts)
-    if len(joined) > 8000:  # piira koondprompti suurust
-        joined = joined[:8000] + "\n…(kärbitud)"
+    joined = "\n".join(f"- {p[:700]}" for p in prompts)
+    if len(joined) > 12000:  # piira koondprompti suurust
+        joined = joined[:12000] + "\n…(kärbitud)"
     prompt = (
         "Sa teed eestikeelseid kokkuvõtteid arendustööst praktikapäeviku jaoks. "
-        f"Allpool on kasutaja AI-promptid ühe tunni ({hour_label}) jooksul."
+        f"Allpool on ühe tunni ({hour_label}) AI-vestluse tekstiosad: kasutaja küsimused ja võimalusel AI vastused."
         f"{_object_context(project_label, cfg)} "
-        "Kirjelda TÖÖ SISU põhjal lihtsas praktikapäeviku keeles. ÄRA maini kaustanimesid, "
+        "Tee kokkuvõte kogu vestluse põhjal, mitte ainult kasutaja küsimuste põhjal. "
+        "Kirjelda TÖÖ SISU lihtsas praktikapäeviku keeles. ÄRA maini kaustanimesid, "
         "failiteid, toorprompte ega sisemisi käske, kui need pole töö sisu ise. "
         "Stiil peab olema nagu praktikapäeviku punktid: konkreetne objekt/projekt, tehtud töö, "
         "takistus ja õpitu. Kirjuta lühidalt, aga piisavalt täpselt.\n"
@@ -1580,7 +1744,7 @@ def summarize(prompts: list[str], project_label: str, hour_label: str, cfg: dict
         "TAKISTUS: <mis takistas või Ei olnud>\n"
         "TEADMINE: <mida uut õpiti või Ei olnud>\n"
         "Ära lisa midagi peale nende nelja rea.\n\n"
-        f"Promptid:\n{joined}"
+        f"Vestlus:\n{joined}"
     )
     model = cfg.get("summarizer", {}).get("model", "")
     cmd, stdin_text = _engine_cmd(engine, exe, prompt, model)
@@ -5370,6 +5534,33 @@ def load_notes() -> dict[str, list[str]]:
     return out
 
 
+def _transcript_buckets(records: list[TranscriptRecord], allow: list[str], *, group_by: str,
+                        start: dt.datetime, end: dt.datetime) -> dict[tuple, list[tuple[TranscriptRecord, str]]]:
+    buckets: dict[tuple, list[tuple[TranscriptRecord, str]]] = {}
+    for r in records:
+        hstart = hour_floor(r.ts)
+        if not (start <= hstart < end):
+            continue
+        proj = match_project(r.project, allow)
+        if proj is None:
+            continue
+        bkey = (hstart, None) if group_by == "hour" else (hstart, proj)
+        buckets.setdefault(bkey, []).append((r, proj))
+    return buckets
+
+
+def _summary_inputs_from_transcript(items: list[tuple[TranscriptRecord, str]], *, limit: int = 80) -> list[str]:
+    labels = {"user": "Kasutaja", "assistant": "AI"}
+    out: list[str] = []
+    for rec, _proj in sorted(items, key=lambda x: x[0].ts)[:limit]:
+        text = re.sub(r"\s+", " ", rec.text or "").strip()
+        if not text:
+            continue
+        label = labels.get(rec.role, rec.role or "Sõnum")
+        out.append(f"{rec.ts.strftime('%H:%M')} {label}: {text}")
+    return out
+
+
 def run_once(cfg: dict, allow: list[str], backfill_hours: int | None = None) -> None:
     if not allow:
         log("run: ühtegi lubatud projekti pole (lisa: aitrack add <tee>). Ei tee midagi.")
@@ -5426,7 +5617,8 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
 
     # võta veidi varem, et täistunni-piiril olev kirje ei kaoks; täpse valiku teeb ämbrifilter
     records = collect_records(last_hour - dt.timedelta(seconds=1))
-    log(f"run: kogutud {len(records)} kirjet alates {last_hour.strftime('%Y-%m-%d %H:%M')} UTC")
+    transcript_records = collect_transcript_records(last_hour - dt.timedelta(seconds=1))
+    log(f"run: kogutud {len(records)} prompti ja {len(transcript_records)} vestluse tekstiosa alates {last_hour.strftime('%Y-%m-%d %H:%M')} UTC")
 
     # group_by="hour" → kõik kaustad koonduvad ühte ämbrisse tunni kohta (üks rida/tund);
     # group_by="project" (vaikimisi) → eraldi ämber iga (tund × projekt) kohta.
@@ -5442,6 +5634,8 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
             continue
         bkey = (hstart, None) if group_by == "hour" else (hstart, proj)
         buckets.setdefault(bkey, []).append((r, proj))
+    transcript_by_bucket = _transcript_buckets(transcript_records, allow, group_by=group_by,
+                                               start=last_hour, end=process_until)
 
     # Backfill: küsi lehelt olemasolevad võtmed ja jäta need tunnid kokku VÕTMATA
     # (väldib raisatud LLM-kõnesid). Tavakäivitus seda ei tee — uued tunnid pole veel lehel.
@@ -5456,12 +5650,18 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
     rows: list[list] = []
     keys: list[str] = []
     skipped = 0
-    for (hstart, proj_key), items in sorted(buckets.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+    bucket_keys = sorted(set(buckets) | set(transcript_by_bucket), key=lambda k: (k[0], str(k[1])))
+    for (hstart, proj_key) in bucket_keys:
+        items = buckets.get((hstart, proj_key), [])
+        transcript_items = transcript_by_bucket.get((hstart, proj_key), [])
         recs = sorted((it[0] for it in items), key=lambda r: r.ts)
-        tools = sorted({r.tool for r in recs})
+        tools = sorted({r.tool for r in recs} | {it[0].tool for it in transcript_items})
         prompts = [r.text for r in recs][:max_p]
+        transcript_inputs = _summary_inputs_from_transcript(transcript_items, limit=max_p * 2)
+        summary_inputs = transcript_inputs or prompts
         # 'hour'-režiimis võib ämbris olla mitu kausta → Projekt-veergu loetelu (nt "api, web")
-        proj_label = ", ".join(sorted({Path(it[1]).name for it in items}))
+        project_paths = [it[1] for it in items] + [it[1] for it in transcript_items]
+        proj_label = ", ".join(sorted({Path(p).name for p in project_paths}))
         local = hstart.astimezone(tz)            # kuvamine kohalikus ajas
         local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
         hour_label = f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}"
@@ -5471,7 +5671,7 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
             skipped += 1
             continue                             # juba lehel → ära kuluta LLM-kõnet
         heartbeat_lock(lock)  # pikk run ei tohi teisele protsessile aegunud näida
-        item = summarize(prompts, proj_label, hour_label, cfg)  # 4-väljaline dict
+        item = summarize(summary_inputs, proj_label, hour_label, cfg)  # 4-väljaline dict
         notes = notes_by_hour.get(_hour_iso(hstart), [])  # käsitsi-märkmed selle tunni kohta
         if notes:  # käsitsi-märge → "Uued teadmised" veergu (sinna kuuluvad õpitud asjad)
             note_txt = "Märge: " + " · ".join(notes)
@@ -5486,7 +5686,7 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
         log(f"  → {date_str} {hour_label} | {', '.join(tools)} | {item['objekt'][:70]}")
 
     # Märkmed tundidel ILMA jälgitava AI-tegevuseta → eraldi "(märge)"-rida (ei kao kaotsi)
-    activity_hours = {_hour_iso(hstart) for (hstart, _) in buckets}
+    activity_hours = {_hour_iso(hstart) for (hstart, _) in (set(buckets) | set(transcript_by_bucket))}
     for hiso, texts in sorted(notes_by_hour.items()):
         if hiso in activity_hours:
             continue                             # juba tegevuse-kokkuvõttesse liidetud

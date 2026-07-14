@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aitrack as A  # noqa: E402
 
 # päris-funktsioonid (setup() monkeypatchib mõned) — hoia originaalid alles
-_REAL = {n: getattr(A, n) for n in ("append_rows", "fetch_existing_keys", "collect_records")}
+_REAL = {n: getattr(A, n) for n in ("append_rows", "fetch_existing_keys", "collect_records", "collect_transcript_records")}
 
 CFG = Path(os.environ["AITRACK_CONFIG_DIR"])
 UTC = dt.timezone.utc
@@ -25,12 +25,14 @@ SINK_KEYS = set()
 SENT = []
 ADDED = []
 SUMMARIZE_CALLS = []
+SUMMARY_INPUTS = []
 
 def reset_sink():
-    SINK_KEYS.clear(); SENT.clear(); ADDED.clear(); SUMMARIZE_CALLS.clear()
+    SINK_KEYS.clear(); SENT.clear(); ADDED.clear(); SUMMARIZE_CALLS.clear(); SUMMARY_INPUTS.clear()
 
 def fake_summarize(prompts, proj, label, cfg):
     SUMMARIZE_CALLS.append(label)
+    SUMMARY_INPUTS.append(list(prompts))
     # 4-väljaline dict (nagu päris summarize); objekt kannab proj-silti, et testid saaks kontrollida
     return {"objekt": f"OBJ[{proj}]", "saavutus": f"STUB({len(prompts)})",
             "takistus": A._NA, "teadmine": A._NA}
@@ -57,6 +59,7 @@ def setup(records, state=None, allow=None):
     else:
         (CFG / "state.json").write_text(state, encoding="utf-8")
     A.collect_records = lambda since: [r for r in records if r.ts > since]
+    A.collect_transcript_records = lambda since: []
     A.summarize = fake_summarize
     A.append_rows = fake_append
     A.fetch_existing_keys = lambda cfg: None  # vaikimisi: ei küsi (tavakäitumine)
@@ -90,6 +93,20 @@ for nh, nm in [(11, 15), (12, 15), (13, 15)]:
 check("3 rida kokku (tunnid 10,11,12)", len(ADDED) == 3)
 check("kõik kolm erinevad", len({r[1] for r in ADDED}) == 3)
 check("watermark = 13:00 UTC", cur_state().get("last_processed_hour") == HFL(13).isoformat())
+
+# ============ TEST 1B: tunnikokkuvõte kasutab kogu vestlust, mitte ainult prompti ============
+print("TEST 1B: tunnikokkuvõte eelistab lokaalse AI-vestluse kasutaja+assistendi teksti")
+reset_sink(); setup([REC(10)])
+A.collect_transcript_records = lambda since: [
+    A.TranscriptRecord("Pi", "/proj", D(10, 10), "user", "küsimus ainult algatas teema"),
+    A.TranscriptRecord("Pi", "/proj", D(10, 40), "assistant", "vastuses selgus päris lahendus ja kontrollitulemus"),
+]
+cfg = A.load_config(); allow = A.load_projects()
+A._now_utc = lambda: dt.datetime(2026, 6, 16, 11, 15, tzinfo=UTC)
+A.run_once(cfg, allow)
+joined_summary_input = "\n".join(SUMMARY_INPUTS[-1]) if SUMMARY_INPUTS else ""
+check("summarizer sai assistendi vastuse tekstiosa", "AI: vastuses selgus päris lahendus" in joined_summary_input)
+check("tunnikokkuvõtte sisend ei piirdu ainult ühe promptiga", len(SUMMARY_INPUTS[-1]) == 2)
 
 # ============ TEST 2: idempotentsus — crash enne state-uuendust ei dubleeri ============
 print("TEST 2: idempotentsus — sama tunni kordustöötlus ei tekita duplikaati")

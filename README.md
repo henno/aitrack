@@ -141,7 +141,8 @@ cd ~ && claude                    # ✗ kodukaustast → ei eristu projektiks
 
 **Väljund on üks rida PÄEVA kohta** (praktikapäeviku vorm). Iga tund lisab sellesse päevaritta
 ühe **nummerdatud punkti** ja numbrid on kõigis neljas sisuveerus kohakuti. Päeviku sõnastus tehakse
-iga tunni AI-transkriptidest / prompt-eventidest; minuti heartbeat'id ja raw-eventid on ainult aja/progressi
+kliendi arvutis iga tunni AI-vestlusest: kasutaja küsimustest ja võimalusel AI vastustest. Serverisse
+saadetakse valmis tunnirida, mitte kogu transkript. Minuti heartbeat'id ja raw-eventid on ainult aja/progressi
 tõenduseks. LLM jagab iga tunni neli välja: *Objekt ja ülesanne / Saavutused / Takistused / Uued teadmised*.
 
 | Kuupäev | Punkte | Nädalapäev | Objekt ja ülesanne | Saavutused | Takistused | Uued teadmised |
@@ -214,8 +215,10 @@ saavad ajutise IP-ban'i.
 
 Harnessi/hookide jaoks salvestab server append-only `raw_events` ridu. Saada batch `POST /api/events`
 kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/api/prompt/done`,
-`/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Praktikapäeviku fallback eelistab
-sisulisi `prompt_events` ridu ning kasutab work-session/minute infot ainult viimase varuvariandina. Ekspordi raw evente
+`/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Tavapärane `aitrack run` teeb
+praktikapäeviku tunni sõnastuse lokaalselt kogu kättesaadava AI-vestluse põhjal ja saadab serverisse valmis
+kokkuvõtterea; kui seda rida pole, eelistab serveri fallback sisulisi `prompt_events` ridu ning kasutab
+work-session/minute infot ainult viimase varuvariandina. Ekspordi raw evente
 `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id piiratakse ning tüüpilised token/parool/saladuse
 võtmed redigeeritakse enne talletamist. `before_tool_call` uuendab jooksva tooli välja ja watchdog saab
 näidata `stuck` sessioone. Work-session'id ja sleep-gap'e arvestavad aktiivsed intervallid on eksporditavad
