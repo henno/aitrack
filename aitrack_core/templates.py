@@ -21,10 +21,16 @@ def _start_page_html(*, server_mode: bool = False) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function(){try{const t=localStorage.getItem('aitrackTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(_){}})();
+</script>
 <title>aitrack</title>
 <style>
 :root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
 @media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; } }
+
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
 * { box-sizing: border-box; }
 body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
 header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
@@ -59,7 +65,7 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 <body>
 <header>
   <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
-  <div class="toolbar">__USER_BUTTON__<button onclick="location.href='/activity'">Server tegevused</button>__SERVER_ACTIONS__</div>
+  <div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button>__USER_BUTTON__<button onclick="location.href='/activity'">Server tegevused</button>__SERVER_ACTIONS__</div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -103,6 +109,14 @@ let days = [];
 let currentUserName = '';
 let selectedUserName = '';
 const $ = (id) => document.getElementById(id);
+
+function effectiveTheme() { const t = document.documentElement.dataset.theme; if (t === 'light' || t === 'dark') return t; return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+function updateThemeButton() { const btn = document.getElementById('themeToggle'); if (btn) btn.textContent = effectiveTheme() === 'dark' ? 'Hele' : 'Tume'; }
+function setTheme(theme) { try { if (theme === 'light' || theme === 'dark') { document.documentElement.dataset.theme = theme; localStorage.setItem('aitrackTheme', theme); } else { delete document.documentElement.dataset.theme; localStorage.removeItem('aitrackTheme'); } } catch (_) {} updateThemeButton(); }
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!localStorage.getItem('aitrackTheme')) updateThemeButton(); }); } catch (_) {}
+updateThemeButton();
+
 const SERVER_MODE = __SERVER_MODE__;
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
 function authToken() { return $('tokenInput') ? $('tokenInput').value.trim() : ''; }
@@ -326,10 +340,16 @@ def _login_page_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function(){try{const t=localStorage.getItem('aitrackTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(_){}})();
+</script>
 <title>aitrack login</title>
 <style>
 :root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --bad:#f97316; --line:#334155; }
 @media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --bad:#c2410c; --line:#cbd5e1; } }
+
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
 * { box-sizing: border-box; }
 body { margin:0; min-height:100vh; display:grid; place-items:center; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); padding:20px; }
 .panel { width:min(420px,100%); background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:22px; box-shadow:0 12px 40px rgba(0,0,0,.18); }
@@ -345,6 +365,7 @@ button { margin-top:16px; border:1px solid var(--accent); background:var(--accen
 </head>
 <body>
 <main class="panel">
+  <button type="button" id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim" style="width:auto;float:right;margin-top:0">Tume</button>
   <h1>aitrack login</h1>
   <div class="small">Logi serveri tegevuste ja päevavaate vaatamiseks sisse.</div>
   <form id="loginForm">
@@ -358,6 +379,14 @@ button { margin-top:16px; border:1px solid var(--accent); background:var(--accen
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
+
+function effectiveTheme() { const t = document.documentElement.dataset.theme; if (t === 'light' || t === 'dark') return t; return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+function updateThemeButton() { const btn = document.getElementById('themeToggle'); if (btn) btn.textContent = effectiveTheme() === 'dark' ? 'Hele' : 'Tume'; }
+function setTheme(theme) { try { if (theme === 'light' || theme === 'dark') { document.documentElement.dataset.theme = theme; localStorage.setItem('aitrackTheme', theme); } else { delete document.documentElement.dataset.theme; localStorage.removeItem('aitrackTheme'); } } catch (_) {} updateThemeButton(); }
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!localStorage.getItem('aitrackTheme')) updateThemeButton(); }); } catch (_) {}
+updateThemeButton();
+
 function nextUrl() {
   const n = new URLSearchParams(location.search).get('next') || '/activity';
   return n.startsWith('/') && !n.startsWith('//') ? n : '/activity';
@@ -391,10 +420,16 @@ def _account_page_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function(){try{const t=localStorage.getItem('aitrackTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(_){}})();
+</script>
 <title>aitrack kasutaja</title>
 <style>
 :root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
 @media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; } }
+
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
 * { box-sizing:border-box; }
 body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }
 header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
@@ -420,7 +455,7 @@ pre.install-command { white-space:pre-wrap; word-break:break-word; border:1px so
 <body>
 <header>
   <div><h1>Kasutaja seaded</h1><div class="small">Parool ja tulevikus muud kasutaja seaded. <span id="userInfo"></span></div></div>
-  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="location.href='/admin'">Admin</button><button onclick="logout()">Logi välja</button></div>
+  <div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/activity'">Server tegevused</button><button onclick="location.href='/admin'">Admin</button><button onclick="logout()">Logi välja</button></div>
 </header>
 <main>
   <section class="panel">
@@ -457,6 +492,14 @@ pre.install-command { white-space:pre-wrap; word-break:break-word; border:1px so
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
+
+function effectiveTheme() { const t = document.documentElement.dataset.theme; if (t === 'light' || t === 'dark') return t; return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+function updateThemeButton() { const btn = document.getElementById('themeToggle'); if (btn) btn.textContent = effectiveTheme() === 'dark' ? 'Hele' : 'Tume'; }
+function setTheme(theme) { try { if (theme === 'light' || theme === 'dark') { document.documentElement.dataset.theme = theme; localStorage.setItem('aitrackTheme', theme); } else { delete document.documentElement.dataset.theme; localStorage.removeItem('aitrackTheme'); } } catch (_) {} updateThemeButton(); }
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!localStorage.getItem('aitrackTheme')) updateThemeButton(); }); } catch (_) {}
+updateThemeButton();
+
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function setStatus(msg, cls='') { $('status').className = 'status ' + cls; $('status').textContent = msg; }
 async function api(path, opts={}) {
@@ -536,10 +579,16 @@ def _admin_page_html() -> str:
 <html lang="et">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function(){try{const t=localStorage.getItem('aitrackTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(_){}})();
+</script>
 <title>aitrack admin</title>
 <style>
 :root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --bad:#f97316; --line:#334155; --ok:#22c55e; }
 @media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#fff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --bad:#c2410c; --line:#cbd5e1; --ok:#15803d; } }
+
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
 *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--text)}
 header{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}
 main{padding:18px 22px 40px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:16px;box-shadow:0 8px 30px rgba(0,0,0,.12)}
@@ -549,13 +598,21 @@ table{width:100%;border-collapse:collapse}th,td{border-top:1px solid var(--line)
 </style>
 </head>
 <body>
-<header><div><h1>aitrack admin</h1><div class="small">Kasutajad ja turvaaudit. Token kuvatakse ainult uue kasutaja loomisel.</div></div><div class="toolbar"><button onclick="location.href='/activity'">Tegevused</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="logout()">Logi välja</button></div></header>
+<header><div><h1>aitrack admin</h1><div class="small">Kasutajad ja turvaaudit. Token kuvatakse ainult uue kasutaja loomisel.</div></div><div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button><button onclick="location.href='/activity'">Tegevused</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="logout()">Logi välja</button></div></header>
 <main>
 <section class="panel"><h2>Kasutajad</h2><div class="toolbar"><input id="newName" placeholder="kasutajanimi"><select id="newRole"><option>user</option><option>admin</option></select><input id="newPassword" type="password" placeholder="algparool (valikuline)"><button class="primary" onclick="addUser()">Lisa kasutaja</button><button onclick="loadUsers()">Värskenda</button></div><div id="userStatus" class="status"></div><table><thead><tr><th>Nimi</th><th>Roll</th><th>Web sessioonid</th><th>Work session'id</th><th>Tegevus</th></tr></thead><tbody id="usersBody"></tbody></table></section>
 <section class="panel"><h2>Turvaaudit</h2><div class="toolbar"><input type="date" id="auditDate"><input id="auditType" placeholder="event_type"><button onclick="loadSecurity()">Ava</button></div><table><thead><tr><th>Aeg</th><th>Event</th><th>Kasutaja</th><th>IP/path</th><th>Detail</th></tr></thead><tbody id="auditBody"></tbody></table></section>
 </main>
 <script>
-const $=id=>document.getElementById(id); const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
+const $=id=>document.getElementById(id);
+
+function effectiveTheme() { const t = document.documentElement.dataset.theme; if (t === 'light' || t === 'dark') return t; return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+function updateThemeButton() { const btn = document.getElementById('themeToggle'); if (btn) btn.textContent = effectiveTheme() === 'dark' ? 'Hele' : 'Tume'; }
+function setTheme(theme) { try { if (theme === 'light' || theme === 'dark') { document.documentElement.dataset.theme = theme; localStorage.setItem('aitrackTheme', theme); } else { delete document.documentElement.dataset.theme; localStorage.removeItem('aitrackTheme'); } } catch (_) {} updateThemeButton(); }
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!localStorage.getItem('aitrackTheme')) updateThemeButton(); }); } catch (_) {}
+updateThemeButton();
+const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
 async function api(path,opts={}){const res=await fetch(path,{credentials:'same-origin',...opts});const data=await res.json().catch(()=>({}));if(res.status===401||res.status===403){if(data.error==='admini õigus puudub') throw new Error(data.error); location.href='/login?next=/admin'; throw new Error(data.error||'login puudub')}if(!res.ok||data.ok===false)throw new Error(data.error||res.statusText);return data}
 function fmt(s){if(!s)return'';const d=new Date(s);return isNaN(d)?esc(s):d.toLocaleString()}
 async function loadUsers(){const data=await api('/api/admin/users');$('usersBody').innerHTML=(data.users||[]).map(u=>`<tr><td>${esc(u.name)}</td><td><span class="pill">${esc(u.role)}</span></td><td>${esc(u.active_web_sessions)}</td><td>${esc(u.work_sessions)}<div class="small">aktiivseid ${esc(u.active_work_sessions)}</div></td><td><button onclick="setPw('${esc(u.name)}')">Sea parool</button> <button onclick="revoke('${esc(u.name)}')">Tühista web sessioonid</button></td></tr>`).join('')||'<tr><td colspan="5">Kasutajaid pole.</td></tr>'}
@@ -576,10 +633,16 @@ def _activity_page_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function(){try{const t=localStorage.getItem('aitrackTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(_){}})();
+</script>
 <title>aitrack server tegevused</title>
 <style>
 :root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --bad:#f97316; --line:#334155; }
 @media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --bad:#c2410c; --line:#cbd5e1; } }
+
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
 * { box-sizing: border-box; }
 body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
 header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
@@ -615,6 +678,10 @@ tr.session-colored { background:var(--row-bg-dark); }
 tr.session-colored td:first-child { border-left:4px solid var(--row-accent-dark); }
 tr.session-colored:hover { filter:brightness(1.08); }
 @media (prefers-color-scheme: light) { tr.session-colored { background:var(--row-bg-light); } tr.session-colored td:first-child { border-left-color:var(--row-accent-light); } }
+:root[data-theme="light"] tr.session-colored { background:var(--row-bg-light); }
+:root[data-theme="light"] tr.session-colored td:first-child { border-left-color:var(--row-accent-light); }
+:root[data-theme="dark"] tr.session-colored { background:var(--row-bg-dark); }
+:root[data-theme="dark"] tr.session-colored td:first-child { border-left-color:var(--row-accent-dark); }
 pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; }
 .bad { color:var(--bad); }
 .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; color:var(--muted); font-size:12px; }
@@ -640,7 +707,7 @@ body.modal-open { overflow:hidden; }
 <body>
 <header>
   <div><h1>aitrack server tegevused</h1><div class="small">Work session'id, prompt-eventid ja tegevuste ajalugu sisselogitud kasutaja õiguste piires. <span id="userInfo"></span></div></div>
-  <div class="toolbar"><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="location.href='/admin'">Admin</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
+  <div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button><button onclick="location.href='/'">Päevavaade</button><button onclick="location.href='/account'">Kasutaja</button><button onclick="location.href='/admin'">Admin</button><button onclick="loadActivity()" class="primary">Värskenda</button><button onclick="logout()">Logi välja</button></div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -693,6 +760,14 @@ body.modal-open { overflow:hidden; }
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
+
+function effectiveTheme() { const t = document.documentElement.dataset.theme; if (t === 'light' || t === 'dark') return t; return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+function updateThemeButton() { const btn = document.getElementById('themeToggle'); if (btn) btn.textContent = effectiveTheme() === 'dark' ? 'Hele' : 'Tume'; }
+function setTheme(theme) { try { if (theme === 'light' || theme === 'dark') { document.documentElement.dataset.theme = theme; localStorage.setItem('aitrackTheme', theme); } else { delete document.documentElement.dataset.theme; localStorage.removeItem('aitrackTheme'); } } catch (_) {} updateThemeButton(); }
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!localStorage.getItem('aitrackTheme')) updateThemeButton(); }); } catch (_) {}
+updateThemeButton();
+
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
 function esc(s) { return String(s ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }

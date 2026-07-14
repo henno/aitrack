@@ -779,6 +779,8 @@ check("Linux/macOS installikäsk sobib ka fish shellile", "bash <(" not in accou
 check("installiskriptid ühendavad serveriga ja paigaldavad Pi extensioni", "install --minute-tracking --pi-extension" in A._install_client_sh("https://aitrack.example.com") and "Install-AitrackClient" in A._install_client_ps1("https://aitrack.example.com"))
 check("login leht postitab /api/login endpointi", "/api/login" in A._login_page_html() and "password" in A._login_page_html())
 check("päevavaates on link serveri tegevustele", "Server tegevused" in start_page and "location.href='/activity'" in start_page)
+for theme_page in [start_page, server_start_page, account_page, A._login_page_html(), A._admin_page_html(), activity_page]:
+    check("veebilehtedel on light/dark mode nupp", "themeToggle" in theme_page and "toggleTheme" in theme_page and "data-theme" in theme_page)
 
 # ============ TEST 46: server client saadab explicit User-Agent ============
 print("TEST 46: server client kasutab explicit User-Agent headerit")
