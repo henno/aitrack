@@ -183,6 +183,9 @@ DEFAULT_CONFIG = {
     "object_names": {},
     # exe = paigaldusajal lahendatud absoluuttee (kindlustab ajasti vastu, kus PATH puudub)
     "summarizer": {"engine": "auto", "model": "", "timeout": 120, "exe": ""},
+    # "metadata" = serverisse lähevad prompti ajad/projekt/tööriist, aga mitte prompti tekst;
+    # "full" = saada ka prompt_text (debug/ümbertöötlemine); "off" = ära saada prompt-evente.
+    "server_prompt_events": "metadata",
     "max_catchup_hours": 48,
 }
 
@@ -5389,8 +5392,18 @@ def _server_fetch_keys(cfg: dict) -> set[str] | None:
     return None
 
 
+def _server_prompt_event_mode(cfg: dict) -> str:
+    raw = str(cfg.get("server_prompt_events", "metadata") or "metadata").strip().lower()
+    aliases = {"false": "off", "0": "off", "none": "off", "no": "off", "true": "full", "1": "full", "yes": "full"}
+    mode = aliases.get(raw, raw)
+    return mode if mode in {"metadata", "full", "off"} else "metadata"
+
+
 def _prompt_events_payload(records: list[Record], allow: list[str], start: dt.datetime,
-                           end: dt.datetime) -> list[dict]:
+                           end: dt.datetime, *, mode: str = "full") -> list[dict]:
+    mode = mode if mode in {"metadata", "full", "off"} else "metadata"
+    if mode == "off":
+        return []
     scoped: list[tuple[Record, str]] = []
     for r in sorted(records, key=lambda x: x.ts):
         if not (start <= r.ts < end):
@@ -5407,15 +5420,19 @@ def _prompt_events_payload(records: list[Record], allow: list[str], start: dt.da
         duration = max(60, int((next_ts - r.ts).total_seconds()))
         raw = f"{r.tool}|{proj}|{r.ts.isoformat()}|{r.text}"
         ekey = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
-        events.append({
+        event = {
             "event_key": ekey,
+            "event_type": "prompt_event",
             "tool": r.tool,
             "project": proj,
-            "prompt_text": r.text,
+            "prompt_text": r.text if mode == "full" else "",
             "started_at": r.ts.isoformat(),
             "ended_at": next_ts.isoformat(),
             "duration_seconds": duration,
-        })
+            "prompt_chars": len(r.text or ""),
+            "content_mode": mode,
+        }
+        events.append(event)
     return events
 
 
@@ -5716,11 +5733,13 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
             dest = str(_local_path(cfg)) if stype == "local" else ("aitrack server" if stype == "server" else "Google Sheetsi")
             log(f"run: {len(rows)} rida saadetud → {dest}")
             if stype == "server":
-                events = _prompt_events_payload(records, allow, last_hour, process_until)
+                mode = _server_prompt_event_mode(cfg)
+                events = _prompt_events_payload(records, allow, last_hour, process_until, mode=mode)
                 if events:
                     body = _server_post("events", {"events": events}, cfg)
                     if body and body.get("ok"):
-                        log(f"run: {len(events)} prompt-eventi saadetud → aitrack server")
+                        suffix = "metadatana" if mode == "metadata" else "täistekstiga"
+                        log(f"run: {len(events)} prompt-eventi saadetud {suffix} → aitrack server")
         else:
             log(f"run: {len(rows)} rida EI saadud kirjutada — state'i ei uuendata, proovin uuesti")
             return  # ära uuenda state'i, et read ei kaoks
@@ -7425,7 +7444,8 @@ def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tu
         return active[0], ctx
     if not start_if_missing:
         return None, ctx
-    summary = _safe_day_prompt_snippet(getattr(args, "summary", None) or getattr(args, "prompt", "") or "AI agenti töö", 1000)
+    raw_summary = _safe_day_prompt_snippet(getattr(args, "summary", None) or getattr(args, "prompt", "") or "AI agenti töö", 1000)
+    summary = raw_summary if _server_prompt_event_mode(cfg) == "full" else "AI agenti töö"
     ns = argparse.Namespace(cwd=ctx["cwd"], issue=getattr(args, "issue", None), tool=tool,
                             summary=[summary], non_billable=False,
                             agent_uid=getattr(args, "agent_uid", ""), parent_agent_uid=getattr(args, "parent_agent_uid", ""),
@@ -7452,13 +7472,16 @@ def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tu
     return session, ctx
 
 
-def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
+def _hook_event(args, event_type: str, session: dict | None, ctx: dict, cfg: dict) -> dict:
     now = _now_utc().isoformat()
     session_uid = str((session or {}).get("work_session_uid") or getattr(args, "work_session_uid", "") or "")
     tool_name = str(getattr(args, "tool_name", "") or getattr(args, "tool", "") or "pi")
     tool_call_id = str(getattr(args, "tool_call_id", "") or "")
     agent_uid = str(getattr(args, "agent_uid", "") or "")
-    summary_text = _safe_day_prompt_snippet(getattr(args, "summary", "") or getattr(args, "prompt", "") or "", 4000)
+    mode = _server_prompt_event_mode(cfg)
+    text_allowed = mode == "full"
+    raw_summary = getattr(args, "summary", "") or getattr(args, "prompt", "") or ""
+    summary_text = _safe_day_prompt_snippet(raw_summary, 4000) if text_allowed else ""
     event = {
         "event_key": f"hook:{event_type}:{session_uid}:{agent_uid}:{tool_call_id}:{now}",
         "event_type": event_type,
@@ -7473,7 +7496,7 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
                     "name": ctx.get("name", ""), "local_path": ctx.get("local_path", ""),
                     "checkout_id": ctx.get("checkout_id", ""), "branch": ctx.get("branch", "")},
         "issue_key": ctx.get("issue_key", ""),
-        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 4000)},
+        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 4000), "content_mode": mode},
     }
     tool_input = getattr(args, "tool_input", "")
     if tool_input:
@@ -7482,7 +7505,10 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict) -> dict:
         except json.JSONDecodeError:
             event["payload"]["tool_input"] = str(tool_input)[:2000]
     if event_type in {"prompt_started", "prompt_finished"}:
-        event["prompt_text"] = _safe_day_prompt_snippet(getattr(args, "prompt", "") or getattr(args, "summary", "") or "", 4000)
+        raw_prompt = getattr(args, "prompt", "") or getattr(args, "summary", "") or ""
+        event["prompt_text"] = _safe_day_prompt_snippet(raw_prompt, 4000) if text_allowed else ""
+        event["prompt_chars"] = len(str(raw_prompt or ""))
+        event["content_mode"] = mode
         event["tool"] = tool_name
         event["started_at"] = now
         event["ended_at"] = now
@@ -7513,7 +7539,7 @@ def cmd_hook(args, cfg):
         "session-shutdown": "session_shutdown",
     }
     event_type = event_map[action]
-    event = _hook_event(args, event_type, session, ctx)
+    event = _hook_event(args, event_type, session, ctx, cfg)
     res = _post_events_or_enqueue([event], cfg)
     if action in {"prompt-start", "heartbeat", "tool-start"} and session:
         tick_args = argparse.Namespace(session_id=session.get("work_session_uid"), tool=getattr(args, "tool", "pi"), cwd=ctx.get("cwd"), issue=ctx.get("issue_key"))

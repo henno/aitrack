@@ -217,8 +217,11 @@ Harnessi/hookide jaoks salvestab server append-only `raw_events` ridu. Saada bat
 kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/api/prompt/done`,
 `/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Tavapärane `aitrack run` teeb
 praktikapäeviku tunni sõnastuse lokaalselt kogu kättesaadava AI-vestluse põhjal ja saadab serverisse valmis
-kokkuvõtterea; kui seda rida pole, eelistab serveri fallback sisulisi `prompt_events` ridu ning kasutab
-work-session/minute infot ainult viimase varuvariandina. Ekspordi raw evente
+kokkuvõtterea. Prompt-eventid lähevad kliendist serverisse vaikimisi ainult metadatana (aeg, projekt,
+tööriist, kestus ja tekstipikkus; mitte prompti tekst). Täisteksti saatmine on opt-in seadistusega
+`server_prompt_events: "full"`; `"off"` lülitab prompt-eventide batch-saatmise välja. Kui valmis tunnirida pole,
+eelistab serveri fallback sisulisi `prompt_events` ridu ning kasutab work-session/minute infot ainult viimase
+varuvariandina. Ekspordi raw evente
 `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id piiratakse ning tüüpilised token/parool/saladuse
 võtmed redigeeritakse enne talletamist. `before_tool_call` uuendab jooksva tooli välja ja watchdog saab
 näidata `stuck` sessioone. Work-session'id ja sleep-gap'e arvestavad aktiivsed intervallid on eksporditavad

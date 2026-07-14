@@ -786,6 +786,20 @@ headers = A._server_headers({"Content-Type": "application/json"})
 check("server headerites on User-Agent", headers.get("User-Agent", "").startswith("aitrack/"))
 check("server headerid säilitavad Content-Type", headers.get("Content-Type") == "application/json")
 
+# ============ TEST 46B: prompt-eventide privaatsusrežiim ============
+print("TEST 46B: klient saadab prompt-eventid vaikimisi metadatana, mitte tekstina")
+priv_records = [A.Record("Pi", "/proj", HFL(10), "salajane prompti tekst")]
+meta_events = A._prompt_events_payload(priv_records, ["/proj"], HFL(10), HFL(11), mode="metadata")
+full_events = A._prompt_events_payload(priv_records, ["/proj"], HFL(10), HFL(11), mode="full")
+off_events = A._prompt_events_payload(priv_records, ["/proj"], HFL(10), HFL(11), mode="off")
+check("metadata prompt-event ei sisalda prompti teksti", len(meta_events) == 1 and meta_events[0]["prompt_text"] == "" and meta_events[0]["prompt_chars"] == len("salajane prompti tekst"))
+check("full prompt-event on opt-in", full_events[0]["prompt_text"] == "salajane prompti tekst" and off_events == [])
+hook_args = types.SimpleNamespace(prompt="salajane hook prompt", summary="", tool="pi", tool_name="", tool_call_id="", agent_uid="", parent_agent_uid="")
+hook_meta = A._hook_event(hook_args, "prompt_started", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "metadata"})
+hook_full = A._hook_event(hook_args, "prompt_started", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "full"})
+check("hook prompt-start peidab teksti metadata režiimis", hook_meta["prompt_text"] == "" and hook_meta["summary"] == "" and hook_meta["prompt_chars"] == len("salajane hook prompt"))
+check("hook prompt-start full režiim on opt-in", hook_full["prompt_text"] == "salajane hook prompt")
+
 # ============ TEST 47: brauseri login parool ja web session ============
 print("TEST 47: serveri brauseri login loob sessiooni ilma API tokenit avaldamata")
 ldb = CFG / "server-login-test.db"
