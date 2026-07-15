@@ -737,7 +737,7 @@ body.modal-open { overflow:hidden; }
   </section>
   <section class="panel">
     <h2>Work session'id</h2>
-    <table><thead><tr><th>Session UID</th><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Staatus</th><th>Min</th><th>Kokkuvõte</th><th></th></tr></thead><tbody id="sessionsBody"></tbody></table>
+    <table><thead><tr><th>Session UID</th><th>Aeg</th><th>Kasutaja</th><th>Projekt / issue</th><th>Staatus</th><th>Agendi min</th><th>Kokkuvõte</th><th></th></tr></thead><tbody id="sessionsBody"></tbody></table>
   </section>
   <section class="panel">
     <h2>Prompt-eventid</h2>
@@ -961,13 +961,22 @@ async function showDetail(type, id, sessionUid) {
 }
 window.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (!$('detailModal').hidden) closeDetailModal(); closeDatePicker(); } });
 document.addEventListener('click', (e) => { if (!$('dateWrap').contains(e.target)) closeDatePicker(); });
+function formatDuration(minutes) {
+  const total = Math.max(0, Math.round(Number(minutes || 0)));
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  return hours ? `${hours} h ${mins} min` : `${mins} min`;
+}
 function renderMetrics(data) {
-  const minutes = (data.sessions || []).reduce((a, s) => a + Number(s.minutes || 0), 0);
+  const durations = data.project_durations || [];
+  const projectMinutes = Number(data.project_minutes || 0);
+  const durationLabel = durations.length === 1 ? 'Projekti kestus' : 'Projektide kestus';
+  const breakdown = durations.map(x => `${x.project || x.project_key}: ${formatDuration(x.minutes)}`).join(' · ');
   $('metrics').innerHTML = `
     <div class="metric"><span class="small">Work session'id</span><b>${(data.sessions || []).length}</b></div>
     <div class="metric"><span class="small">Prompt-eventid</span><b>${(data.prompt_events || []).length}</b></div>
     <div class="metric"><span class="small">Raw eventid</span><b>${(data.raw_events || []).length}</b></div>
-    <div class="metric"><span class="small">Minutid</span><b>${minutes}</b></div>
+    <div class="metric" title="${esc(breakdown)}"><span class="small">${durationLabel}</span><b>${formatDuration(projectMinutes)}</b>${durations.length > 1 ? `<span class="small">${durations.length} projekti</span>` : ''}</div>
     <div class="metric"><span class="small">Periood</span><b style="font-size:16px">${esc(data.period || '')}</b></div>`;
 }
 function promptEventLabel(x) {

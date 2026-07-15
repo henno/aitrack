@@ -739,6 +739,35 @@ check("activity sisaldab checkouti failiteed", activity["sessions"][0]["local_pa
 check("serveri päevavaade asendab automaatkokkuvõtte placeholderi tunni prompt-event transkriptiga", "tee issue 662" in day_rows_with_work[0][3] and "parandus valmis" not in day_rows_with_work[0][3])
 check("serveri päevavaade tuletab prompt-event transkriptist uued teadmised", day_rows_with_work[0][5] != A._NA)
 
+# ============ TEST 43B: projekti kestus ei summeeri paralleelseid agente ============
+print("TEST 43B: Activity projekti kestus ühendab sama projekti kattuvad agendiminutid")
+pddb = CFG / "server-project-duration-test.db"
+pddb.unlink(missing_ok=True)
+pdtok = A._db_add_user(pddb, "durationuser")
+allow_server_project(pddb, pdtok, "/tmp/project-a", "github.com/example/project-a", "project-a")
+allow_server_project(pddb, pdtok, "/tmp/project-b", "github.com/example/project-b", "project-b")
+def duration_start(project_key, name, path, client, tool):
+    return A._db_work_start(pddb, pdtok, {
+        "project": {"project_key": project_key, "name": name, "local_path": path},
+        "work": {"title": "paralleelne töö", "summary": "paralleelne töö"},
+        "session": {"client_id": client, "device_name": "testbox", "platform": "linux", "tool": tool, "local_path": path, "cwd": path},
+        "started_at": HFL(10).isoformat(),
+    })
+pda1 = duration_start("github.com/example/project-a", "project-a", "/tmp/project-a", "duration-a1", "pi")
+pda2 = duration_start("github.com/example/project-a", "project-a", "/tmp/project-a", "duration-a2", "claude")
+pdb1 = duration_start("github.com/example/project-b", "project-b", "/tmp/project-b", "duration-b1", "codex")
+for minute in (0, 1, 2):
+    A._db_work_tick(pddb, pdtok, {"work_session_uid": pda1["work_session_uid"], "tick_at": (HFL(10) + dt.timedelta(minutes=minute)).isoformat()})
+for minute in (1, 2, 3):
+    A._db_work_tick(pddb, pdtok, {"work_session_uid": pda2["work_session_uid"], "tick_at": (HFL(10) + dt.timedelta(minutes=minute)).isoformat()})
+for minute in (2, 3):
+    A._db_work_tick(pddb, pdtok, {"work_session_uid": pdb1["work_session_uid"], "tick_at": (HFL(10) + dt.timedelta(minutes=minute)).isoformat()})
+project_duration_activity = A._db_activity_log(pddb, pdtok, {"date": ["2026-06-16"], "timezone": ["UTC"], "stale_minutes": ["999999"]})
+durations_by_key = {x["project_key"]: x["minutes"] for x in project_duration_activity.get("project_durations", [])}
+check("sama projekti paralleelsed agendid loetakse ühe korra", durations_by_key.get("github.com/example/project-a") == 4)
+check("eri projektide kestused summeeritakse projektipõhiselt", durations_by_key.get("github.com/example/project-b") == 2 and project_duration_activity.get("project_minutes") == 6)
+check("projekti kestus erineb agentide minutite lihtsummast", sum(x.get("minutes", 0) for x in project_duration_activity.get("sessions", [])) == 8 and project_duration_activity.get("project_minutes") == 6)
+
 # ============ TEST 44: lokaalse agendi DB hoiab work_session_uid ============
 print("TEST 44: lokaalse agendi SQLite DB salvestab aktiivse work_session_uid")
 A.LOCAL_DB.unlink(missing_ok=True)
@@ -764,6 +793,7 @@ check("activity leht kutsub /api/activity endpointi", "/api/activity" in activit
 check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in activity_page and "class=\"small path\"" in activity_page)
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
 check("activity leht sisaldab raw event timeline'i", "Raw eventid" in activity_page and "renderRawEvents" in activity_page and "raw_events" in activity_page)
+check("activity kuvab agentide summa asemel projektikestust", "data.project_minutes" in activity_page and "Projektide kestus" in activity_page and "formatDuration" in activity_page and "Agendi min" in activity_page and "reduce((a, s) => a + Number(s.minutes" not in activity_page)
 check("activity näitab sündmuste millisekundeid ja metadata prompti selgitust", "fmtTime(x.at, true)" in activity_page and "fractionalSecondDigits:3" in activity_page and "Teksti ei saadetud" in activity_page)
 check("activity kuvab prompti lõpetamisel tehtu kokkuvõtet ja tokenite arvu", "x.work_summary" in activity_page and "Tehtu kokkuvõte" in activity_page and "x.context_tokens" in activity_page and "tokenit" in activity_page and "promptContextLine" not in activity_page)
 check("activity filtrid jõustuvad automaatselt ja status on nupud", "setSessionStatusFilter('active')" in activity_page and "scheduleActivityLoad" in activity_page and ">Ava</button>" not in activity_page)

@@ -3132,6 +3132,46 @@ def _minute_interval_minutes(start: dt.datetime, end: dt.datetime) -> int:
     return max(0, int((end - start).total_seconds()) // 60)
 
 
+def _project_duration_summary(intervals: list[dict], start_iso: str, end_iso: str) -> dict:
+    """Ühenda sama projekti kattuvad agendiintervallid üheks projekti kestuseks."""
+    bound_start = parse_iso(start_iso)
+    bound_end = parse_iso(end_iso)
+    grouped: dict[str, dict] = {}
+    if not bound_start or not bound_end:
+        return {"minutes": 0, "projects": []}
+    for item in intervals:
+        start = parse_iso(str(item.get("start") or ""))
+        end = parse_iso(str(item.get("end") or ""))
+        if not start or not end:
+            continue
+        start = max(start, bound_start)
+        end = min(end, bound_end)
+        if end <= start:
+            continue
+        project_key = str(item.get("project_key") or f"project:{item.get('project_id') or ''}")
+        group = grouped.setdefault(project_key, {
+            "project_id": int(item.get("project_id") or 0),
+            "project_key": project_key,
+            "project": str(item.get("project") or project_key),
+            "intervals": [],
+        })
+        group["intervals"].append((start, end))
+    projects = []
+    for group in grouped.values():
+        merged: list[list[dt.datetime]] = []
+        for start, end in sorted(group.pop("intervals"), key=lambda x: x[0]):
+            if merged and start <= merged[-1][1]:
+                if end > merged[-1][1]:
+                    merged[-1][1] = end
+            else:
+                merged.append([start, end])
+        seconds = sum(max(0.0, (end - start).total_seconds()) for start, end in merged)
+        minutes = max(0, int(seconds + 59) // 60)
+        projects.append({**group, "minutes": minutes, "interval_count": len(merged)})
+    projects.sort(key=lambda x: (-int(x["minutes"]), str(x["project_key"])))
+    return {"minutes": sum(int(x["minutes"]) for x in projects), "projects": projects}
+
+
 def _db_rollup_active_intervals_conn(conn: sqlite3.Connection, session_id: int,
                                      *, gap_threshold_minutes: int = 2,
                                      source: str = "minute_ticks") -> dict:
@@ -3588,6 +3628,43 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             prompt_args.append(event_type_filter)
             raw_where.append("re.event_type = ?")
             raw_args.append(event_type_filter)
+
+        # Kestuse päringud ei kasuta UI realimiiti: sama projekti paralleelsed agendid
+        # annavad intervallid, mis ühendatakse hiljem üheks seinakella-kestuseks.
+        duration_sessions = conn.execute(f"""
+            SELECT ws.id, ws.started_at, ws.ended_at, ws.last_seen_at, ws.minutes_final,
+                   p.id AS project_id, p.project_key, p.name AS project_name
+            FROM work_sessions ws
+            JOIN users u ON u.id = ws.user_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(session_where)}
+        """, tuple(session_args)).fetchall()
+        duration_ticks = conn.execute(f"""
+            SELECT ws.id AS work_session_id, p.id AS project_id, p.project_key, p.name AS project_name,
+                   mt.minute_start_utc
+            FROM minute_ticks mt
+            JOIN work_sessions ws ON ws.id = mt.work_session_id
+            JOIN users u ON u.id = ws.user_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(session_where)}
+              AND mt.minute_start_utc >= ? AND mt.minute_start_utc < ?
+        """, (*session_args, start_iso, end_iso)).fetchall()
+        duration_rollups = conn.execute(f"""
+            SELECT ws.id AS work_session_id, p.id AS project_id, p.project_key, p.name AS project_name,
+                   wai.start_minute_utc, wai.end_minute_utc
+            FROM work_session_active_intervals wai
+            JOIN work_sessions ws ON ws.id = wai.work_session_id
+            JOIN users u ON u.id = ws.user_id
+            JOIN work_items wi ON wi.id = ws.work_item_id
+            JOIN projects p ON p.id = wi.project_id
+            LEFT JOIN issues i ON i.id = wi.issue_id
+            WHERE {' AND '.join(session_where)}
+              AND wai.start_minute_utc < ? AND wai.end_minute_utc > ?
+        """, (*session_args, end_iso, start_iso)).fetchall()
         sessions = conn.execute(f"""
             SELECT ws.*, u.name AS user_name, d.name AS device_name, d.client_id,
                    wi.title AS work_title, p.project_key, p.name AS project_name,
@@ -3630,6 +3707,46 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             ORDER BY re.occurred_at_utc DESC, re.id DESC
             LIMIT ?
         """, (*raw_args, limit)).fetchall()
+
+    duration_intervals: list[dict] = []
+    evidence_sessions: set[int] = set()
+    for r in duration_ticks:
+        start = parse_iso(r["minute_start_utc"])
+        if not start:
+            continue
+        evidence_sessions.add(int(r["work_session_id"]))
+        duration_intervals.append({
+            "project_id": int(r["project_id"]), "project_key": r["project_key"],
+            "project": r["project_name"], "start": start.isoformat(),
+            "end": (start + dt.timedelta(minutes=1)).isoformat(),
+        })
+    for r in duration_rollups:
+        evidence_sessions.add(int(r["work_session_id"]))
+        duration_intervals.append({
+            "project_id": int(r["project_id"]), "project_key": r["project_key"],
+            "project": r["project_name"], "start": r["start_minute_utc"], "end": r["end_minute_utc"],
+        })
+    for r in duration_sessions:
+        if int(r["id"]) in evidence_sessions:
+            continue
+        start = parse_iso(r["started_at"])
+        if not start:
+            continue
+        final_minutes = r["minutes_final"]
+        if final_minutes is not None:
+            try:
+                end = start + dt.timedelta(minutes=max(0, int(final_minutes)))
+            except (TypeError, ValueError, OverflowError):
+                end = None
+        else:
+            end = parse_iso(r["ended_at"] or r["last_seen_at"] or "")
+        if not end or end <= start:
+            continue
+        duration_intervals.append({
+            "project_id": int(r["project_id"]), "project_key": r["project_key"],
+            "project": r["project_name"], "start": start.isoformat(), "end": end.isoformat(),
+        })
+    project_duration = _project_duration_summary(duration_intervals, start_iso, end_iso)
     session_items = []
     activity = []
     for r in sessions:
@@ -3794,6 +3911,8 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         activity.append({**item, "at": item["occurred_at_utc"], "label": "raw_event"})
     activity.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
     return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
+            "project_minutes": int(project_duration["minutes"]),
+            "project_durations": project_duration["projects"],
             "sessions": session_items, "prompt_events": prompt_items, "raw_events": raw_items,
             "agent_tree": _agent_tree_from_raw_items(raw_items), "activity": activity[:limit]}
 
