@@ -969,14 +969,14 @@ function formatDuration(minutes) {
 }
 function renderMetrics(data) {
   const durations = data.project_durations || [];
-  const projectMinutes = Number(data.project_minutes || 0);
-  const durationLabel = durations.length === 1 ? 'Projekti kestus' : 'Projektide kestus';
-  const breakdown = durations.map(x => `${x.project || x.project_key}: ${formatDuration(x.minutes)}`).join(' · ');
+  const durationCards = durations.length
+    ? durations.map(x => `<div class="metric"><span class="small">Projekti kestus</span><b>${formatDuration(x.minutes)}</b><span class="small">${esc(x.project || x.project_key || '')}</span></div>`).join('')
+    : '<div class="metric"><span class="small">Projekti kestus</span><b>0 min</b></div>';
   $('metrics').innerHTML = `
     <div class="metric"><span class="small">Work session'id</span><b>${(data.sessions || []).length}</b></div>
     <div class="metric"><span class="small">Prompt-eventid</span><b>${(data.prompt_events || []).length}</b></div>
     <div class="metric"><span class="small">Raw eventid</span><b>${(data.raw_events || []).length}</b></div>
-    <div class="metric" title="${esc(breakdown)}"><span class="small">${durationLabel}</span><b>${formatDuration(projectMinutes)}</b>${durations.length > 1 ? `<span class="small">${durations.length} projekti</span>` : ''}</div>
+    ${durationCards}
     <div class="metric"><span class="small">Periood</span><b style="font-size:16px">${esc(data.period || '')}</b></div>`;
 }
 function promptEventLabel(x) {

@@ -206,8 +206,8 @@ kuupäevakalendris valida ühe päeva või vahemiku (1. klikk algus, 2. klikk l�
 sama `event_key` prompt-kirje ühe korra ja ühendab Pi sama tööetapi `agent_finished` + `prompt_finished`
 üheks visuaalseks lõpetamiseks; täielik auditijälg jääb eraldi Raw eventide tabelisse. Lifecycle-rida kasutab
 enda sündmuse kirjeldust, mitte sessioni hiljem muutunud lõppkokkuvõtet, ning lähestikku tekkinud sündmustel
-näidatakse eristamiseks millisekundeid. Ülemine „Projekti kestus” ühendab sama projekti kattuvad
-agendi- ja work-session'i intervallid, mistõttu paralleelsed agendid ei korruta tegelikku projektile kulunud aega;
+näidatakse eristamiseks millisekundeid. Ülemised „Projekti kestus” kaardid näitavad iga projekti eraldi ning
+ühendavad selle kattuvad agendi- ja work-session'i intervallid, mistõttu paralleelsed agendid ei korruta tegelikku projektile kulunud aega;
 work-session'i tabeli „Agendi min” jääb eraldi auditinfoks. Detailmodaal eraldab indekseeritava DB-kirje parsitud
 payloadist, et sama JSON ei oleks escaped stringina ja korduvate väljadena kaks korda näha. Staatused:
 `active` = hiljutise progressiga töö, `stale` = üle 10 minuti progressita töö, `stuck` = üle 10 minuti
