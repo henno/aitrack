@@ -3520,6 +3520,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         session_args: list = [end_iso, start_iso]
         prompt_where = ["pe.started_at >= ?", "pe.started_at < ?"]
         prompt_args: list = [start_iso, end_iso]
+        prompt_payload_sql = "CASE WHEN json_valid(COALESCE(pe.payload_json, '')) THEN pe.payload_json ELSE '{}' END"
         raw_where = ["re.occurred_at_utc >= ?", "re.occurred_at_utc < ?"]
         raw_args: list = [start_iso, end_iso]
         if user["role"] != "admin":
@@ -3577,9 +3578,13 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         if agent_filter:
             session_where.append("ws.agent_uid = ?")
             session_args.append(agent_filter)
+            prompt_where.append(f"COALESCE(json_extract({prompt_payload_sql}, '$.agent_uid'), '') = ?")
+            prompt_args.append(agent_filter)
             raw_where.append("re.agent_uid = ?")
             raw_args.append(agent_filter)
         if event_type_filter:
+            prompt_where.append(f"COALESCE(json_extract({prompt_payload_sql}, '$.event_type'), 'prompt_event') = ?")
+            prompt_args.append(event_type_filter)
             raw_where.append("re.event_type = ?")
             raw_args.append(event_type_filter)
         sessions = conn.execute(f"""
@@ -3665,10 +3670,23 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         activity.append({**item, "at": r["started_at"], "label": "work_session"})
     prompt_items = []
     for r in prompts:
+        prompt_payload = {}
+        try:
+            parsed_prompt_payload = json.loads(r["payload_json"] or "{}")
+            if isinstance(parsed_prompt_payload, dict):
+                prompt_payload = parsed_prompt_payload
+        except (TypeError, json.JSONDecodeError):
+            prompt_payload = {}
+        try:
+            prompt_chars = max(0, int(prompt_payload.get("prompt_chars") or 0))
+        except (TypeError, ValueError):
+            prompt_chars = 0
         item = {
             "type": "prompt_event",
             "id": int(r["id"]),
             "event_key": r["event_key"],
+            "event_type": str(prompt_payload.get("event_type") or "prompt_event"),
+            "user_id": int(r["user_id"]),
             "user": r["user_name"],
             "tool": r["tool"],
             "project": r["project_name"] or r["project"],
@@ -3676,7 +3694,10 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "issue": f"#{r['issue_key']}" if r["issue_key"] else "",
             "issue_key": r["issue_key"] or "",
             "work_session_uid": r["session_uid"] or "",
+            "agent_uid": str(prompt_payload.get("agent_uid") or ""),
             "prompt_text": r["prompt_text"],
+            "prompt_chars": prompt_chars,
+            "content_mode": str(prompt_payload.get("content_mode") or ""),
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
             "duration_seconds": int(r["duration_seconds"] or 0),
@@ -3685,6 +3706,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         }
         prompt_items.append(item)
         activity.append({**item, "at": r["started_at"], "label": "prompt_event"})
+    prompt_event_keys = {str(x.get("event_key") or "") for x in prompt_items if x.get("event_key")}
     raw_items = []
     for r in raw_rows:
         payload_preview, payload_truncated, payload_bytes = _payload_preview_json(r["payload_json"])
@@ -3701,6 +3723,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         item = {
             "type": "raw_event",
             "id": int(r["id"]),
+            "user_id": int(r["user_id"]),
             "user": r["user_name"],
             "event_type": r["event_type"],
             "tool": display_tool,
@@ -3722,10 +3745,39 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "payload_json": payload_preview,
             "payload_truncated": payload_truncated,
             "payload_bytes": payload_bytes,
-            "summary": _raw_event_display_summary(r["event_type"], display_tool, payload_summary, r["session_summary"] or r["work_title"] or ""),
+            "summary": _raw_event_display_summary(r["event_type"], display_tool, payload_summary),
         }
         raw_items.append(item)
-        activity.append({**item, "at": r["occurred_at_utc"], "label": "raw_event"})
+
+    # Üks prompt-lifecycle event materialiseerub auditiks raw_events tabelisse ja
+    # päringute jaoks prompt_events tabelisse. Activity koondvaates kuva sama event_key
+    # ainult üks kord; eraldi Raw eventide tabel säilitab kõik auditiread.
+    canonical_prompt_finishes = [x for x in prompt_items if x.get("event_type") == "prompt_finished"]
+
+    def duplicate_agent_finish(item: dict) -> bool:
+        if item.get("event_type") != "agent_finished":
+            return False
+        item_at = parse_iso(str(item.get("occurred_at_utc") or ""))
+        if not item_at:
+            return False
+        for finished in canonical_prompt_finishes:
+            if int(item.get("user_id") or 0) != int(finished.get("user_id") or 0):
+                continue
+            finished_at = parse_iso(str(finished.get("started_at") or ""))
+            if not finished_at or abs((item_at - finished_at).total_seconds()) > 15:
+                continue
+            agent_uid = str(item.get("agent_uid") or "")
+            same_agent = bool(agent_uid and agent_uid == str(finished.get("agent_uid") or ""))
+            session_uid = str(item.get("work_session_uid") or "")
+            same_session = bool(session_uid and session_uid == str(finished.get("work_session_uid") or ""))
+            if same_agent or same_session:
+                return True
+        return False
+
+    for item in raw_items:
+        if item.get("event_key") in prompt_event_keys or duplicate_agent_finish(item):
+            continue
+        activity.append({**item, "at": item["occurred_at_utc"], "label": "raw_event"})
     activity.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
     return {"ok": True, "period": label, "from": start_iso, "to": end_iso,
             "sessions": session_items, "prompt_events": prompt_items, "raw_events": raw_items,
@@ -4545,13 +4597,9 @@ def _raw_event_display_tool(tool_name: str, payload_value: dict | None = None) -
 
 
 def _raw_event_display_summary(event_type: str, tool_name: str = "", payload_summary: str = "", session_summary: str = "") -> str:
-    """Activity vaate inimloetav tekst raw-eventile, mitte tehniline event_type."""
+    """Activity tekst põhineb sündmusel endal, mitte sessioni hiljem muutunud kokkuvõttel."""
     event = str(event_type or "").strip()
     summary = _safe_day_prompt_snippet(payload_summary, 500).strip()
-    if not summary:
-        summary = _safe_day_prompt_snippet(session_summary, 500).strip()
-    if summary and summary != event:
-        return summary
     tool = str(tool_name or "").strip()
     tool_part = f" {tool}" if tool else ""
     mapping = {
@@ -4577,7 +4625,16 @@ def _raw_event_display_summary(event_type: str, tool_name: str = "", payload_sum
         "subagent_stuck": "Alam-agent jäi liiga kauaks pooleli",
         "agent_recovered": "AI-agent jätkas pärast tõrget",
     }
-    return mapping.get(event, event.replace("_", " ") or "Sündmus salvestati")
+    label = mapping.get(event)
+    # Lõpusündmuse oma kokkuvõte on kasulik, kuid ei tohi varasematele lifecycle-ridadele
+    # sessioni lõppkokkuvõttena tagasi kanduda.
+    if label:
+        if summary and summary not in {event, label} and event in {"prompt_finished", "agent_finished", "subagent_finished", "turn_end"}:
+            return f"{label}: {summary}"
+        return label
+    if summary and summary != event:
+        return summary
+    return event.replace("_", " ") or "Sündmus salvestati"
 
 
 def _raw_event_occurred_at(e: dict, now: str) -> str:

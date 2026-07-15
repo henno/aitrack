@@ -202,7 +202,11 @@ Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser 
 `/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.
 Tavakasutaja näeb enda work session'eid, prompt-evente ja tegevuste ajalugu; admin näeb kõiki kasutajaid.
 Activity vaates saab filtreerida projekti, kasutaja, issue, tööriista, agent'i ja staatuse järgi ning
-kuupäevakalendris valida ühe päeva või vahemiku (1. klikk algus, 2. klikk lõpp). Staatused:
+kuupäevakalendris valida ühe päeva või vahemiku (1. klikk algus, 2. klikk lõpp). Koondajalugu kuvab
+sama `event_key` prompt-kirje ühe korra ja ühendab Pi sama tööetapi `agent_finished` + `prompt_finished`
+üheks visuaalseks lõpetamiseks; täielik auditijälg jääb eraldi Raw eventide tabelisse. Lifecycle-rida kasutab
+enda sündmuse kirjeldust, mitte sessioni hiljem muutunud lõppkokkuvõtet, ning lähestikku tekkinud sündmustel
+näidatakse eristamiseks millisekundeid. Staatused:
 `active` = hiljutise progressiga töö, `stale` = üle 10 minuti progressita töö, `stuck` = üle 10 minuti
 pooleliolev tool-call.
 

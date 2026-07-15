@@ -770,7 +770,17 @@ updateThemeButton();
 
 function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
 function esc(s) { return String(s ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function fmtTime(s) { if (!s) return ''; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }
+function fmtTime(s, milliseconds=false) {
+  if (!s) return '';
+  const d = new Date(s);
+  if (isNaN(d)) return esc(s);
+  if (!milliseconds) return d.toLocaleString();
+  try {
+    return d.toLocaleString(undefined, {year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', fractionalSecondDigits:3});
+  } catch (_) {
+    return d.toLocaleString();
+  }
+}
 function projectLabel(x) {
   const path = x.local_path || x.cwd || '';
   return `${esc(x.project_key || x.project || '')}${x.issue ? ' <span class="pill">' + esc(x.issue) + '</span>' : ''}${path ? '<div class="small path">' + esc(path) + '</div>' : ''}`;
@@ -959,14 +969,25 @@ function renderMetrics(data) {
     <div class="metric"><span class="small">Minutid</span><b>${minutes}</b></div>
     <div class="metric"><span class="small">Periood</span><b style="font-size:16px">${esc(data.period || '')}</b></div>`;
 }
+function promptEventLabel(x) {
+  if (x.event_type === 'prompt_started') return 'AI-prompt algas';
+  if (x.event_type === 'prompt_finished') return 'AI-prompt lõpetati';
+  return 'Prompt salvestati';
+}
+function promptEventBody(x) {
+  const label = promptEventLabel(x);
+  if (x.prompt_text) return `<pre>${esc(x.prompt_text)}</pre><div class="small">${esc(label)}</div>`;
+  const metadata = x.prompt_chars ? ` · ${esc(x.prompt_chars)} märki` : '';
+  return `${esc(label)}<div class="small">Teksti ei saadetud${metadata}</div>`;
+}
 function renderActivity(rows) {
   $('activityBody').innerHTML = rows.length ? rows.map(x => {
     const body = x.type === 'prompt_event'
-      ? `<pre>${esc(x.prompt_text || '')}</pre>`
+      ? promptEventBody(x)
       : x.type === 'raw_event'
         ? `${x.summary && x.summary !== x.event_type ? '<pre>' + esc(x.summary) + '</pre>' : esc(x.event_type || '')}<div class="small">${esc(x.event_type || '')}${x.agent_uid ? ' · ' + esc(x.agent_uid) : ''}</div>`
         : `${esc(x.summary || '')}<div class="small">${esc(x.work_session_uid || '')}</div>`;
-    return `<tr${rowColorAttrs(x)}><td data-label="Aeg">${fmtTime(x.at)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td><td data-label="Toorandmed">${detailButton(x)}</td></tr>`;
+    return `<tr${rowColorAttrs(x)}><td data-label="Aeg">${fmtTime(x.at, true)}</td><td data-label="Tüüp"><span class="pill">${esc(x.type)}</span></td><td data-label="Kasutaja">${esc(x.user || '')}</td><td data-label="Projekt">${projectLabel(x)}</td><td data-label="Tööriist">${esc(x.tool || '')}</td><td data-label="Sisu">${body}</td><td data-label="Toorandmed">${detailButton(x)}</td></tr>`;
   }).join('') : '<tr><td class="empty" colspan="7">Tegevusi pole.</td></tr>';
 }
 function renderSessions(rows) {
@@ -988,7 +1009,7 @@ function renderPrompts(rows) {
     <td data-label="Projekt">${projectLabel(x)}<div class="small">${esc(x.work_session_uid || '')}</div></td>
     <td data-label="Tööriist">${esc(x.tool || '')}</td>
     <td data-label="Kestus">${Math.round(Number(x.duration_seconds || 0) / 60)} min</td>
-    <td data-label="Prompt"><pre>${esc(x.prompt_text || '')}</pre></td>
+    <td data-label="Prompt">${promptEventBody(x)}</td>
     <td data-label="Toorandmed">${detailButton({...x, type:'prompt_event'})}</td>
   </tr>`).join('') : '<tr><td class="empty" colspan="7">Prompt-evente pole.</td></tr>';
 }
@@ -1000,7 +1021,7 @@ function renderAgentTree(rows) {
 }
 function renderRawEvents(rows) {
   $('rawEventsBody').innerHTML = rows.length ? rows.map(x => `<tr${rowColorAttrs(x)}>
-    <td data-label="Aeg">${fmtTime(x.occurred_at_utc)}</td>
+    <td data-label="Aeg">${fmtTime(x.occurred_at_utc, true)}</td>
     <td data-label="Kasutaja">${esc(x.user || '')}</td>
     <td data-label="Event"><span class="pill">${esc(x.event_type || '')}</span><div class="small">${esc(x.event_key || '')}</div></td>
     <td data-label="Agent/tool">${esc(x.agent_uid || '')}<div class="small">${esc(x.tool || x.tool_name || '')}${x.tool_name && x.tool && x.tool_name !== x.tool ? ' · raw: ' + esc(x.tool_name) : ''}${x.tool_call_id ? ' · ' + esc(x.tool_call_id) : ''}</div></td>
