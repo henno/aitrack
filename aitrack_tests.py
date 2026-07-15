@@ -765,7 +765,7 @@ check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
 check("activity leht sisaldab raw event timeline'i", "Raw eventid" in activity_page and "renderRawEvents" in activity_page and "raw_events" in activity_page)
 check("activity näitab sündmuste millisekundeid ja metadata prompti selgitust", "fmtTime(x.at, true)" in activity_page and "fractionalSecondDigits:3" in activity_page and "Teksti ei saadetud" in activity_page)
-check("activity kuvab prompti lõpetamisel tehtu kokkuvõtet", "x.work_summary" in activity_page and "Tehtu kokkuvõte" in activity_page and "promptContextLine" not in activity_page)
+check("activity kuvab prompti lõpetamisel tehtu kokkuvõtet ja tokenite arvu", "x.work_summary" in activity_page and "Tehtu kokkuvõte" in activity_page and "x.context_tokens" in activity_page and "tokenit" in activity_page and "promptContextLine" not in activity_page)
 check("activity filtrid jõustuvad automaatselt ja status on nupud", "setSessionStatusFilter('active')" in activity_page and "scheduleActivityLoad" in activity_page and ">Ava</button>" not in activity_page)
 check("activity kuupäevafilter toetab kalendri vahemikku", "datePicker" in activity_page and "selectDateRangeDay" in activity_page and "params.set('from', dateRangeStart)" in activity_page and "params.set('to', dateRangeEnd)" in activity_page)
 server_start_page = A._start_page_html(server_mode=True)
@@ -801,11 +801,11 @@ check("full prompt-event on opt-in", full_events[0]["prompt_text"] == "salajane 
 hook_args = types.SimpleNamespace(prompt="salajane hook prompt", summary="", tool="pi", tool_name="", tool_call_id="", agent_uid="", parent_agent_uid="")
 hook_meta = A._hook_event(hook_args, "prompt_started", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "metadata"})
 hook_full = A._hook_event(hook_args, "prompt_started", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "full"})
-hook_done_args = types.SimpleNamespace(prompt="", summary="Parandasin Activity vaate ja kontrollisin testidega.", tool="pi", tool_name="", tool_call_id="", agent_uid="", parent_agent_uid="")
+hook_done_args = types.SimpleNamespace(prompt="", summary="Parandasin Activity vaate ja kontrollisin testidega.", tool="pi", tool_name="", tool_call_id="", agent_uid="", parent_agent_uid="", context_tokens=3210)
 hook_done_meta = A._hook_event(hook_done_args, "prompt_finished", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "metadata"})
 check("hook prompt-start peidab teksti metadata režiimis", hook_meta["prompt_text"] == "" and hook_meta["summary"] == "" and hook_meta["prompt_chars"] == len("salajane hook prompt"))
 check("hook prompt-start full režiim on opt-in", hook_full["prompt_text"] == "salajane hook prompt")
-check("metadata režiim saadab prompti lõpus tehtu kokkuvõtte", hook_done_meta["prompt_text"] == "" and hook_done_meta["work_summary"] == "Parandasin Activity vaate ja kontrollisin testidega." and hook_done_meta["payload"]["work_summary"] == hook_done_meta["work_summary"])
+check("metadata režiim saadab prompti lõpus tehtu kokkuvõtte ja tokenite arvu", hook_done_meta["prompt_text"] == "" and hook_done_meta["work_summary"] == "Parandasin Activity vaate ja kontrollisin testidega." and hook_done_meta["payload"]["work_summary"] == hook_done_meta["work_summary"] and hook_done_meta["context_tokens"] == 3210)
 
 # ============ TEST 47: brauseri login parool ja web session ============
 print("TEST 47: serveri brauseri login loob sessiooni ilma API tokenit avaldamata")
@@ -912,6 +912,8 @@ check("activity filter otsib projekti ja kasutajat osalise tekstiga", len(raw_ac
 check("activity issue filter oskab combobox labelit kasutada", len(raw_activity_issue_filtered.get("raw_events", [])) == 1)
 check("activity autocomplete valikud sisaldavad projekti, kasutajat ja issue pealkirja", any("parkkarl" in p.get("project_key", "") for p in raw_filter_options.get("projects", [])) and any(u.get("name") == "rawuser" for u in raw_filter_options.get("users", [])) and any(i.get("issue_key") == "662" and "Asendaja" in i.get("title", "") for i in raw_filter_options.get("issues", [])))
 check("raw payload on piiratud ja saladus redigeeritud", "SALA" not in exported_raw.get("payload_json", "") and len(exported_raw.get("payload_json", "")) <= A.RAW_EVENT_PAYLOAD_MAX_BYTES)
+safe_token_meta = A._raw_event_payload_value({"context_tokens": 321, "token": "SALA"})
+check("tokenite arv säilib, kuid päris token redigeeritakse", safe_token_meta["context_tokens"] == 321 and safe_token_meta["token"] == "[redacted]")
 check("raw export filter töötab", A._db_export_raw_events(rdb, rtok, {"period": ["2026-06"], "event_type": ["after_tool_call"]})["count"] == 0)
 
 # ============ TEST 50: active interval rollup käsitleb sleep-gap'i ==========
@@ -1012,7 +1014,7 @@ check("activity agent filter piirab ka prompt-evente", activity_agent.get("promp
 check("activity koondvaade ei kuva prompt-starti raw ja prompt duplikaadina", len([x for x in activity_agent.get("activity", []) if x.get("event_type") == "prompt_started"]) == 1 and all(x.get("type") == "prompt_event" for x in activity_agent.get("activity", []) if x.get("event_type") == "prompt_started"))
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool_name": "read", "tool_call_id": "tc-1", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=4)).isoformat()}, "after_tool_call")
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "summary": "muudatused valmis", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=5)).isoformat()}, "agent_finished")
-A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "summary": "prompti kokkuvõte", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=5, seconds=1)).isoformat()}, "prompt_finished")
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "summary": "prompti kokkuvõte", "context_tokens": 900, "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=5, seconds=1)).isoformat()}, "prompt_finished")
 activity_done = A._db_activity_log(edb, etok, {"period": ["2026-06"], "agent_uid": ["agent-a"]})
 with A._db_connect(edb) as conn:
     done_row = conn.execute("SELECT current_tool_name, summary, status_detail FROM work_sessions WHERE session_uid = ?", (estart["work_session_uid"],)).fetchone()
@@ -1020,7 +1022,7 @@ with A._db_connect(edb) as conn:
 check("tool-end endpoint puhastab jooksva tooli", done_row["current_tool_name"] == "")
 check("done event uuendab sessiooni kokkuvõtte", done_row["summary"] == "prompti kokkuvõte" and str(done_row["status_detail"]).startswith("done:"))
 check("prompt-done event salvestab tehtu kokkuvõtte prompt-eventina", done_prompt is not None)
-check("activity prompt-done sisaldab tehtu kokkuvõtet", any(x.get("event_type") == "prompt_finished" and x.get("work_summary") == "prompti kokkuvõte" for x in activity_done.get("prompt_events", [])))
+check("activity prompt-done sisaldab tehtu kokkuvõtet ja tokenite arvu", any(x.get("event_type") == "prompt_finished" and x.get("work_summary") == "prompti kokkuvõte" and x.get("context_tokens") == 900 for x in activity_done.get("prompt_events", [])))
 check("activity raw done event näitab sündmuse liiki ja oma kokkuvõtet", any(x.get("event_type") == "agent_finished" and x.get("summary") == "AI-agent lõpetas tööülesande: muudatused valmis" for x in activity_done.get("raw_events", [])))
 check("activity varasem tool-event ei päri sessioni lõppkokkuvõtet", any(x.get("event_type") == "before_tool_call" and x.get("summary") == "Käivitasin tööriista read" for x in activity_done.get("raw_events", [])))
 completion_activity = [x for x in activity_done.get("activity", []) if x.get("event_type") in {"agent_finished", "prompt_finished"}]
@@ -1219,7 +1221,7 @@ print("TEST 60B: Pi extension jätab valmis-kokkuvõtte kopeerimiseks alles")
 extension_text = A._pi_extension_text()
 check("Pi extension ei tee 260 märgi '...' lõiget", "s.length > 260" not in extension_text and "slice(0, 257)" not in extension_text)
 check("Pi extension lubab pikema summary serverisse", "summary.slice(0, 4000)" in extension_text)
-check("Pi extension saadab prompti lõpus tehtu kokkuvõtte", '"prompt-done"' in extension_text and "doneSummary(event)" in extension_text and '"--context-json"' not in extension_text)
+check("Pi extension saadab prompti lõpus tehtu kokkuvõtte ja tokenite arvu", '"prompt-done"' in extension_text and "doneSummary(event)" in extension_text and '"--context-tokens"' in extension_text and '"--context-json"' not in extension_text)
 
 # ============ TEST 61: aitrack add vajab päris terminali ==========
 print("TEST 61: aitrack add vajab päris terminali")

@@ -224,8 +224,9 @@ kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/
 praktikapäeviku tunni sõnastuse lokaalselt kogu kättesaadava AI-vestluse põhjal ja saadab serverisse valmis
 kokkuvõtterea. Prompt-eventid lähevad kliendist serverisse vaikimisi ainult metadatana (aeg, projekt,
 tööriist, kestus ja tekstipikkus; mitte prompti tekst). Pi prompti lõpetamisel saadetakse eraldi lokaalselt
-valminud tehtu kokkuvõte, mida Activity näitab tehniliste kontekstiloendurite asemel. See ei sisalda varasemat
-vestlustranskripti. Ainult jooksva prompti täistekst on opt-in seadistusega `server_prompt_events: "full"`;
+valminud tehtu kokkuvõte. Activity näitab selle kõrval ainult konteksti tokenite arvu; muid tehnilisi
+kontekstiloendureid ega varasemat vestlustranskripti serverisse ei saadeta. Ainult jooksva prompti täistekst on
+opt-in seadistusega `server_prompt_events: "full"`;
 `"off"` lülitab prompt-eventide batch-saatmise välja. Kui valmis tunnirida pole,
 eelistab serveri fallback sisulisi `prompt_events` ridu ning kasutab work-session/minute infot ainult viimase
 varuvariandina. Ekspordi raw evente

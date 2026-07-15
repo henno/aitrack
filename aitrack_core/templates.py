@@ -977,10 +977,11 @@ function promptEventLabel(x) {
 }
 function promptEventBody(x) {
   const label = promptEventLabel(x);
-  if (x.work_summary) return `<pre>${esc(x.work_summary)}</pre><div class="small">Tehtu kokkuvõte · ${esc(label)}</div>`;
-  if (x.prompt_text) return `<pre>${esc(x.prompt_text)}</pre><div class="small">${esc(label)}</div>`;
+  const tokens = x.context_tokens ? ` · ${esc(x.context_tokens)} tokenit` : '';
+  if (x.work_summary) return `<pre>${esc(x.work_summary)}</pre><div class="small">Tehtu kokkuvõte${tokens} · ${esc(label)}</div>`;
+  if (x.prompt_text) return `<pre>${esc(x.prompt_text)}</pre><div class="small">${esc(label)}${tokens}</div>`;
   const metadata = x.prompt_chars ? ` · ${esc(x.prompt_chars)} märki` : '';
-  return `${esc(label)}<div class="small">Teksti ei saadetud${metadata}</div>`;
+  return `${esc(label)}<div class="small">Teksti ei saadetud${metadata}${tokens}</div>`;
 }
 function renderActivity(rows) {
   $('activityBody').innerHTML = rows.length ? rows.map(x => {

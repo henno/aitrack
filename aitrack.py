@@ -89,10 +89,11 @@ BAN_SECONDS = 30 * 60
 RAW_EVENT_PAYLOAD_MAX_BYTES = 16 * 1024
 RAW_EVENT_STRING_MAX_CHARS = 4000
 RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "authorization", "cookie"}
+RAW_EVENT_SAFE_METADATA_KEYS = {"context_tokens"}
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
-CLIENT_VERSION = 8
+CLIENT_VERSION = 9
 ALLOWLIST_SYNC_TTL_SECONDS = 10 * 60
 AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
@@ -3682,6 +3683,10 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         except (TypeError, ValueError):
             prompt_chars = 0
         nested_prompt_payload = prompt_payload.get("payload") if isinstance(prompt_payload.get("payload"), dict) else {}
+        try:
+            context_tokens = min(1_000_000_000, max(0, int(prompt_payload.get("context_tokens") or nested_prompt_payload.get("context_tokens") or 0)))
+        except (TypeError, ValueError, OverflowError):
+            context_tokens = 0
         prompt_event_type = str(prompt_payload.get("event_type") or "prompt_event")
         work_summary = ""
         if prompt_event_type == "prompt_finished":
@@ -3705,6 +3710,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "prompt_text": r["prompt_text"],
             "prompt_chars": prompt_chars,
             "content_mode": str(prompt_payload.get("content_mode") or nested_prompt_payload.get("content_mode") or ""),
+            "context_tokens": context_tokens,
             "work_summary": work_summary,
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
@@ -4710,7 +4716,8 @@ def _raw_event_payload_value(value, *, depth: int = 0):
         for k, v in value.items():
             key = str(k)
             lowered = key.lower().replace("-", "_")
-            if lowered in RAW_EVENT_SENSITIVE_KEYS or any(s in lowered for s in ("token", "password", "secret")):
+            sensitive = lowered in RAW_EVENT_SENSITIVE_KEYS or any(s in lowered for s in ("token", "password", "secret"))
+            if sensitive and lowered not in RAW_EVENT_SAFE_METADATA_KEYS:
                 out[key] = "[redacted]"
             else:
                 out[key] = _raw_event_payload_value(v, depth=depth + 1)
@@ -7602,6 +7609,10 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict, cfg: dic
     # on Activity vaate põhisisu ka privaatses metadata režiimis.
     summary_text = _safe_day_prompt_snippet(raw_summary, 4000) if text_allowed or is_completion else ""
     work_summary = summary_text if is_completion else ""
+    try:
+        context_tokens = min(1_000_000_000, max(0, int(getattr(args, "context_tokens", 0) or 0)))
+    except (TypeError, ValueError, OverflowError):
+        context_tokens = 0
     event = {
         "event_key": f"hook:{event_type}:{session_uid}:{agent_uid}:{tool_call_id}:{now}",
         "event_type": event_type,
@@ -7613,11 +7624,12 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict, cfg: dic
         "occurred_at_utc": now,
         "summary": summary_text,
         "work_summary": work_summary,
+        "context_tokens": context_tokens,
         "project": {"project_key": ctx.get("project_key", ""), "repo_url": ctx.get("repo_url", ""),
                     "name": ctx.get("name", ""), "local_path": ctx.get("local_path", ""),
                     "checkout_id": ctx.get("checkout_id", ""), "branch": ctx.get("branch", "")},
         "issue_key": ctx.get("issue_key", ""),
-        "payload": {"cwd": ctx.get("cwd", ""), "work_summary": work_summary, "content_mode": mode},
+        "payload": {"cwd": ctx.get("cwd", ""), "work_summary": work_summary, "context_tokens": context_tokens, "content_mode": mode},
     }
     tool_input = getattr(args, "tool_input", "")
     if tool_input:
@@ -7988,6 +8000,15 @@ function common(ctx: any, agentUid: string, prompt?: string, summary?: string): 
   ];
 }
 
+function contextTokenArgs(ctx: any): string[] {
+  try {
+    const tokens = Math.max(0, Math.round(Number(ctx.getContextUsage?.()?.tokens || 0)));
+    return Number.isFinite(tokens) && tokens > 0 ? ["--context-tokens", String(tokens)] : [];
+  } catch {
+    return [];
+  }
+}
+
 function toolInputArgs(input: unknown): string[] {
   try {
     const text = JSON.stringify(input ?? {});
@@ -8045,7 +8066,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     agentUid = `pi-${randomUUID()}`;
-    runAitrack(["hook", "prompt-start", ...common(ctx, agentUid, event.prompt)], ctx.cwd);
+    runAitrack(["hook", "prompt-start", ...common(ctx, agentUid, event.prompt), ...contextTokenArgs(ctx)], ctx.cwd);
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -8081,7 +8102,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, ctx) => {
     const summary = doneSummary(event);
     runAitrack(["hook", "agent-end", ...common(ctx, agentUid, undefined, summary)], ctx.cwd);
-    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid, undefined, summary)], ctx.cwd);
+    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid, undefined, summary), ...contextTokenArgs(ctx)], ctx.cwd);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -8428,7 +8449,8 @@ def main():
         p.add_argument("--tool-name", dest="tool_name", default="")
         p.add_argument("--tool-call-id", dest="tool_call_id", default="")
         p.add_argument("--tool-input", dest="tool_input", default="")
-        # Kliendiversioon 7 võis selle argumendi saata; v8 eirab seda tagasiühilduvalt.
+        p.add_argument("--context-tokens", dest="context_tokens", type=int, default=0)
+        # Kliendiversioon 7 võis selle argumendi saata; uuem klient eirab seda tagasiühilduvalt.
         p.add_argument("--context-json", dest="context_json", default="", help=argparse.SUPPRESS)
         p.add_argument("--owner-pid", dest="owner_pid")
         p.add_argument("--owner-start", dest="owner_start", default="")
