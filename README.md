@@ -223,10 +223,10 @@ kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/
 `/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Tavapärane `aitrack run` teeb
 praktikapäeviku tunni sõnastuse lokaalselt kogu kättesaadava AI-vestluse põhjal ja saadab serverisse valmis
 kokkuvõtterea. Prompt-eventid lähevad kliendist serverisse vaikimisi ainult metadatana (aeg, projekt,
-tööriist, kestus ja tekstipikkus; mitte prompti tekst). Pi lisab privaatsussäästliku vestluskonteksti:
-sessioni/modeli tunnus, sõnumite ja tokenite arv ning hiljutiste tööriistade ja failide nimed (mitte absoluutsed
-failiteed). Vestluse varasemate sõnumite teksti serverisse ei saadeta. Ainult jooksva prompti täistekst on opt-in
-seadistusega `server_prompt_events: "full"`; `"off"` lülitab prompt-eventide batch-saatmise välja. Kui valmis tunnirida pole,
+tööriist, kestus ja tekstipikkus; mitte prompti tekst). Pi prompti lõpetamisel saadetakse eraldi lokaalselt
+valminud tehtu kokkuvõte, mida Activity näitab tehniliste kontekstiloendurite asemel. See ei sisalda varasemat
+vestlustranskripti. Ainult jooksva prompti täistekst on opt-in seadistusega `server_prompt_events: "full"`;
+`"off"` lülitab prompt-eventide batch-saatmise välja. Kui valmis tunnirida pole,
 eelistab serveri fallback sisulisi `prompt_events` ridu ning kasutab work-session/minute infot ainult viimase
 varuvariandina. Ekspordi raw evente
 `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id piiratakse ning tüüpilised token/parool/saladuse

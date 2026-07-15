@@ -92,7 +92,7 @@ RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", 
 DEFAULT_STALE_MINUTES = 10
 DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
-CLIENT_VERSION = 7
+CLIENT_VERSION = 8
 ALLOWLIST_SYNC_TTL_SECONDS = 10 * 60
 AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
@@ -3682,12 +3682,17 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
         except (TypeError, ValueError):
             prompt_chars = 0
         nested_prompt_payload = prompt_payload.get("payload") if isinstance(prompt_payload.get("payload"), dict) else {}
-        conversation_context = nested_prompt_payload.get("conversation_context") if isinstance(nested_prompt_payload.get("conversation_context"), dict) else {}
+        prompt_event_type = str(prompt_payload.get("event_type") or "prompt_event")
+        work_summary = ""
+        if prompt_event_type == "prompt_finished":
+            work_summary = _safe_day_prompt_snippet(
+                prompt_payload.get("work_summary") or nested_prompt_payload.get("work_summary") or prompt_payload.get("summary") or "", 4000
+            )
         item = {
             "type": "prompt_event",
             "id": int(r["id"]),
             "event_key": r["event_key"],
-            "event_type": str(prompt_payload.get("event_type") or "prompt_event"),
+            "event_type": prompt_event_type,
             "user_id": int(r["user_id"]),
             "user": r["user_name"],
             "tool": r["tool"],
@@ -3700,7 +3705,7 @@ def _db_activity_log(path: Path, token: str, q: dict) -> dict:
             "prompt_text": r["prompt_text"],
             "prompt_chars": prompt_chars,
             "content_mode": str(prompt_payload.get("content_mode") or nested_prompt_payload.get("content_mode") or ""),
-            "conversation_context": conversation_context,
+            "work_summary": work_summary,
             "started_at": r["started_at"],
             "ended_at": r["ended_at"],
             "duration_seconds": int(r["duration_seconds"] or 0),
@@ -7583,49 +7588,6 @@ def _hook_get_or_start_session(args, cfg: dict, *, start_if_missing: bool) -> tu
     return session, ctx
 
 
-def _hook_conversation_context(raw_context, mode: str) -> dict:
-    """Valmista Pi vestluskontekst serverile; metadata režiimis ei lähe sõnumiteksti."""
-    if not raw_context:
-        return {}
-    try:
-        value = json.loads(str(raw_context)) if isinstance(raw_context, str) else raw_context
-    except (TypeError, json.JSONDecodeError):
-        return {}
-    if not isinstance(value, dict):
-        return {}
-
-    def number(name: str) -> int:
-        try:
-            return min(1_000_000_000, max(0, int(value.get(name) or 0)))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    def strings(name: str, limit: int, chars: int) -> list[str]:
-        items = value.get(name)
-        if not isinstance(items, list):
-            return []
-        return [_safe_day_prompt_snippet(x, chars) for x in items[:limit] if str(x).strip()]
-
-    recent_files = [x.replace("\\", "/").rsplit("/", 1)[-1] for x in strings("recent_files", 20, 500)]
-    context = {
-        "session_id": _safe_day_prompt_snippet(value.get("session_id") or "", 160),
-        "model": _safe_day_prompt_snippet(value.get("model") or "", 160),
-        "message_count": number("message_count"),
-        "user_message_count": number("user_message_count"),
-        "assistant_message_count": number("assistant_message_count"),
-        "tool_result_count": number("tool_result_count"),
-        "compaction_count": number("compaction_count"),
-        "context_chars": number("context_chars"),
-        "context_tokens": number("context_tokens"),
-        "context_window": number("context_window"),
-        "branch_entries": number("branch_entries"),
-        "recent_tools": strings("recent_tools", 20, 80),
-        "recent_files": recent_files,
-        "content_mode": mode,
-    }
-    return _compact_detail_value(context)
-
-
 def _hook_event(args, event_type: str, session: dict | None, ctx: dict, cfg: dict) -> dict:
     now = _now_utc().isoformat()
     session_uid = str((session or {}).get("work_session_uid") or getattr(args, "work_session_uid", "") or "")
@@ -7635,7 +7597,11 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict, cfg: dic
     mode = _server_prompt_event_mode(cfg)
     text_allowed = mode == "full"
     raw_summary = getattr(args, "summary", "") or getattr(args, "prompt", "") or ""
-    summary_text = _safe_day_prompt_snippet(raw_summary, 4000) if text_allowed else ""
+    is_completion = event_type in {"prompt_finished", "agent_finished", "subagent_finished", "turn_end"}
+    # Lokaalselt valminud tehtu kokkuvõte ei ole vestluse transkript ega prompt ning
+    # on Activity vaate põhisisu ka privaatses metadata režiimis.
+    summary_text = _safe_day_prompt_snippet(raw_summary, 4000) if text_allowed or is_completion else ""
+    work_summary = summary_text if is_completion else ""
     event = {
         "event_key": f"hook:{event_type}:{session_uid}:{agent_uid}:{tool_call_id}:{now}",
         "event_type": event_type,
@@ -7646,15 +7612,13 @@ def _hook_event(args, event_type: str, session: dict | None, ctx: dict, cfg: dic
         "tool_call_id": tool_call_id,
         "occurred_at_utc": now,
         "summary": summary_text,
+        "work_summary": work_summary,
         "project": {"project_key": ctx.get("project_key", ""), "repo_url": ctx.get("repo_url", ""),
                     "name": ctx.get("name", ""), "local_path": ctx.get("local_path", ""),
                     "checkout_id": ctx.get("checkout_id", ""), "branch": ctx.get("branch", "")},
         "issue_key": ctx.get("issue_key", ""),
-        "payload": {"cwd": ctx.get("cwd", ""), "summary": _safe_day_prompt_snippet(summary_text, 4000), "content_mode": mode},
+        "payload": {"cwd": ctx.get("cwd", ""), "work_summary": work_summary, "content_mode": mode},
     }
-    conversation_context = _hook_conversation_context(getattr(args, "context_json", ""), mode)
-    if conversation_context:
-        event["payload"]["conversation_context"] = conversation_context
     tool_input = getattr(args, "tool_input", "")
     if tool_input:
         try:
@@ -8012,7 +7976,7 @@ function runAitrack(args: string[], cwd: string) {
   }
 }
 
-function common(ctx: any, agentUid: string, prompt?: string, summary?: string, contextJson?: string): string[] {
+function common(ctx: any, agentUid: string, prompt?: string, summary?: string): string[] {
   return [
     "--tool", "pi",
     "--cwd", ctx.cwd || process.cwd(),
@@ -8021,7 +7985,6 @@ function common(ctx: any, agentUid: string, prompt?: string, summary?: string, c
     "--owner-command", process.argv.join(" ").slice(0, 500),
     ...(prompt ? ["--prompt", prompt.slice(0, 2000)] : []),
     ...(summary ? ["--summary", summary.slice(0, 4000)] : []),
-    ...(contextJson && contextJson !== "{}" ? ["--context-json", contextJson] : []),
   ];
 }
 
@@ -8077,78 +8040,12 @@ function doneSummary(event: any): string {
   return "";
 }
 
-function conversationContext(ctx: any): string {
-  try {
-    const built = ctx.sessionManager.buildSessionContext();
-    const messages = Array.isArray(built?.messages) ? built.messages : [];
-    const recentTools = new Set<string>();
-    const recentFiles = new Set<string>();
-    let userMessages = 0;
-    let assistantMessages = 0;
-    let toolResults = 0;
-    let compactions = 0;
-    let contextChars = 0;
-    for (const message of messages) {
-      const role = String(message?.role || "");
-      if (role === "user") userMessages += 1;
-      else if (role === "assistant") assistantMessages += 1;
-      else if (role === "toolResult") toolResults += 1;
-      else if (role === "compactionSummary" || role === "branchSummary") compactions += 1;
-      const text = role === "compactionSummary" || role === "branchSummary"
-        ? String(message?.summary || "")
-        : textParts(message?.content).join(" ");
-      const compact = String(text || "").replace(/\s+/g, " ").trim();
-      contextChars += compact.length;
-      if (role === "toolResult" && message?.toolName) recentTools.add(String(message.toolName));
-      if (role !== "assistant" || !Array.isArray(message.content)) continue;
-      for (const part of message.content) {
-        const block = part as ContentBlock;
-        if (block?.type !== "toolCall" && !block?.name) continue;
-        const name = String(block?.name || "");
-        const args = (block?.arguments || {}) as Record<string, unknown>;
-        if (name) recentTools.add(name);
-        for (const key of ["path", "file", "filePath"]) {
-          if (typeof args[key] !== "string") continue;
-          const rawPath = String(args[key]).replace(/\\/g, "/");
-          const cwd = String(ctx.cwd || "").replace(/\\/g, "/").replace(/\/$/, "");
-          const relative = cwd && rawPath.startsWith(cwd + "/") ? rawPath.slice(cwd.length + 1) : rawPath;
-          const safePath = relative.startsWith("/") || /^[A-Za-z]:\//.test(relative)
-            ? relative.split("/").filter(Boolean).pop() || ""
-            : relative.replace(/^\.\//, "");
-          if (safePath) recentFiles.add(safePath.slice(0, 300));
-        }
-      }
-    }
-    const usage = ctx.getContextUsage?.();
-    const provider = String(ctx.model?.provider || "");
-    const modelId = String(ctx.model?.id || "");
-    const snapshot = {
-      session_id: String(ctx.sessionManager.getSessionId?.() || "").slice(0, 160),
-      model: [provider, modelId].filter(Boolean).join("/").slice(0, 160),
-      message_count: messages.length,
-      user_message_count: userMessages,
-      assistant_message_count: assistantMessages,
-      tool_result_count: toolResults,
-      compaction_count: compactions,
-      context_chars: contextChars,
-      context_tokens: Number(usage?.tokens || 0),
-      context_window: Number(ctx.model?.contextWindow || 0),
-      branch_entries: Number(ctx.sessionManager.getBranch?.().length || 0),
-      recent_tools: Array.from(recentTools).slice(-20).map((x) => x.slice(0, 80)),
-      recent_files: Array.from(recentFiles).slice(-10),
-    };
-    return JSON.stringify(snapshot);
-  } catch {
-    return "{}";
-  }
-}
-
 export default function (pi: ExtensionAPI) {
   let agentUid = `pi-${randomUUID()}`;
 
   pi.on("before_agent_start", async (event, ctx) => {
     agentUid = `pi-${randomUUID()}`;
-    runAitrack(["hook", "prompt-start", ...common(ctx, agentUid, event.prompt, undefined, conversationContext(ctx))], ctx.cwd);
+    runAitrack(["hook", "prompt-start", ...common(ctx, agentUid, event.prompt)], ctx.cwd);
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -8184,7 +8081,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, ctx) => {
     const summary = doneSummary(event);
     runAitrack(["hook", "agent-end", ...common(ctx, agentUid, undefined, summary)], ctx.cwd);
-    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid, undefined, summary, conversationContext(ctx))], ctx.cwd);
+    runAitrack(["hook", "prompt-done", ...common(ctx, agentUid, undefined, summary)], ctx.cwd);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -8531,7 +8428,6 @@ def main():
         p.add_argument("--tool-name", dest="tool_name", default="")
         p.add_argument("--tool-call-id", dest="tool_call_id", default="")
         p.add_argument("--tool-input", dest="tool_input", default="")
-        p.add_argument("--context-json", dest="context_json", default="")
         p.add_argument("--owner-pid", dest="owner_pid")
         p.add_argument("--owner-start", dest="owner_start", default="")
         p.add_argument("--owner-command", dest="owner_command", default="")
