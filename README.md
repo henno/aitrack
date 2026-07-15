@@ -102,6 +102,7 @@ ise allowlisti lisada.
 | `aitrack watchdog --stale-minutes N --stuck-minutes N` | Märgi progressita või liiga kaua tooli sees olevad sessioonid `stale`/`stuck` olekusse. |
 | `aitrack cleanup --older-than 90d [--apply]` | Retention cleanup: raw eventid ja rollupitud vanad minute tickid; vaikimisi dry-run. |
 | `aitrack events status/flush` | Lokaalse offline raw-event outboxi olek ja uuestisaatmine. |
+| `aitrack report month --period YYYY-MM --project-key ... --rate 82` | Ekspordi serverist issue-põhine kuuraport minutite, tehtud töö ja tõendusviidetega. |
 | `aitrack customer/contract/rate ...` | Kliendi, lepingu ja tunnihinna baastöövoog serveri DB jaoks. |
 | `aitrack project assign-customer PROJECT_KEY CUSTOMER` | Seo olemasolev projekt kliendiga. |
 | `aitrack setup` | **Interaktiivne seadistus algusest lõpuni** (soovitatav). |
@@ -251,15 +252,24 @@ Pi extension saadab promptide alguse/lõpu, tool-call'id ja harnessi lühikokkuv
 Kui Pi kasutab `bash` tooli, proovib aitrack käsu põhjal kuvada päris tegevuse (`testid`, `ssh`,
 `docker compose`, `git`, `read`, `write` jne), mitte ainult `bash`.
 
-Arve jaoks server dokumenti ei tee, vaid annab export-andmed välisele arvegeneraatorile. Vana
-`/api/billing/invoice-lines` endpoint jääb ühilduvuseks alles, kuid vastuses on `deprecated: true`;
-eelista `/api/export/work-sessions` ja `/api/export/active-intervals`. Admin-token näeb kõigi kasutajate ridu;
-tavakasutaja token ainult enda omi.
+Arve jaoks server dokumenti ei tee, vaid annab export-andmed välisele arvegeneraatorile. Kuuraporti jaoks kasuta
+`/api/report/monthly` endpointi või CLI käsku `aitrack report month`. See koondab töö issue järgi, arvutab minutid,
+aja ja summa, tagastab `work_done[]` kokkuvõtted ning tõendusviited `work_session_uid` ja raw-event ID-dega.
+Kui sessioonil pole explicit issue seost, proovib eksport üheselt tuvastada issue numbrit tekstidest kujul `#667`,
+`issue 667` või `GH-667`. Admin-token näeb kõigi kasutajate ridu; tavakasutaja token ainult enda omi.
 
 ```bash
-curl -H "X-Aitrack-Token: TOKEN" \
-  "https://aitrack.example.com/api/billing/invoice-lines?period=2026-06&hourly_rate=82"
+aitrack report month --period 2026-06 \
+  --project-key github.com/puhastusproff/pp-finar \
+  --rate 82 --format json
+
+curl -H "User-Agent: aitrack/1.0" \
+  "https://aitrack.example.com/api/report/monthly?token=TOKEN&period=2026-06&project_key=github.com/puhastusproff/pp-finar&hourly_rate=82"
 ```
+
+Vana `/api/billing/invoice-lines` endpoint jääb ühilduvuseks alles, kuid vastuses on `deprecated: true`;
+eelista uue raporti jaoks `/api/report/monthly` ning madalama taseme ekspordiks `/api/export/work-sessions` ja
+`/api/export/active-intervals`.
 
 Praktikakokkuvõtte saab serverist:
 
