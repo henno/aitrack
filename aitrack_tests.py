@@ -765,6 +765,7 @@ check("activity leht näitab projekti all failiteed", "x.local_path || x.cwd" in
 check("activity leht kasutab login cookie authi", "Server token" not in activity_page and "/api/me" in activity_page and "/api/logout" in activity_page)
 check("activity leht sisaldab raw event timeline'i", "Raw eventid" in activity_page and "renderRawEvents" in activity_page and "raw_events" in activity_page)
 check("activity näitab sündmuste millisekundeid ja metadata prompti selgitust", "fmtTime(x.at, true)" in activity_page and "fractionalSecondDigits:3" in activity_page and "Teksti ei saadetud" in activity_page)
+check("activity kuvab prompti juures privaatsussäästliku vestluskonteksti", "promptContextLine" in activity_page and "Kontekst:" in activity_page and "recent_tools" in activity_page)
 check("activity filtrid jõustuvad automaatselt ja status on nupud", "setSessionStatusFilter('active')" in activity_page and "scheduleActivityLoad" in activity_page and ">Ava</button>" not in activity_page)
 check("activity kuupäevafilter toetab kalendri vahemikku", "datePicker" in activity_page and "selectDateRangeDay" in activity_page and "params.set('from', dateRangeStart)" in activity_page and "params.set('to', dateRangeEnd)" in activity_page)
 server_start_page = A._start_page_html(server_mode=True)
@@ -797,11 +798,17 @@ full_events = A._prompt_events_payload(priv_records, ["/proj"], HFL(10), HFL(11)
 off_events = A._prompt_events_payload(priv_records, ["/proj"], HFL(10), HFL(11), mode="off")
 check("metadata prompt-event ei sisalda prompti teksti", len(meta_events) == 1 and meta_events[0]["prompt_text"] == "" and meta_events[0]["prompt_chars"] == len("salajane prompti tekst"))
 check("full prompt-event on opt-in", full_events[0]["prompt_text"] == "salajane prompti tekst" and off_events == [])
-hook_args = types.SimpleNamespace(prompt="salajane hook prompt", summary="", tool="pi", tool_name="", tool_call_id="", agent_uid="", parent_agent_uid="")
+hook_context = json.dumps({"session_id": "pi-session", "message_count": 12, "user_message_count": 4, "assistant_message_count": 4, "tool_result_count": 4, "context_chars": 9000, "context_tokens": 2100, "recent_tools": ["read", "bash"], "recent_files": ["/home/park/salajane-klient/aitrack.py"], "recent_messages": [{"role": "user", "text": "salajane varasem küsimus"}, {"role": "assistant", "text": "salajane varasem vastus"}]})
+hook_args = types.SimpleNamespace(prompt="salajane hook prompt", summary="", tool="pi", tool_name="", tool_call_id="", agent_uid="", parent_agent_uid="", context_json=hook_context)
 hook_meta = A._hook_event(hook_args, "prompt_started", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "metadata"})
 hook_full = A._hook_event(hook_args, "prompt_started", {"work_session_uid": "ws_priv"}, {"cwd": "/proj", "project_key": "local:proj"}, {"server_prompt_events": "full"})
 check("hook prompt-start peidab teksti metadata režiimis", hook_meta["prompt_text"] == "" and hook_meta["summary"] == "" and hook_meta["prompt_chars"] == len("salajane hook prompt"))
-check("hook prompt-start full režiim on opt-in", hook_full["prompt_text"] == "salajane hook prompt")
+meta_context = hook_meta.get("payload", {}).get("conversation_context", {})
+full_context = hook_full.get("payload", {}).get("conversation_context", {})
+check("metadata kontekst saadab loendurid ja tööliigid, mitte vestluse teksti", meta_context.get("message_count") == 12 and meta_context.get("recent_tools") == ["read", "bash"] and "recent_messages" not in meta_context)
+check("konteksti failiteest saadetakse ainult failinimi", meta_context.get("recent_files") == ["aitrack.py"] and "salajane-klient" not in json.dumps(meta_context))
+check("ka full režiim ei saada varasema vestluse teksti", hook_full["prompt_text"] == "salajane hook prompt" and "recent_messages" not in full_context)
+check("vigane lõpmatu kontekstiloendur ei katkesta hooki", A._hook_conversation_context('{"message_count":1e309}', "metadata").get("message_count", 0) == 0)
 
 # ============ TEST 47: brauseri login parool ja web session ============
 print("TEST 47: serveri brauseri login loob sessiooni ilma API tokenit avaldamata")
@@ -994,7 +1001,7 @@ epayload = {
     "started_at": HFL(9).isoformat(),
 }
 estart = A._db_work_start(edb, etok, epayload)
-A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool": "pi", "prompt": "palun tee test", "occurred_at_utc": HFL(9).isoformat()}, "prompt_started")
+A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool": "pi", "prompt": "palun tee test", "occurred_at_utc": HFL(9).isoformat(), "payload": {"conversation_context": {"message_count": 7, "context_tokens": 900, "recent_tools": ["read"]}}}, "prompt_started")
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-b", "tool": "pi", "prompt": "teise agendi prompt", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=1)).isoformat()}, "prompt_started")
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool_name": "read", "tool_call_id": "tc-1", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=3)).isoformat()}, "before_tool_call")
 activity_agent = A._db_activity_log(edb, etok, {"period": ["2026-06"], "agent_uid": ["agent-a"]})
@@ -1005,6 +1012,7 @@ check("prompt/start endpoint tekitab prompt_eventi ja seob sessiooniga", prompt_
 check("tool-start endpoint uuendab jooksva tooli välja", erow["current_tool_name"] == "read" and erow["current_tool_call_id"] == "tc-1" and erow["agent_uid"] == "agent-a")
 check("activity agent filter leiab raw eventid", len(activity_agent.get("raw_events", [])) >= 2 and all(x.get("agent_uid") == "agent-a" for x in activity_agent.get("raw_events", [])))
 check("activity agent filter piirab ka prompt-evente", activity_agent.get("prompt_events") and all(x.get("agent_uid") == "agent-a" for x in activity_agent.get("prompt_events", [])))
+check("activity prompt-event sisaldab struktureeritud vestluskonteksti", any(x.get("conversation_context", {}).get("message_count") == 7 and x.get("conversation_context", {}).get("recent_tools") == ["read"] for x in activity_agent.get("prompt_events", [])))
 check("activity koondvaade ei kuva prompt-starti raw ja prompt duplikaadina", len([x for x in activity_agent.get("activity", []) if x.get("event_type") == "prompt_started"]) == 1 and all(x.get("type") == "prompt_event" for x in activity_agent.get("activity", []) if x.get("event_type") == "prompt_started"))
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "tool_name": "read", "tool_call_id": "tc-1", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=4)).isoformat()}, "after_tool_call")
 A._db_ingest_event_endpoint(edb, etok, {"work_session_uid": estart["work_session_uid"], "agent_uid": "agent-a", "summary": "muudatused valmis", "occurred_at_utc": (HFL(9) + dt.timedelta(minutes=5)).isoformat()}, "agent_finished")
@@ -1190,13 +1198,22 @@ filtered_activity = A._db_activity_log(detdb, dettok, {"period": ["2026-06"], "w
 miss_activity = A._db_activity_log(detdb, dettok, {"period": ["2026-06"], "worksessionid": ["ws_missing"]})
 with A._db_connect(detdb) as conn:
     raw_id = conn.execute("SELECT id FROM raw_events WHERE event_key = 'detail-raw'").fetchone()["id"]
-raw_detail = A._db_event_detail(detdb, dettok, {"type": ["raw_event"], "id": [str(raw_id)]})
-session_detail = A._db_event_detail(detdb, dettok, {"type": ["work_session"], "work_session_uid": [detstart["work_session_uid"]]})
+raw_flat_detail = A._db_event_detail(detdb, dettok, {"type": ["raw_event"], "id": [str(raw_id)]})
+raw_detail = A._db_event_detail(detdb, dettok, {"type": ["raw_event"], "id": [str(raw_id)], "structured": ["1"]})
+session_detail = A._db_event_detail(detdb, dettok, {"type": ["work_session"], "work_session_uid": [detstart["work_session_uid"]], "structured": ["1"]})
 activity_html = A._activity_page_html()
-check("event-detail tagastab raw event payload_json välja", raw_detail["detail"]["event_key"] == "detail-raw" and "echo detail" in raw_detail["detail"]["payload_json"])
-check("event-detail tagastab work_session toorrea", session_detail["detail"]["session_uid"] == detstart["work_session_uid"])
+deep_payload = {"leaf": "ok"}
+for _ in range(20):
+    deep_payload = {"child": deep_payload}
+deep_detail = A._structured_event_detail("raw_event", {"id": 1, "payload_json": json.dumps(deep_payload)})
+oversized_detail = A._structured_event_detail("raw_event", {"id": 2, "payload_json": json.dumps({"text": "x" * (A.RAW_EVENT_PAYLOAD_MAX_BYTES + 1)})})
+check("event-detail eraldab DB-kirje parsitud payloadist", raw_detail["detail"]["record"]["event_key"] == "detail-raw" and raw_detail["detail"]["payload"]["payload"]["command"] == "echo detail")
+check("event-detail ei kuva struktureeritud payloadis topelt event_key välja", "payload_json" not in raw_detail["detail"]["record"] and "event_key" not in raw_detail["detail"]["payload"])
+check("event-detail säilitab vaikimisi vana flat API kuju", raw_flat_detail["detail"]["event_key"] == "detail-raw" and "payload_json" in raw_flat_detail["detail"] and raw_flat_detail["detail_format"] == "flat")
+check("event-detail piirab liiga sügava ja suure payloadi", "truncated-depth" in json.dumps(deep_detail) and oversized_detail.get("payload", {}).get("_truncated") is True)
+check("event-detail tagastab work_session kirje", session_detail["detail"]["record"]["session_uid"] == detstart["work_session_uid"])
 check("activity HTML sisaldab detail modalit ja nuppe", "detailModal" in activity_html and "showDetail" in activity_html and "Toorandmed" in activity_html)
-check("detail modal värvib JSON-i süntaksit", "syntaxHighlightJson" in activity_html and "json-key" in activity_html and "json-string" in activity_html)
+check("detail modal värvib JSON-i süntaksit ja küsib struktureeritud kuju", "syntaxHighlightJson" in activity_html and "json-key" in activity_html and "json-string" in activity_html and "params.set('structured', '1')" in activity_html)
 check("activity filtreerib worksessionid järgi", len(filtered_activity["sessions"]) == 1 and len(filtered_activity["raw_events"]) == 1 and not miss_activity["sessions"] and not miss_activity["raw_events"])
 check("activity HTML sisaldab worksessionid filtrit", "workSessionInput" in activity_html and "work_session_uid" in activity_html)
 
@@ -1205,6 +1222,7 @@ print("TEST 60B: Pi extension jätab valmis-kokkuvõtte kopeerimiseks alles")
 extension_text = A._pi_extension_text()
 check("Pi extension ei tee 260 märgi '...' lõiget", "s.length > 260" not in extension_text and "slice(0, 257)" not in extension_text)
 check("Pi extension lubab pikema summary serverisse", "summary.slice(0, 4000)" in extension_text)
+check("Pi extension lisab promptile sessioni konteksti", "buildSessionContext()" in extension_text and '"--context-json"' in extension_text and "recent_tools" in extension_text)
 
 # ============ TEST 61: aitrack add vajab päris terminali ==========
 print("TEST 61: aitrack add vajab päris terminali")

@@ -945,6 +945,7 @@ function syntaxHighlightJson(value) {
 async function showDetail(type, id, sessionUid) {
   const params = new URLSearchParams();
   params.set('type', type);
+  params.set('structured', '1');
   if (id) params.set('id', id);
   if (sessionUid) params.set('work_session_uid', sessionUid);
   $('detailTitle').textContent = 'Toorandmed: ' + type;
@@ -974,11 +975,21 @@ function promptEventLabel(x) {
   if (x.event_type === 'prompt_finished') return 'AI-prompt lõpetati';
   return 'Prompt salvestati';
 }
+function promptContextLine(x) {
+  const c = x.conversation_context || {};
+  const parts = [];
+  if (c.message_count) parts.push(`${esc(c.message_count)} sõnumit`);
+  if (c.context_tokens) parts.push(`${esc(c.context_tokens)} tokenit`);
+  if (Array.isArray(c.recent_tools) && c.recent_tools.length) parts.push(`tööriistad: ${esc(c.recent_tools.join(', '))}`);
+  if (Array.isArray(c.recent_files) && c.recent_files.length) parts.push(`failid: ${esc(c.recent_files.join(', '))}`);
+  return parts.length ? `<div class="small">Kontekst: ${parts.join(' · ')}</div>` : '';
+}
 function promptEventBody(x) {
   const label = promptEventLabel(x);
-  if (x.prompt_text) return `<pre>${esc(x.prompt_text)}</pre><div class="small">${esc(label)}</div>`;
+  const context = promptContextLine(x);
+  if (x.prompt_text) return `<pre>${esc(x.prompt_text)}</pre><div class="small">${esc(label)}</div>${context}`;
   const metadata = x.prompt_chars ? ` · ${esc(x.prompt_chars)} märki` : '';
-  return `${esc(label)}<div class="small">Teksti ei saadetud${metadata}</div>`;
+  return `${esc(label)}<div class="small">Teksti ei saadetud${metadata}</div>${context}`;
 }
 function renderActivity(rows) {
   $('activityBody').innerHTML = rows.length ? rows.map(x => {

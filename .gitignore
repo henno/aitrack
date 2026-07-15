@@ -9,3 +9,4 @@ state.json
 *.log
 aitrack-log.csv
 apps-script-ready.gs
+.pi-subagents/

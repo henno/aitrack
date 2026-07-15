@@ -206,7 +206,8 @@ kuupäevakalendris valida ühe päeva või vahemiku (1. klikk algus, 2. klikk l�
 sama `event_key` prompt-kirje ühe korra ja ühendab Pi sama tööetapi `agent_finished` + `prompt_finished`
 üheks visuaalseks lõpetamiseks; täielik auditijälg jääb eraldi Raw eventide tabelisse. Lifecycle-rida kasutab
 enda sündmuse kirjeldust, mitte sessioni hiljem muutunud lõppkokkuvõtet, ning lähestikku tekkinud sündmustel
-näidatakse eristamiseks millisekundeid. Staatused:
+näidatakse eristamiseks millisekundeid. Detailmodaal eraldab indekseeritava DB-kirje parsitud payloadist,
+et sama JSON ei oleks escaped stringina ja korduvate väljadena kaks korda näha. Staatused:
 `active` = hiljutise progressiga töö, `stale` = üle 10 minuti progressita töö, `stuck` = üle 10 minuti
 pooleliolev tool-call.
 
@@ -222,8 +223,10 @@ kaudu (`events: [...]`) või kasuta spets-endpointe `POST /api/prompt/start`, `/
 `/api/agent/heartbeat`, `/api/agent/tool-start`, `/api/agent/tool-end`. Tavapärane `aitrack run` teeb
 praktikapäeviku tunni sõnastuse lokaalselt kogu kättesaadava AI-vestluse põhjal ja saadab serverisse valmis
 kokkuvõtterea. Prompt-eventid lähevad kliendist serverisse vaikimisi ainult metadatana (aeg, projekt,
-tööriist, kestus ja tekstipikkus; mitte prompti tekst). Täisteksti saatmine on opt-in seadistusega
-`server_prompt_events: "full"`; `"off"` lülitab prompt-eventide batch-saatmise välja. Kui valmis tunnirida pole,
+tööriist, kestus ja tekstipikkus; mitte prompti tekst). Pi lisab privaatsussäästliku vestluskonteksti:
+sessioni/modeli tunnus, sõnumite ja tokenite arv ning hiljutiste tööriistade ja failide nimed (mitte absoluutsed
+failiteed). Vestluse varasemate sõnumite teksti serverisse ei saadeta. Ainult jooksva prompti täistekst on opt-in
+seadistusega `server_prompt_events: "full"`; `"off"` lülitab prompt-eventide batch-saatmise välja. Kui valmis tunnirida pole,
 eelistab serveri fallback sisulisi `prompt_events` ridu ning kasutab work-session/minute infot ainult viimase
 varuvariandina. Ekspordi raw evente
 `GET /api/export/raw-events?period=YYYY-MM` kaudu; payload'id piiratakse ning tüüpilised token/parool/saladuse
