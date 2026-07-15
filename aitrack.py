@@ -8428,6 +8428,8 @@ def main():
         p.add_argument("--tool-name", dest="tool_name", default="")
         p.add_argument("--tool-call-id", dest="tool_call_id", default="")
         p.add_argument("--tool-input", dest="tool_input", default="")
+        # Kliendiversioon 7 võis selle argumendi saata; v8 eirab seda tagasiühilduvalt.
+        p.add_argument("--context-json", dest="context_json", default="", help=argparse.SUPPRESS)
         p.add_argument("--owner-pid", dest="owner_pid")
         p.add_argument("--owner-start", dest="owner_start", default="")
         p.add_argument("--owner-command", dest="owner_command", default="")
