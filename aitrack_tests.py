@@ -1358,5 +1358,46 @@ check("monthly report sisaldab tehtud töö kokkuvõtteid", "explicit #701 valmi
 check("monthly report sisaldab sessiooni ja raw-event evidence'it", len(line.get("evidence", {}).get("work_session_uids", [])) == 2 and len(line.get("evidence", {}).get("raw_event_ids", [])) == 1)
 check("monthly report tavakasutaja näeb ainult enda ridu ja admin kõiki", report.get("count") == 1 and admin_report.get("count") == 2)
 
+# ============ TEST 64: päringukeha lugemine (Content-Length ja chunked) ============
+# Regressioon: proxy (Cloudflare tunnel) edastas keha chunked-kujul ilma Content-Length
+# päiseta, server luges tühja keha ja vastas "token puudub", kuigi token oli päringus.
+print("TEST 64: _read_json loeb nii Content-Length kui ka chunked keha")
+import io  # noqa: E402
+
+def read_json_with(headers, raw):
+    h = object.__new__(A._AitrackHandler)
+    h.headers = headers
+    h.rfile = io.BytesIO(raw)
+    return h._read_json()
+
+body = b'{"token": "abc", "date": "2026-07-17"}'
+check("Content-Length keha loetakse",
+      read_json_with({"Content-Length": str(len(body))}, body) == {"token": "abc", "date": "2026-07-17"})
+chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body)
+check("chunked keha loetakse",
+      read_json_with({"Transfer-Encoding": "chunked"}, chunked) == {"token": "abc", "date": "2026-07-17"})
+split = b"%x\r\n%s\r\n%x\r\n%s\r\n0\r\n\r\n" % (10, body[:10], len(body) - 10, body[10:])
+check("mitmes tükis chunked keha liidetakse kokku",
+      read_json_with({"Transfer-Encoding": "chunked"}, split) == {"token": "abc", "date": "2026-07-17"})
+ext = b"%x;ext=1\r\n%s\r\n0\r\nX-Trailer: v\r\n\r\n" % (len(body), body)
+check("chunk-laiendid ja trailerid ei sega lugemist",
+      read_json_with({"Transfer-Encoding": "chunked", "Content-Length": "0"}, ext) == {"token": "abc", "date": "2026-07-17"})
+check("Transfer-Encoding suurtähtedega tuvastatakse",
+      read_json_with({"Transfer-Encoding": "CHUNKED"}, chunked) == {"token": "abc", "date": "2026-07-17"})
+check("kehata päring annab tühja dicti", read_json_with({}, b"") == {})
+check("vigane chunk-suurus annab tühja dicti",
+      read_json_with({"Transfer-Encoding": "chunked"}, b"zz\r\n" + body) == {})
+check("katkine chunked-ühendus annab tühja dicti",
+      read_json_with({"Transfer-Encoding": "chunked"}, b"%x\r\n%s" % (len(body) + 50, body)) == {})
+check("liiga suur Content-Length annab tühja dicti",
+      read_json_with({"Content-Length": str(A.REQUEST_BODY_MAX_BYTES + 1)}, body) == {})
+big = b"%x\r\n%s\r\n0\r\n\r\n" % (A.REQUEST_BODY_MAX_BYTES + 1, b"x" * 10)
+check("liiga suur chunked keha annab tühja dicti",
+      read_json_with({"Transfer-Encoding": "chunked"}, big) == {})
+check("mitte-JSON keha annab tühja dicti",
+      read_json_with({"Content-Length": "4"}, b"nope") == {})
+check("JSON-massiiv (mitte objekt) annab tühja dicti",
+      read_json_with({"Content-Length": "2"}, b"[]") == {})
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

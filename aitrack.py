@@ -87,6 +87,9 @@ LOGIN_FAIL_WINDOW_SECONDS = 10 * 60
 LOGIN_FAIL_MAX = 5
 BAN_SECONDS = 30 * 60
 RAW_EVENT_PAYLOAD_MAX_BYTES = 16 * 1024
+# Päringukeha ülempiir. Vajalik eelkõige chunked-keha jaoks, kus tükkide arv ei ole ette teada.
+REQUEST_BODY_MAX_BYTES = 8 * 1024 * 1024
+REQUEST_CHUNK_LINE_MAX_BYTES = 1024
 RAW_EVENT_STRING_MAX_CHARS = 4000
 RAW_EVENT_SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "apikey", "authorization", "cookie"}
 RAW_EVENT_SAFE_METADATA_KEYS = {"context_tokens"}
@@ -6996,13 +6999,51 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def _read_chunked_body(self) -> bytes:
+        """Loe HTTP/1.1 chunked keha kokku üheks baidijadaks; vigase kodeeringu korral b""."""
+        parts: list[bytes] = []
+        total = 0
+        while True:
+            line = self.rfile.readline(REQUEST_CHUNK_LINE_MAX_BYTES)
+            if not line.strip():  # ootamatu lõpp või tühi rida enne suurust
+                return b""
+            try:  # tükisuurus on 16-ndsüsteemis; järel võivad olla laiendid (";" järel)
+                size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                return b""
+            if size == 0:  # viimane tükk; järgnevad võimalikud trailerid kuni tühja reani
+                while True:
+                    trailer = self.rfile.readline(REQUEST_CHUNK_LINE_MAX_BYTES)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        return b"".join(parts)
+            total += size
+            if total > REQUEST_BODY_MAX_BYTES:
+                return b""
+            part = self.rfile.read(size)
+            if len(part) != size:  # ühendus katkes keset tükki
+                return b""
+            parts.append(part)
+            self.rfile.read(2)  # tükile järgnev CRLF
+
+    def _read_body(self) -> bytes:
+        """Päringu keha. Proxy (nt Cloudflare tunnel) võib keha edastada chunked-kujul ilma
+        Content-Length päiseta — siis tuleb tükid ise kokku lugeda, muidu jääks keha lugemata."""
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return self._read_chunked_body()
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            return b""
+        if length <= 0 or length > REQUEST_BODY_MAX_BYTES:
+            return b""
+        return self.rfile.read(length)
+
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
+        raw = self._read_body() or b"{}"
         try:
             data = json.loads(raw.decode("utf-8"))
             return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
     def _cookie_value(self, name: str) -> str:
