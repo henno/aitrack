@@ -48,6 +48,7 @@ from aitrack_core.templates import (
     _admin_page_html,
     _login_page_html,
     _start_page_html,
+    _token_usage_page_html,
 )
 
 from aitrack_core.security import (
@@ -5074,6 +5075,64 @@ def _db_ingest_token_usage(path: Path, token: str, rows: list[dict]) -> dict:
     return {"ok": True, "stored": stored}
 
 
+def _db_token_usage_report(path: Path, token: str, q: dict | None = None) -> dict:
+    """Perioodi token-kulu koondrida (projekt × AI × mudel × thinking) + kogusummad.
+
+    Periood filtreerib kohaliku kuupäeva (date) järgi. Admin võib valida teise kasutaja."""
+    _db_init(path)
+    q = q or {}
+    tz = _query_tzinfo(q)
+    today = _now_utc().astimezone(tz).date()
+    from_s = _qval(q, "from") or _qval(q, "start")
+    to_s = _qval(q, "to") or _qval(q, "end")
+    date_from = from_s if _valid_date(from_s) else today.replace(day=1).isoformat()
+    date_to = to_s if _valid_date(to_s) else today.isoformat()
+    project_f = _qval(q, "project")
+    tool_f = _qval(q, "tool")
+    model_f = _qval(q, "model")
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        target = _db_target_user_for_query(conn, user, q)
+        where = ["user_id = ?", "date >= ?", "date <= ?"]
+        args: list = [int(target["id"]), date_from, date_to]
+        if project_f:
+            where.append("project LIKE ?")
+            args.append(f"%{project_f}%")
+        if tool_f:
+            where.append("tool LIKE ?")
+            args.append(f"%{tool_f}%")
+        if model_f:
+            where.append("model LIKE ?")
+            args.append(f"%{model_f}%")
+        rows = conn.execute(
+            "SELECT project, tool, model, thinking, "
+            " SUM(input_tokens) input, SUM(output_tokens) output, "
+            " SUM(cache_read_tokens) cache_read, SUM(cache_write_tokens) cache_write, "
+            " SUM(reasoning_tokens) reasoning, SUM(messages) messages "
+            "FROM token_usage WHERE " + " AND ".join(where) +
+            " GROUP BY project, tool, model, thinking",
+            args,
+        ).fetchall()
+    out_rows: list[dict] = []
+    totals = {k: 0 for k in ("input", "output", "cache_read", "cache_write", "reasoning", "messages", "total")}
+    for r in rows:
+        # Kokku = input+output+cache (reasoning EI liideta topelt: see on osa output'ist/eraldi loend).
+        total = int(r["input"]) + int(r["output"]) + int(r["cache_read"]) + int(r["cache_write"])
+        row = {
+            "project": r["project"] or "", "tool": r["tool"] or "", "model": r["model"] or "",
+            "thinking": int(r["thinking"] or 0),
+            "input": int(r["input"] or 0), "output": int(r["output"] or 0),
+            "cache_read": int(r["cache_read"] or 0), "cache_write": int(r["cache_write"] or 0),
+            "reasoning": int(r["reasoning"] or 0), "messages": int(r["messages"] or 0), "total": total,
+        }
+        out_rows.append(row)
+        for k in totals:
+            totals[k] += row[k]
+    out_rows.sort(key=lambda x: x["total"], reverse=True)
+    return {"ok": True, "period_from": date_from, "period_to": date_to,
+            "user": target["name"], "rows": out_rows, "totals": totals}
+
+
 def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict], q: dict | None = None) -> None:
     if not _valid_date(date):
         raise ValueError("vigane kuupäev")
@@ -7370,7 +7429,7 @@ class _AitrackHandler(BaseHTTPRequestHandler):
         if not self._allow_request():
             return
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html", "/activity", "/account", "/admin", "/login"):
+        if path in ("/", "/index.html", "/activity", "/tokens", "/account", "/admin", "/login"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -7404,6 +7463,15 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     self._redirect("/login?next=/activity")
                     return
                 self._html(_activity_page_html())
+                return
+            if u.path == "/tokens":
+                if not self._server_mode():
+                    self._redirect("/")
+                    return
+                if self._cookie_user() is None:
+                    self._redirect("/login?next=/tokens")
+                    return
+                self._html(_token_usage_page_html())
                 return
             if u.path == "/account":
                 if not self._server_mode():
@@ -7500,6 +7568,9 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/activity" and self._server_mode():
                 self._json(_db_activity_log(self._db_path(), self._token(q), q))
+                return
+            if u.path == "/api/token-usage" and self._server_mode():
+                self._json(_db_token_usage_report(self._db_path(), self._token(q), q))
                 return
             if u.path == "/api/event-detail" and self._server_mode():
                 self._json(_db_event_detail(self._db_path(), self._token(q), q))
