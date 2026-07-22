@@ -128,6 +128,25 @@ class TranscriptRecord:
     text: str          # vestluse tekstiosa
 
 
+@dataclass
+class TokenUsageRecord:
+    """Ühe assistendi-sõnumi PÄRIS token-kulu (mitte konteksti-akna täituvus).
+
+    Tokenite väärtus sõltub mudelist JA tüübist (output ≫ input ≫ cache_read),
+    seepärast hoiame tüübid lahus ja mudeli juures. reasoning = thinking-tokenid,
+    kui harness need eraldi loeb (Pi); Claude arvestab thinking'u output'i sisse."""
+    tool: str          # AI-tööriist (Claude / Pi / …)
+    project: str       # cwd, kust AI-d kasutati (alamagendid kaasa arvatud)
+    ts: dt.datetime    # UTC, timezone-aware
+    model: str         # nt claude-opus-4-8, gpt-5.6-sol:high
+    thinking: bool     # kas selles sõnumis oli thinking/reasoning
+    input: int
+    output: int
+    cache_read: int
+    cache_write: int
+    reasoning: int
+
+
 # --- failisüsteemi abifunktsioonid ------------------------------------------
 def _mkconfdir() -> None:
     """Loo CONFIG_DIR ja piira õigused 0o700 (token elab seal)."""
@@ -1641,6 +1660,107 @@ def collect_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
     return recs
 
 
+# --- token-kulu (mudelipõhine arvestus) -------------------------------------
+def _to_int(v) -> int:
+    try:
+        n = int(v)
+        return n if n >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _norm_usage(tool: str, usage: dict) -> dict:
+    """Normaliseeri harness-spetsiifiline usage-dict ühisele kujule.
+
+    Claude: input_tokens/output_tokens/cache_read_input_tokens/cache_creation_input_tokens
+            (thinking arvestatakse output'i sisse → reasoning=0).
+    Pi:     input/output/cacheRead/cacheWrite/reasoning (reasoning = thinking-tokenid eraldi)."""
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        "input": _to_int(usage.get("input_tokens") if "input_tokens" in usage else usage.get("input")),
+        "output": _to_int(usage.get("output_tokens") if "output_tokens" in usage else usage.get("output")),
+        "cache_read": _to_int(usage.get("cache_read_input_tokens") if "cache_read_input_tokens" in usage else usage.get("cacheRead")),
+        "cache_write": _to_int(usage.get("cache_creation_input_tokens") if "cache_creation_input_tokens" in usage else usage.get("cacheWrite")),
+        "reasoning": _to_int(usage.get("reasoning")),
+    }
+
+
+def _content_has_thinking(content) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(b, dict) and str(b.get("type", "")).lower() in {"thinking", "reasoning"} for b in content)
+
+
+def _usage_from_jsonl(jsonl: Path, tool: str, since: dt.datetime) -> list[TokenUsageRecord]:
+    """Loe ühe session-jsonl assistendi-sõnumite token-kulu. cwd võetakse session/message realt."""
+    out: list[TokenUsageRecord] = []
+    cwd = ""
+    try:
+        with jsonl.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"usage"' not in line and '"cwd"' not in line and '"session"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # cwd tuleb Claude'il igalt realt (d.cwd), Pi-l eraldi 'session'-realt → jäta meelde
+                cwd = d.get("cwd") or cwd
+                msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+                if str(msg.get("role") or d.get("type") or "").strip().lower() != "assistant":
+                    continue
+                usage = _norm_usage(tool, msg.get("usage") or {})
+                if not usage or not any(usage.values()):
+                    continue
+                ts = parse_iso(d.get("timestamp", "")) or parse_iso(str(msg.get("timestamp") or ""))
+                if ts is None or ts <= since:
+                    continue
+                model = str(msg.get("model") or "").strip()
+                thinking = _content_has_thinking(msg.get("content")) or usage["reasoning"] > 0
+                out.append(TokenUsageRecord(tool, cwd or "", ts, model, thinking, **usage))
+    except OSError:
+        pass
+    return out
+
+
+def claude_token_usage(since: dt.datetime) -> list[TokenUsageRecord]:
+    out: list[TokenUsageRecord] = []
+    if not CLAUDE_PROJECTS.is_dir():
+        return out
+    cutoff = since.timestamp()
+    for jsonl in CLAUDE_PROJECTS.glob("*/*.jsonl"):  # peaagent + alamagendid on sama kausta eri failides
+        try:
+            if jsonl.stat().st_mtime < cutoff - 3600:
+                continue
+        except OSError:
+            continue
+        out.extend(_usage_from_jsonl(jsonl, "Claude", since))
+    return out
+
+
+def pi_token_usage(since: dt.datetime) -> list[TokenUsageRecord]:
+    out: list[TokenUsageRecord] = []
+    if not PI_SESSIONS.is_dir():
+        return out
+    cutoff = since.timestamp()
+    for jsonl in PI_SESSIONS.rglob("*.jsonl"):  # rglob → alam-run'ide (subagent) failid kaasa
+        try:
+            if jsonl.stat().st_mtime < cutoff - 3600:
+                continue
+        except OSError:
+            continue
+        out.extend(_usage_from_jsonl(jsonl, "Pi", since))
+    return out
+
+
+def collect_token_usage(since: dt.datetime) -> list[TokenUsageRecord]:
+    """Kõigi harnesside PÄRIS token-kulu ühe akna kohta (alamagendid kaasa arvatud)."""
+    recs = claude_token_usage(since) + pi_token_usage(since)
+    recs.sort(key=lambda r: r.ts)
+    return recs
+
+
 # --- kokkuvõtja (mitme mootori automaattuvastus) ----------------------------
 SUMMARIZER_ENGINES = ["pi", "claude", "codex", "gemini"]  # eelistuse järjekord: kasuta esmalt sama harnessit
 
@@ -2283,6 +2403,29 @@ def _db_init(path: Path) -> None:
           UNIQUE(user_id, row_key)
         );
         CREATE INDEX IF NOT EXISTS hour_rows_user_date_idx ON hour_rows(user_id, date, hour);
+        CREATE TABLE IF NOT EXISTS token_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          hour TEXT NOT NULL,
+          hour_utc TEXT NOT NULL DEFAULT '',
+          hour_key TEXT NOT NULL DEFAULT '',
+          project TEXT NOT NULL DEFAULT '',
+          tool TEXT NOT NULL DEFAULT '',
+          model TEXT NOT NULL DEFAULT '',
+          thinking INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+          reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+          messages INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, hour_key, tool, model, thinking)
+        );
+        CREATE INDEX IF NOT EXISTS token_usage_user_date_idx ON token_usage(user_id, date, hour);
+        CREATE INDEX IF NOT EXISTS token_usage_user_model_idx ON token_usage(user_id, model);
         CREATE TABLE IF NOT EXISTS day_summaries (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -4890,6 +5033,47 @@ def _db_ingest_rows(path: Path, token: str, rows: list[list], keys: list[str]) -
             )
 
 
+def _db_ingest_token_usage(path: Path, token: str, rows: list[dict]) -> dict:
+    """Salvesta mudelipõhine token-kulu. Sama (tund × tööriist × mudel × thinking) → upsert
+    (kordus-run/backfill kirjutab värske koondsumma peale, idempotentne)."""
+    _db_init(path)
+    now = _now_utc().isoformat()
+    stored = 0
+    with _db_connect(path) as conn:
+        user = _db_user_by_token(conn, token)
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            hour_key = str(r.get("hour_key") or "").strip()
+            date = str(r.get("date") or "").strip()
+            hour = str(r.get("hour") or "").strip()
+            if not hour_key.startswith("k:") or not _valid_date(date) or not hour:
+                continue
+            def _u(k):  # noqa: E306
+                try:
+                    return max(0, int(r.get(k) or 0))
+                except (TypeError, ValueError):
+                    return 0
+            conn.execute(
+                "INSERT INTO token_usage "
+                "(user_id, date, hour, hour_utc, hour_key, project, tool, model, thinking, "
+                " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+                " messages, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, hour_key, tool, model, thinking) DO UPDATE SET "
+                " date=excluded.date, hour=excluded.hour, hour_utc=excluded.hour_utc, project=excluded.project, "
+                " input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, "
+                " cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens, "
+                " reasoning_tokens=excluded.reasoning_tokens, messages=excluded.messages, updated_at=excluded.updated_at",
+                (user["id"], date, hour, str(r.get("hour_utc") or ""), hour_key,
+                 str(r.get("project") or "")[:200], str(r.get("tool") or "")[:60], str(r.get("model") or "")[:120],
+                 1 if r.get("thinking") else 0, _u("input"), _u("output"), _u("cache_read"),
+                 _u("cache_write"), _u("reasoning"), _u("messages"), now, now),
+            )
+            stored += 1
+    return {"ok": True, "stored": stored}
+
+
 def _db_replace_day_rows(path: Path, token: str, date: str, items: list[dict], q: dict | None = None) -> None:
     if not _valid_date(date):
         raise ValueError("vigane kuupäev")
@@ -6014,6 +6198,59 @@ def _transcript_buckets(records: list[TranscriptRecord], allow: list[str], *, gr
     return buckets
 
 
+def _token_usage_rows(records: list[TokenUsageRecord], allow: list[str], *, group_by: str,
+                      start: dt.datetime, end: dt.datetime, tz) -> list[dict]:
+    """Koonda per-sõnumi token-kulu → üks rida (tund × projekt × tööriist × mudel × thinking).
+
+    hour_key seob rea vastava päeviku-tunnireaga (sama bucket_key). Väärtused on toorarvud;
+    rahalise väärtuse (mudelipõhine määr) arvutab aitrack-VÄLINE arvestus."""
+    agg: dict[tuple, dict] = {}
+    for u in records:
+        hstart = hour_floor(u.ts)
+        if not (start <= hstart < end):
+            continue
+        proj = match_project(u.project, allow)
+        if proj is None:
+            continue
+        pkey = None if group_by == "hour" else proj
+        gkey = (hstart, pkey, u.tool, u.model, bool(u.thinking))
+        acc = agg.get(gkey)
+        if acc is None:
+            acc = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                   "reasoning": 0, "messages": 0, "projects": set()}
+            agg[gkey] = acc
+        acc["input"] += u.input
+        acc["output"] += u.output
+        acc["cache_read"] += u.cache_read
+        acc["cache_write"] += u.cache_write
+        acc["reasoning"] += u.reasoning
+        acc["messages"] += 1
+        if u.project:
+            acc["projects"].add(Path(u.project).name)
+    out: list[dict] = []
+    for (hstart, pkey, tool, model, thinking), acc in agg.items():
+        local = hstart.astimezone(tz)
+        local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
+        out.append({
+            "date": local.strftime("%Y-%m-%d"),
+            "hour": f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}",
+            "hour_utc": hstart.astimezone(dt.timezone.utc).isoformat(),
+            "hour_key": bucket_key(hstart, pkey),
+            "project": ", ".join(sorted(acc["projects"])),
+            "tool": tool,
+            "model": model,
+            "thinking": 1 if thinking else 0,
+            "input": acc["input"],
+            "output": acc["output"],
+            "cache_read": acc["cache_read"],
+            "cache_write": acc["cache_write"],
+            "reasoning": acc["reasoning"],
+            "messages": acc["messages"],
+        })
+    out.sort(key=lambda r: (r["hour_utc"], r["tool"], r["model"], r["thinking"]))
+    return out
+
+
 def _summary_inputs_from_transcript(items: list[tuple[TranscriptRecord, str]], *, limit: int = 80) -> list[str]:
     labels = {"user": "Kasutaja", "assistant": "AI"}
     out: list[str] = []
@@ -6084,6 +6321,10 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
     records = collect_records(last_hour - dt.timedelta(seconds=1))
     transcript_records = collect_transcript_records(last_hour - dt.timedelta(seconds=1))
     log(f"run: kogutud {len(records)} prompti ja {len(transcript_records)} vestluse tekstiosa alates {last_hour.strftime('%Y-%m-%d %H:%M')} UTC")
+    # Token-kulu (mudelipõhine) kogutakse ainult serveri-sinki jaoks — see on ainus koht, kuhu
+    # seda saadetakse. Tokeni väärtus sõltub mudelist, seepärast hoiame mudeli+tüübi lahus.
+    token_usage_records = (collect_token_usage(last_hour - dt.timedelta(seconds=1))
+                           if cfg.get("sink", {}).get("type") == "server" else [])
 
     # group_by="hour" → kõik kaustad koonduvad ühte ämbrisse tunni kohta (üks rida/tund);
     # group_by="project" (vaikimisi) → eraldi ämber iga (tund × projekt) kohta.
@@ -6193,6 +6434,18 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
             return  # ära uuenda state'i, et read ei kaoks
     else:
         log("run: lõpetatud tundides polnud (uusi) jälgitavate projektide tegevust")
+
+    # Token-kulu saadetakse rea-loogikast sõltumatult: nii saab `aitrack backfill N` täita
+    # ka juba olemas tundide token-kulu tagasiulatuvalt (päevikuread jäetakse siis vahele).
+    if cfg.get("sink", {}).get("type") == "server" and token_usage_records:
+        usage_rows = _token_usage_rows(token_usage_records, allow, group_by=group_by,
+                                       start=last_hour, end=process_until, tz=tz)
+        if usage_rows:
+            body = _server_post("token-usage", {"usage": usage_rows}, cfg)
+            if body and body.get("ok"):
+                log(f"run: {len(usage_rows)} token-kulu rida saadetud → aitrack server")
+            elif body is not None:
+                log(f"run: token-kulu saatmine ebaõnnestus: {body.get('error') if isinstance(body, dict) else body}")
 
     # Backfill on käsitsi taastamine/test — see EI tohi watermarki muuta (väldib hüppeid/vahelejätmist)
     if backfill_hours is None:
@@ -6850,7 +7103,7 @@ def _html_table_for_day(date: str, full: bool = False) -> tuple[str, str]:
 
 def _client_version_endpoint(path: str) -> bool:
     return path in {
-        "/api/keys", "/api/ingest", "/api/events", "/api/day-summary", "/api/projects/allow", "/api/projects/unallow",
+        "/api/keys", "/api/ingest", "/api/token-usage", "/api/events", "/api/day-summary", "/api/projects/allow", "/api/projects/unallow",
         "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard",
         "/api/work/status", "/api/watchdog", "/api/cleanup",
         "/api/prompt/start", "/api/prompt/done", "/api/agent/heartbeat", "/api/agent/tool-start",
@@ -7363,6 +7616,10 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                 keys = data.get("keys") if isinstance(data.get("keys"), list) else []
                 _db_ingest_rows(self._db_path(), self._token(data=data), rows, [str(k) for k in keys])
                 self._json({"ok": True})
+                return
+            if u.path == "/api/token-usage" and self._server_mode():
+                usage = data.get("usage") if isinstance(data.get("usage"), list) else []
+                self._json(_db_ingest_token_usage(self._db_path(), self._token(data=data), usage))
                 return
             if u.path == "/api/projects/allow" and self._server_mode():
                 self._json(_db_allow_projects(self._db_path(), self._token(data=data), data))
