@@ -1399,8 +1399,8 @@ check("mitte-JSON keha annab tühja dicti",
 check("JSON-massiiv (mitte objekt) annab tühja dicti",
       read_json_with({"Content-Length": "2"}, b"[]") == {})
 
-# ============ TEST 64: mudelipõhine token-kulu (parse → aggregate → server) ============
-print("TEST 64: token-kulu — normaliseerimine, transkripti-parse, agregatsioon, serveri upsert")
+# ============ TEST 65: mudelipõhine token-kulu (parse → aggregate → server) ============
+print("TEST 65: token-kulu — normaliseerimine, transkripti-parse, agregatsioon, serveri upsert")
 
 # --- normaliseerimine: Claude ja Pi usage-kujud ühisele kujule ---
 claude_u = A._norm_usage("Claude", {"input_tokens": 10, "output_tokens": 200,
@@ -1415,7 +1415,7 @@ check("Pi usage normaliseerub (reasoning eraldi)",
 since = D(9)
 cl_file = CFG / "usage-claude.jsonl"
 cl_file.write_text(
-    json.dumps({"cwd": "/proj", "timestamp": "2026-06-16T10:30:00+00:00", "message": {
+    json.dumps({"cwd": "/proj", "effort": "xhigh", "timestamp": "2026-06-16T10:30:00+00:00", "message": {
         "role": "assistant", "model": "claude-opus-4-8",
         "usage": {"input_tokens": 10, "output_tokens": 200, "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 300},
         "content": [{"type": "thinking", "text": "..."}, {"type": "text", "text": "hi"}]}}) + "\n" +
@@ -1424,34 +1424,49 @@ cl_file.write_text(
     encoding="utf-8")
 cl = A._usage_from_jsonl(cl_file, "Claude", since)
 check("Claude transkriptist loetakse ainult 'since' järel", len(cl) == 1)
-check("Claude thinking-blokk → thinking=True", cl and cl[0].thinking is True and cl[0].model == "claude-opus-4-8")
+check("Claude .effort → thinking_level", cl and cl[0].thinking_level == "xhigh" and cl[0].thinking is True)
 check("Claude tokenid loetud", cl and cl[0].output == 200 and cl[0].cache_read == 5000)
 
 pi_file = CFG / "usage-pi.jsonl"
-pi_file.write_text(
+pi_file.write_text(  # päris Pi-formaat: cwd 'session'-real, tase eraldi 'thinking_level_change'-real
     json.dumps({"type": "session", "cwd": "/proj"}) + "\n" +
+    json.dumps({"type": "thinking_level_change", "timestamp": "2026-06-16T10:10:00+00:00", "thinkingLevel": "high"}) + "\n" +
     json.dumps({"type": "message", "timestamp": "2026-06-16T10:15:00+00:00", "message": {
         "role": "assistant", "model": "gpt-5.6-sol",
         "usage": {"input": 14000, "output": 600, "cacheRead": 0, "cacheWrite": 0, "reasoning": 60}}}) + "\n",
     encoding="utf-8")
 pi = A._usage_from_jsonl(pi_file, "Pi", since)
 check("Pi session-realt cwd päritud", pi and pi[0].project == "/proj")
-check("Pi reasoning>0 → thinking=True", pi and pi[0].thinking is True and pi[0].reasoning == 60)
+check("Pi eraldi thinking_level_change → tase kehtib edaspidi", pi and pi[0].thinking_level == "high" and pi[0].reasoning == 60)
 
-# --- agregatsioon: sama (tund × mudel × thinking) liidetakse, erinev eraldub ---
+# thinking ilma tasemeta → level 'on'; ilma thinking'uta → level ''
+nolevel = CFG / "usage-nolevel.jsonl"
+nolevel.write_text(
+    json.dumps({"cwd": "/proj", "timestamp": "2026-06-16T10:20:00+00:00", "message": {
+        "role": "assistant", "model": "m",
+        "usage": {"input_tokens": 5, "output_tokens": 5, "reasoning": 7}}}) + "\n" +
+    json.dumps({"cwd": "/proj", "timestamp": "2026-06-16T10:21:00+00:00", "message": {
+        "role": "assistant", "model": "m", "usage": {"input_tokens": 5, "output_tokens": 5}}}) + "\n",
+    encoding="utf-8")
+nl = A._usage_from_jsonl(nolevel, "Pi", since)
+check("thinking ilma tasemeta → level 'on'", nl[0].thinking_level == "on")
+check("ilma thinking'uta → level ''", nl[1].thinking_level == "" and nl[1].thinking is False)
+
+# --- agregatsioon: sama (tund × mudel × tase) liidetakse, erinev tase eraldub ---
 UTC = dt.timezone.utc
-def UR(model, think, out_tok, tool="Claude"):  # noqa: E306
-    return A.TokenUsageRecord(tool, "/proj", D(10), model, think, 10, out_tok, 5000, 300, 0)
-recs = [UR("claude-opus-4-8", True, 200), UR("claude-opus-4-8", True, 100),
-        UR("claude-sonnet-5", True, 50), UR("claude-opus-4-8", False, 40)]
+def UR(model, level, out_tok, tool="Claude"):  # noqa: E306
+    return A.TokenUsageRecord(tool, "/proj", D(10), model, bool(level), level, 10, out_tok, 5000, 300, 0)
+recs = [UR("claude-opus-4-8", "xhigh", 200), UR("claude-opus-4-8", "xhigh", 100),
+        UR("claude-opus-4-8", "high", 50), UR("claude-sonnet-5", "xhigh", 40)]
 urows = A._token_usage_rows(recs, ["/proj"], group_by="project",
                             start=A.hour_floor(D(9)), end=A.hour_floor(D(12)), tz=UTC)
-check("agregatsioon annab 3 rida (mudel×thinking)", len(urows) == 3)
-opus_think = [r for r in urows if r["model"] == "claude-opus-4-8" and r["thinking"] == 1]
-check("sama mudel+thinking liidetakse", len(opus_think) == 1 and opus_think[0]["output"] == 300 and opus_think[0]["messages"] == 2)
+check("agregatsioon eristab tasemed sama mudeli sees (opus xhigh + opus high = 2 rida)", len(urows) == 3)
+opus_xhigh = [r for r in urows if r["model"] == "claude-opus-4-8" and r["thinking_level"] == "xhigh"]
+check("sama mudel+tase liidetakse", len(opus_xhigh) == 1 and opus_xhigh[0]["output"] == 300 and opus_xhigh[0]["messages"] == 2)
+check("tase kandub ritta", {r["thinking_level"] for r in urows} == {"xhigh", "high"})
 check("kõik read sama tunni hour_key all", len({r["hour_key"] for r in urows}) == 1 and urows[0]["hour_key"].startswith("k:"))
 check("jälgimata projekt jäetakse välja",
-      A._token_usage_rows([A.TokenUsageRecord("Claude", "/muu", D(10), "m", False, 1, 1, 0, 0, 0)],
+      A._token_usage_rows([A.TokenUsageRecord("Claude", "/muu", D(10), "m", False, "", 1, 1, 0, 0, 0)],
                           ["/proj"], group_by="project", start=A.hour_floor(D(9)), end=A.hour_floor(D(12)), tz=UTC) == [])
 
 # --- serveri salvestus: upsert + dedup ---
@@ -1463,12 +1478,12 @@ check("serverisse salvestatud 3 rida", res["ok"] and res["stored"] == 3)
 with A._db_connect(tudb) as conn:
     n = conn.execute("SELECT COUNT(*) FROM token_usage WHERE user_id=?", (1,)).fetchone()[0]
     check("token_usage tabelis 3 rida", n == 3)
-# kordus-ingest sama hour_key+mudel+thinking → upsert (mitte duplikaat), värske väärtus peale
-bumped = [dict(r, output=99999) for r in urows if r["model"] == "claude-opus-4-8" and r["thinking"] == 1]
+# kordus-ingest sama hour_key+mudel+tase → upsert (mitte duplikaat), värske väärtus peale
+bumped = [dict(r, output=99999) for r in urows if r["model"] == "claude-opus-4-8" and r["thinking_level"] == "xhigh"]
 A._db_ingest_token_usage(tudb, tutok, bumped)
 with A._db_connect(tudb) as conn:
     n2 = conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0]
-    val = conn.execute("SELECT output_tokens FROM token_usage WHERE model='claude-opus-4-8' AND thinking=1").fetchone()[0]
+    val = conn.execute("SELECT output_tokens FROM token_usage WHERE model='claude-opus-4-8' AND thinking_level='xhigh'").fetchone()[0]
     check("kordus-ingest ei tekita duplikaati", n2 == 3)
     check("kordus-ingest kirjutab värske summa peale", val == 99999)
 check("vigane rida (ilma hour_key'ta) jäetakse vahele",
@@ -1479,7 +1494,8 @@ rep = A._db_token_usage_report(tudb, tutok, {"from": "2026-06-01", "to": "2026-0
 check("report annab 3 rida perioodis", rep["ok"] and len(rep["rows"]) == 3)
 check("report read järjestatud kokku-summa järgi kahanevalt",
       rep["rows"][0]["total"] >= rep["rows"][-1]["total"])
-opus_row = [r for r in rep["rows"] if r["model"] == "claude-opus-4-8" and r["thinking"] == 1][0]
+opus_row = [r for r in rep["rows"] if r["model"] == "claude-opus-4-8" and r["thinking_level"] == "xhigh"][0]
+check("report tagastab thinking_level", opus_row["thinking_level"] == "xhigh")
 check("report Kokku = input+output+cache (reasoning ei liideta topelt)",
       opus_row["total"] == opus_row["input"] + opus_row["output"] + opus_row["cache_read"] + opus_row["cache_write"])
 check("report kogusummad liidetud", rep["totals"]["total"] == sum(r["total"] for r in rep["rows"]))
@@ -1487,6 +1503,25 @@ check("report mudelifilter kitsendab",
       len(A._db_token_usage_report(tudb, tutok, {"from": "2026-06-01", "to": "2026-06-30", "model": "sonnet"})["rows"]) == 1)
 check("report periood väljaspool andmeid → tühi",
       A._db_token_usage_report(tudb, tutok, {"from": "2026-01-01", "to": "2026-01-31"})["rows"] == [])
+
+# --- migratsioon: vana token_usage skeem (thinking, ilma thinking_level) → uus ---
+migdb = CFG / "server-token-usage-migrate.db"
+migdb.unlink(missing_ok=True)
+A._db_init(migdb)  # loob uue skeemi
+with A._db_connect(migdb) as conn:
+    conn.execute("DROP TABLE token_usage")  # jäljenda vana klienti: loo VANA skeem ilma thinking_level'ita
+    conn.execute("CREATE TABLE token_usage (id INTEGER PRIMARY KEY, user_id INTEGER, date TEXT, hour TEXT, "
+                 "hour_key TEXT, tool TEXT, model TEXT, thinking INTEGER, created_at TEXT, updated_at TEXT, "
+                 "UNIQUE(user_id, hour_key, tool, model, thinking))")
+    conn.execute("INSERT INTO token_usage (user_id, date, hour, hour_key, tool, model, thinking, created_at, updated_at) "
+                 "VALUES (1,'2026-06-16','10:00–11:00','k:x','Pi','m',1,'t','t')")
+check("vana skeemis pole thinking_level veergu", "thinking_level" not in A._db_columns(A._db_connect(migdb).__enter__(), "token_usage"))
+A._db_init(migdb)  # peaks vana tabeli maha viskama ja uue looma
+with A._db_connect(migdb) as conn:
+    cols = A._db_columns(conn, "token_usage")
+    check("migratsioon lisas thinking_level veeru", "thinking_level" in cols)
+    check("migratsioon viskas vana andmestiku maha (taastatav backfilliga)",
+          conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0] == 0)
 
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)

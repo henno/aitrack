@@ -141,6 +141,7 @@ class TokenUsageRecord:
     ts: dt.datetime    # UTC, timezone-aware
     model: str         # nt claude-opus-4-8, gpt-5.6-sol:high
     thinking: bool     # kas selles sõnumis oli thinking/reasoning
+    thinking_level: str  # tase: '', low, medium, high, xhigh, max, minimal, 'on' (tase logimata)
     input: int
     output: int
     cache_read: int
@@ -1694,13 +1695,15 @@ def _content_has_thinking(content) -> bool:
 
 
 def _usage_from_jsonl(jsonl: Path, tool: str, since: dt.datetime) -> list[TokenUsageRecord]:
-    """Loe ühe session-jsonl assistendi-sõnumite token-kulu. cwd võetakse session/message realt."""
+    """Loe ühe session-jsonl assistendi-sõnumite token-kulu. cwd ja thinking-tase võetakse
+    eraldi ridadelt (Pi: 'session' → cwd, 'thinking_level_change' → tase) ja jäetakse meelde."""
     out: list[TokenUsageRecord] = []
     cwd = ""
+    level_state = ""  # Pi: kehtiv thinking-tase, mille määrab viimane 'thinking_level_change'
     try:
         with jsonl.open(encoding="utf-8", errors="replace") as f:
             for line in f:
-                if '"usage"' not in line and '"cwd"' not in line and '"session"' not in line:
+                if not any(k in line for k in ('"usage"', '"cwd"', '"session"', '"thinkingLevel"')):
                     continue
                 try:
                     d = json.loads(line)
@@ -1708,6 +1711,10 @@ def _usage_from_jsonl(jsonl: Path, tool: str, since: dt.datetime) -> list[TokenU
                     continue
                 # cwd tuleb Claude'il igalt realt (d.cwd), Pi-l eraldi 'session'-realt → jäta meelde
                 cwd = d.get("cwd") or cwd
+                # Pi seab thinking-taseme eraldi 'thinking_level_change' sündmusega → kehtib edaspidi
+                lvl = str(d.get("thinkingLevel") or "").strip().lower()
+                if lvl:
+                    level_state = lvl
                 msg = d.get("message") if isinstance(d.get("message"), dict) else {}
                 if str(msg.get("role") or d.get("type") or "").strip().lower() != "assistant":
                     continue
@@ -1718,8 +1725,14 @@ def _usage_from_jsonl(jsonl: Path, tool: str, since: dt.datetime) -> list[TokenU
                 if ts is None or ts <= since:
                     continue
                 model = str(msg.get("model") or "").strip()
-                thinking = _content_has_thinking(msg.get("content")) or usage["reasoning"] > 0
-                out.append(TokenUsageRecord(tool, cwd or "", ts, model, thinking, **usage))
+                # Tase: Claude → d.effort (sõnumi juures); Pi → viimane thinking_level_change.
+                level = str(d.get("effort") or msg.get("effort") or level_state or "").strip().lower()
+                thinking = bool(level) or _content_has_thinking(msg.get("content")) or usage["reasoning"] > 0
+                if thinking and (not level or level in {"none", "off"}):
+                    level = "on"  # mõtlemine toimus, aga taset ei logitud
+                if not thinking:
+                    level = ""
+                out.append(TokenUsageRecord(tool, cwd or "", ts, model, thinking, level, **usage))
     except OSError:
         pass
     return out
@@ -2189,6 +2202,11 @@ def _rate_limit_profile(path: str) -> tuple[str, int, bool] | None:
 
 def _db_init(path: Path) -> None:
     with _db_connect(path) as conn:
+        # Migratsioon: token_usage sai thinking (0/1) asemel thinking_level (tekst-tase) dedup-võtmesse.
+        # Andmed on `aitrack backfill`-iga taastatavad, seepärast vana skeem lihtsalt maha ja loo uuesti.
+        tu_cols = _db_columns(conn, "token_usage")
+        if tu_cols and "thinking_level" not in tu_cols:
+            conn.execute("DROP TABLE token_usage")
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2415,6 +2433,7 @@ def _db_init(path: Path) -> None:
           tool TEXT NOT NULL DEFAULT '',
           model TEXT NOT NULL DEFAULT '',
           thinking INTEGER NOT NULL DEFAULT 0,
+          thinking_level TEXT NOT NULL DEFAULT '',
           input_tokens INTEGER NOT NULL DEFAULT 0,
           output_tokens INTEGER NOT NULL DEFAULT 0,
           cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -2423,7 +2442,7 @@ def _db_init(path: Path) -> None:
           messages INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
-          UNIQUE(user_id, hour_key, tool, model, thinking)
+          UNIQUE(user_id, hour_key, tool, model, thinking_level)
         );
         CREATE INDEX IF NOT EXISTS token_usage_user_date_idx ON token_usage(user_id, date, hour);
         CREATE INDEX IF NOT EXISTS token_usage_user_model_idx ON token_usage(user_id, model);
@@ -5055,20 +5074,21 @@ def _db_ingest_token_usage(path: Path, token: str, rows: list[dict]) -> dict:
                     return max(0, int(r.get(k) or 0))
                 except (TypeError, ValueError):
                     return 0
+            level = str(r.get("thinking_level") or "").strip().lower()[:16]
             conn.execute(
                 "INSERT INTO token_usage "
-                "(user_id, date, hour, hour_utc, hour_key, project, tool, model, thinking, "
+                "(user_id, date, hour, hour_utc, hour_key, project, tool, model, thinking, thinking_level, "
                 " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, "
                 " messages, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(user_id, hour_key, tool, model, thinking) DO UPDATE SET "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, hour_key, tool, model, thinking_level) DO UPDATE SET "
                 " date=excluded.date, hour=excluded.hour, hour_utc=excluded.hour_utc, project=excluded.project, "
-                " input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, "
+                " thinking=excluded.thinking, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, "
                 " cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens, "
                 " reasoning_tokens=excluded.reasoning_tokens, messages=excluded.messages, updated_at=excluded.updated_at",
                 (user["id"], date, hour, str(r.get("hour_utc") or ""), hour_key,
                  str(r.get("project") or "")[:200], str(r.get("tool") or "")[:60], str(r.get("model") or "")[:120],
-                 1 if r.get("thinking") else 0, _u("input"), _u("output"), _u("cache_read"),
+                 1 if (r.get("thinking") or level) else 0, level, _u("input"), _u("output"), _u("cache_read"),
                  _u("cache_write"), _u("reasoning"), _u("messages"), now, now),
             )
             stored += 1
@@ -5105,12 +5125,12 @@ def _db_token_usage_report(path: Path, token: str, q: dict | None = None) -> dic
             where.append("model LIKE ?")
             args.append(f"%{model_f}%")
         rows = conn.execute(
-            "SELECT project, tool, model, thinking, "
+            "SELECT project, tool, model, thinking, thinking_level, "
             " SUM(input_tokens) input, SUM(output_tokens) output, "
             " SUM(cache_read_tokens) cache_read, SUM(cache_write_tokens) cache_write, "
             " SUM(reasoning_tokens) reasoning, SUM(messages) messages "
             "FROM token_usage WHERE " + " AND ".join(where) +
-            " GROUP BY project, tool, model, thinking",
+            " GROUP BY project, tool, model, thinking_level",
             args,
         ).fetchall()
     out_rows: list[dict] = []
@@ -5120,7 +5140,7 @@ def _db_token_usage_report(path: Path, token: str, q: dict | None = None) -> dic
         total = int(r["input"]) + int(r["output"]) + int(r["cache_read"]) + int(r["cache_write"])
         row = {
             "project": r["project"] or "", "tool": r["tool"] or "", "model": r["model"] or "",
-            "thinking": int(r["thinking"] or 0),
+            "thinking": int(r["thinking"] or 0), "thinking_level": r["thinking_level"] or "",
             "input": int(r["input"] or 0), "output": int(r["output"] or 0),
             "cache_read": int(r["cache_read"] or 0), "cache_write": int(r["cache_write"] or 0),
             "reasoning": int(r["reasoning"] or 0), "messages": int(r["messages"] or 0), "total": total,
@@ -6272,7 +6292,7 @@ def _token_usage_rows(records: list[TokenUsageRecord], allow: list[str], *, grou
         if proj is None:
             continue
         pkey = None if group_by == "hour" else proj
-        gkey = (hstart, pkey, u.tool, u.model, bool(u.thinking))
+        gkey = (hstart, pkey, u.tool, u.model, u.thinking_level)
         acc = agg.get(gkey)
         if acc is None:
             acc = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
@@ -6287,7 +6307,7 @@ def _token_usage_rows(records: list[TokenUsageRecord], allow: list[str], *, grou
         if u.project:
             acc["projects"].add(Path(u.project).name)
     out: list[dict] = []
-    for (hstart, pkey, tool, model, thinking), acc in agg.items():
+    for (hstart, pkey, tool, model, level), acc in agg.items():
         local = hstart.astimezone(tz)
         local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
         out.append({
@@ -6298,7 +6318,8 @@ def _token_usage_rows(records: list[TokenUsageRecord], allow: list[str], *, grou
             "project": ", ".join(sorted(acc["projects"])),
             "tool": tool,
             "model": model,
-            "thinking": 1 if thinking else 0,
+            "thinking": 1 if level else 0,
+            "thinking_level": level,
             "input": acc["input"],
             "output": acc["output"],
             "cache_read": acc["cache_read"],
@@ -6306,7 +6327,7 @@ def _token_usage_rows(records: list[TokenUsageRecord], allow: list[str], *, grou
             "reasoning": acc["reasoning"],
             "messages": acc["messages"],
         })
-    out.sort(key=lambda r: (r["hour_utc"], r["tool"], r["model"], r["thinking"]))
+    out.sort(key=lambda r: (r["hour_utc"], r["tool"], r["model"], r["thinking_level"]))
     return out
 
 

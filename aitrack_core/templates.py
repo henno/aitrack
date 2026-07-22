@@ -1180,7 +1180,7 @@ tfoot td { border-top:2px solid var(--line); font-weight:700; }
           <th data-sort="project">Projekt</th>
           <th data-sort="tool">AI</th>
           <th data-sort="model">Mudel</th>
-          <th data-sort="thinking">Thinking</th>
+          <th data-sort="thinking_level">Thinking</th>
           <th class="num" data-sort="input">Input</th>
           <th class="num" data-sort="output">Output</th>
           <th class="num" data-sort="cache_read">Cache-in</th>
@@ -1233,7 +1233,7 @@ function render() {
     <td>${esc(r.project || '—')}</td>
     <td>${esc(r.tool || '—')}</td>
     <td>${esc(r.model || '—')}</td>
-    <td>${r.thinking ? '<span class="pill think">thinking</span>' : '<span class="pill">—</span>'}</td>
+    <td>${r.thinking_level ? '<span class="pill think">' + esc(r.thinking_level) + '</span>' : '<span class="pill">—</span>'}</td>
     <td class="num">${fmt(r.input)}</td>
     <td class="num">${fmt(r.output)}</td>
     <td class="num">${fmt(r.cache_read)}</td>
@@ -1274,7 +1274,7 @@ async function load() {
 }
 document.querySelectorAll('th[data-sort]').forEach(th => th.addEventListener('click', () => {
   const k = th.dataset.sort;
-  SORT = {key: k, dir: SORT.key === k ? -SORT.dir : (['project','tool','model'].includes(k) ? 1 : -1)};
+  SORT = {key: k, dir: SORT.key === k ? -SORT.dir : (['project','tool','model','thinking_level'].includes(k) ? 1 : -1)};
   render();
 }));
 async function init() {
