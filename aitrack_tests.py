@@ -1399,5 +1399,80 @@ check("mitte-JSON keha annab tühja dicti",
 check("JSON-massiiv (mitte objekt) annab tühja dicti",
       read_json_with({"Content-Length": "2"}, b"[]") == {})
 
+# ============ TEST 64: mudelipõhine token-kulu (parse → aggregate → server) ============
+print("TEST 64: token-kulu — normaliseerimine, transkripti-parse, agregatsioon, serveri upsert")
+
+# --- normaliseerimine: Claude ja Pi usage-kujud ühisele kujule ---
+claude_u = A._norm_usage("Claude", {"input_tokens": 10, "output_tokens": 200,
+                                     "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 300})
+check("Claude usage normaliseerub",
+      claude_u == {"input": 10, "output": 200, "cache_read": 5000, "cache_write": 300, "reasoning": 0})
+pi_u = A._norm_usage("Pi", {"input": 14000, "output": 600, "cacheRead": 0, "cacheWrite": 0, "reasoning": 60})
+check("Pi usage normaliseerub (reasoning eraldi)",
+      pi_u == {"input": 14000, "output": 600, "cache_read": 0, "cache_write": 0, "reasoning": 60})
+
+# --- transkripti-parse: kirjuta ajutine session-jsonl ja loe kulu ---
+since = D(9)
+cl_file = CFG / "usage-claude.jsonl"
+cl_file.write_text(
+    json.dumps({"cwd": "/proj", "timestamp": "2026-06-16T10:30:00+00:00", "message": {
+        "role": "assistant", "model": "claude-opus-4-8",
+        "usage": {"input_tokens": 10, "output_tokens": 200, "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 300},
+        "content": [{"type": "thinking", "text": "..."}, {"type": "text", "text": "hi"}]}}) + "\n" +
+    json.dumps({"cwd": "/proj", "timestamp": "2026-06-16T08:00:00+00:00", "message": {  # enne 'since' → välja
+        "role": "assistant", "model": "claude-opus-4-8", "usage": {"input_tokens": 99, "output_tokens": 99}}}) + "\n",
+    encoding="utf-8")
+cl = A._usage_from_jsonl(cl_file, "Claude", since)
+check("Claude transkriptist loetakse ainult 'since' järel", len(cl) == 1)
+check("Claude thinking-blokk → thinking=True", cl and cl[0].thinking is True and cl[0].model == "claude-opus-4-8")
+check("Claude tokenid loetud", cl and cl[0].output == 200 and cl[0].cache_read == 5000)
+
+pi_file = CFG / "usage-pi.jsonl"
+pi_file.write_text(
+    json.dumps({"type": "session", "cwd": "/proj"}) + "\n" +
+    json.dumps({"type": "message", "timestamp": "2026-06-16T10:15:00+00:00", "message": {
+        "role": "assistant", "model": "gpt-5.6-sol",
+        "usage": {"input": 14000, "output": 600, "cacheRead": 0, "cacheWrite": 0, "reasoning": 60}}}) + "\n",
+    encoding="utf-8")
+pi = A._usage_from_jsonl(pi_file, "Pi", since)
+check("Pi session-realt cwd päritud", pi and pi[0].project == "/proj")
+check("Pi reasoning>0 → thinking=True", pi and pi[0].thinking is True and pi[0].reasoning == 60)
+
+# --- agregatsioon: sama (tund × mudel × thinking) liidetakse, erinev eraldub ---
+UTC = dt.timezone.utc
+def UR(model, think, out_tok, tool="Claude"):  # noqa: E306
+    return A.TokenUsageRecord(tool, "/proj", D(10), model, think, 10, out_tok, 5000, 300, 0)
+recs = [UR("claude-opus-4-8", True, 200), UR("claude-opus-4-8", True, 100),
+        UR("claude-sonnet-5", True, 50), UR("claude-opus-4-8", False, 40)]
+urows = A._token_usage_rows(recs, ["/proj"], group_by="project",
+                            start=A.hour_floor(D(9)), end=A.hour_floor(D(12)), tz=UTC)
+check("agregatsioon annab 3 rida (mudel×thinking)", len(urows) == 3)
+opus_think = [r for r in urows if r["model"] == "claude-opus-4-8" and r["thinking"] == 1]
+check("sama mudel+thinking liidetakse", len(opus_think) == 1 and opus_think[0]["output"] == 300 and opus_think[0]["messages"] == 2)
+check("kõik read sama tunni hour_key all", len({r["hour_key"] for r in urows}) == 1 and urows[0]["hour_key"].startswith("k:"))
+check("jälgimata projekt jäetakse välja",
+      A._token_usage_rows([A.TokenUsageRecord("Claude", "/muu", D(10), "m", False, 1, 1, 0, 0, 0)],
+                          ["/proj"], group_by="project", start=A.hour_floor(D(9)), end=A.hour_floor(D(12)), tz=UTC) == [])
+
+# --- serveri salvestus: upsert + dedup ---
+tudb = CFG / "server-token-usage-test.db"
+tudb.unlink(missing_ok=True)
+tutok = A._db_add_user(tudb, "tokenuser")
+res = A._db_ingest_token_usage(tudb, tutok, urows)
+check("serverisse salvestatud 3 rida", res["ok"] and res["stored"] == 3)
+with A._db_connect(tudb) as conn:
+    n = conn.execute("SELECT COUNT(*) FROM token_usage WHERE user_id=?", (1,)).fetchone()[0]
+    check("token_usage tabelis 3 rida", n == 3)
+# kordus-ingest sama hour_key+mudel+thinking → upsert (mitte duplikaat), värske väärtus peale
+bumped = [dict(r, output=99999) for r in urows if r["model"] == "claude-opus-4-8" and r["thinking"] == 1]
+A._db_ingest_token_usage(tudb, tutok, bumped)
+with A._db_connect(tudb) as conn:
+    n2 = conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0]
+    val = conn.execute("SELECT output_tokens FROM token_usage WHERE model='claude-opus-4-8' AND thinking=1").fetchone()[0]
+    check("kordus-ingest ei tekita duplikaati", n2 == 3)
+    check("kordus-ingest kirjutab värske summa peale", val == 99999)
+check("vigane rida (ilma hour_key'ta) jäetakse vahele",
+      A._db_ingest_token_usage(tudb, tutok, [{"date": "2026-06-16", "hour": "10:00–11:00", "model": "x"}])["stored"] == 0)
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
