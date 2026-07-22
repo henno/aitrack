@@ -7162,7 +7162,7 @@ def _html_table_for_day(date: str, full: bool = False) -> tuple[str, str]:
 
 def _client_version_endpoint(path: str) -> bool:
     return path in {
-        "/api/keys", "/api/ingest", "/api/token-usage", "/api/events", "/api/day-summary", "/api/projects/allow", "/api/projects/unallow",
+        "/api/keys", "/api/ingest", "/api/events", "/api/day-summary", "/api/projects/allow", "/api/projects/unallow",
         "/api/work/start", "/api/work/tick", "/api/work/done", "/api/work/discard",
         "/api/work/status", "/api/watchdog", "/api/cleanup",
         "/api/prompt/start", "/api/prompt/done", "/api/agent/heartbeat", "/api/agent/tool-start",
