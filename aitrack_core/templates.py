@@ -65,7 +65,7 @@ th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
 <body>
 <header>
   <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
-  <div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button>__USER_BUTTON__<button onclick="location.href='/activity'">Server tegevused</button>__SERVER_ACTIONS__</div>
+  <div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button>__USER_BUTTON__<button onclick="location.href='/activity'">Server tegevused</button><button onclick="window.open('/tokens','_blank')" title="Mudelipõhine token-kulu eraldi aknas">Token-kulu</button>__SERVER_ACTIONS__</div>
 </header>
 <main>
   <section class="panel toolbar">
@@ -1097,6 +1097,199 @@ async function init() {
   loadActivity();
 }
 init().catch(e => { renderWaiting(e.message || 'login puudub'); setStatus(e.message || 'login puudub', true); });
+</script>
+</body>
+</html>"""
+
+
+def _token_usage_page_html() -> str:
+    return r"""<!doctype html>
+<html lang="et">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function(){try{const t=localStorage.getItem('aitrackTheme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(_){}})();
+</script>
+<title>aitrack token-kulu</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; } }
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
+* { box-sizing: border-box; }
+body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+h1 { margin:0; font-size:22px; }
+main { padding:18px 22px 40px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:16px; box-shadow:0 8px 30px rgba(0,0,0,.12); }
+.toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+label { display:flex; gap:6px; align-items:center; color:var(--muted); font-size:13px; }
+button, input, select { font:inherit; }
+button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:8px 11px; cursor:pointer; }
+button.primary { background:var(--accent); color:white; border-color:var(--accent); }
+button:hover { filter:brightness(1.08); }
+input, select { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
+.small { color:var(--muted); font-size:13px; }
+.status { color:var(--muted); min-height:20px; }
+.hint { color:var(--muted); font-size:12px; margin:2px 0 0; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+.metric { border:1px solid var(--line); border-radius:12px; padding:10px; }
+.metric span { color:var(--muted); font-size:12px; display:block; }
+.metric b { display:block; font-size:20px; margin-top:3px; }
+.tablewrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; min-width:820px; }
+th, td { border-top:1px solid var(--line); padding:8px 10px; vertical-align:top; }
+th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; white-space:nowrap; cursor:pointer; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+tbody tr:hover { background:rgba(56,189,248,.07); }
+tfoot td { border-top:2px solid var(--line); font-weight:700; }
+.pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 8px; color:var(--muted); font-size:12px; }
+.pill.think { border-color:var(--accent); color:var(--accent); }
+.empty { text-align:center; color:var(--muted); padding:26px; }
+@media (max-width: 720px) { .metric b { font-size:17px; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>aitrack token-kulu</h1><div class="small">Mudelipõhine token-kulu perioodi kohta — toorarvud, rahaline väärtus arvutatakse väljaspool. <span id="userInfo"></span></div></div>
+  <div class="toolbar">
+    <button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button>
+    <button onclick="location.href='/'">Päevavaade</button>
+    <button onclick="location.href='/activity'">Server tegevused</button>
+    <button onclick="load()" class="primary">Värskenda</button>
+    <button onclick="logout()">Logi välja</button>
+  </div>
+</header>
+<main>
+  <section class="panel toolbar">
+    <label>Alates <input type="date" id="fromInput"></label>
+    <label>Kuni <input type="date" id="toInput"></label>
+    <label>Projekt <input id="projectInput" placeholder="kõik" autocomplete="off"></label>
+    <label>AI <input id="toolInput" placeholder="Pi / Claude" style="width:110px" autocomplete="off"></label>
+    <label>Mudel <input id="modelInput" placeholder="kõik" style="width:150px" autocomplete="off"></label>
+    <label id="userWrap" hidden>Kasutaja <input id="userInput" placeholder="kasutajanimi" style="width:120px" autocomplete="off"></label>
+    <button onclick="load()">Näita</button>
+    <span class="status" id="status"></span>
+  </section>
+  <section class="panel grid" id="metrics"></section>
+  <section class="panel">
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th data-sort="project">Projekt</th>
+          <th data-sort="tool">AI</th>
+          <th data-sort="model">Mudel</th>
+          <th data-sort="thinking">Thinking</th>
+          <th class="num" data-sort="input">Input</th>
+          <th class="num" data-sort="output">Output</th>
+          <th class="num" data-sort="cache_read">Cache-in</th>
+          <th class="num" data-sort="cache_write">Cache-out</th>
+          <th class="num" data-sort="reasoning">Reasoning</th>
+          <th class="num" data-sort="total">Kokku</th>
+          <th class="num" data-sort="messages">Sõnumeid</th>
+        </tr></thead>
+        <tbody id="rowsBody"><tr><td class="empty" colspan="11">Laen…</td></tr></tbody>
+        <tfoot id="rowsFoot"></tfoot>
+      </table>
+    </div>
+    <p class="hint">Reasoning = eraldi loetud thinking-tokenid (Pi). Claude arvestab thinking'u output'i sisse. "Kokku" = input + output + cache-in + cache-out (reasoning ei liideta topelt).</p>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function effectiveTheme() { const t = document.documentElement.dataset.theme; if (t === 'light' || t === 'dark') return t; return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+function updateThemeButton() { const b = $('themeToggle'); if (b) b.textContent = effectiveTheme() === 'dark' ? 'Hele' : 'Tume'; }
+function setTheme(t) { try { if (t === 'light' || t === 'dark') { document.documentElement.dataset.theme = t; localStorage.setItem('aitrackTheme', t); } else { delete document.documentElement.dataset.theme; localStorage.removeItem('aitrackTheme'); } } catch (_) {} updateThemeButton(); }
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!localStorage.getItem('aitrackTheme')) updateThemeButton(); }); } catch (_) {}
+updateThemeButton();
+
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function setStatus(msg, isError=false) { $('status').textContent = msg; $('status').style.color = isError ? 'var(--bad)' : 'var(--muted)'; }
+function fmt(n) { return (Number(n) || 0).toLocaleString('et-EE'); }
+async function api(path) {
+  const res = await fetch(path, {credentials:'same-origin'});
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 || res.status === 403) { location.href = '/login?next=' + encodeURIComponent('/tokens'); throw new Error(data.error || 'login puudub'); }
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data;
+}
+async function logout() { await fetch('/api/logout', {method:'POST', credentials:'same-origin'}).catch(() => {}); location.href = '/login?next=/tokens'; }
+
+let ROWS = [], TOTALS = {}, SORT = {key:'total', dir:-1};
+function isAdmin() { return $('userWrap') && !$('userWrap').hidden; }
+
+function render() {
+  const rows = ROWS.slice().sort((a, b) => {
+    const k = SORT.key;
+    let x = a[k], y = b[k];
+    if (typeof x === 'string') { x = x.toLowerCase(); y = String(y).toLowerCase(); return x < y ? SORT.dir : x > y ? -SORT.dir : 0; }
+    return (Number(x) - Number(y)) * SORT.dir;
+  });
+  const body = $('rowsBody');
+  if (!rows.length) { body.innerHTML = '<tr><td class="empty" colspan="11">Sellel perioodil token-kulu andmeid pole.</td></tr>'; $('rowsFoot').innerHTML = ''; return; }
+  body.innerHTML = rows.map(r => `<tr>
+    <td>${esc(r.project || '—')}</td>
+    <td>${esc(r.tool || '—')}</td>
+    <td>${esc(r.model || '—')}</td>
+    <td>${r.thinking ? '<span class="pill think">thinking</span>' : '<span class="pill">—</span>'}</td>
+    <td class="num">${fmt(r.input)}</td>
+    <td class="num">${fmt(r.output)}</td>
+    <td class="num">${fmt(r.cache_read)}</td>
+    <td class="num">${fmt(r.cache_write)}</td>
+    <td class="num">${fmt(r.reasoning)}</td>
+    <td class="num"><b>${fmt(r.total)}</b></td>
+    <td class="num">${fmt(r.messages)}</td>
+  </tr>`).join('');
+  const t = TOTALS;
+  $('rowsFoot').innerHTML = `<tr><td colspan="4">Kokku (${rows.length} rida)</td>
+    <td class="num">${fmt(t.input)}</td><td class="num">${fmt(t.output)}</td>
+    <td class="num">${fmt(t.cache_read)}</td><td class="num">${fmt(t.cache_write)}</td>
+    <td class="num">${fmt(t.reasoning)}</td><td class="num">${fmt(t.total)}</td><td class="num">${fmt(t.messages)}</td></tr>`;
+}
+function renderMetrics() {
+  const t = TOTALS;
+  const cards = [
+    ['Kokku tokeneid', t.total], ['Input', t.input], ['Output', t.output],
+    ['Cache-in', t.cache_read], ['Cache-out', t.cache_write], ['Reasoning (Pi)', t.reasoning], ['Sõnumeid', t.messages],
+  ];
+  $('metrics').innerHTML = cards.map(([k, v]) => `<div class="metric"><span>${esc(k)}</span><b>${fmt(v)}</b></div>`).join('');
+}
+async function load() {
+  setStatus('Laen…');
+  const q = new URLSearchParams();
+  if ($('fromInput').value) q.set('from', $('fromInput').value);
+  if ($('toInput').value) q.set('to', $('toInput').value);
+  if ($('projectInput').value.trim()) q.set('project', $('projectInput').value.trim());
+  if ($('toolInput').value.trim()) q.set('tool', $('toolInput').value.trim());
+  if ($('modelInput').value.trim()) q.set('model', $('modelInput').value.trim());
+  if (isAdmin() && $('userInput').value.trim()) q.set('user', $('userInput').value.trim());
+  try {
+    const data = await api('/api/token-usage?' + q.toString());
+    ROWS = data.rows || []; TOTALS = data.totals || {};
+    renderMetrics(); render();
+    setStatus(`${data.period_from} … ${data.period_to} · ${ROWS.length} rida`);
+  } catch (err) { setStatus(err.message || 'Laadimine ebaõnnestus', true); }
+}
+document.querySelectorAll('th[data-sort]').forEach(th => th.addEventListener('click', () => {
+  const k = th.dataset.sort;
+  SORT = {key: k, dir: SORT.key === k ? -SORT.dir : (['project','tool','model'].includes(k) ? 1 : -1)};
+  render();
+}));
+async function init() {
+  const today = new Date();
+  const first = new Date(today.getFullYear(), today.getMonth(), 1);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  $('fromInput').value = iso(first); $('toInput').value = iso(today);
+  try {
+    const me = await api('/api/me');
+    $('userInfo').innerHTML = me.user ? '(' + esc(me.user.name) + ', <span class="pill">' + esc(me.user.role) + '</span>)' : '';
+    if (me.user && me.user.role === 'admin') $('userWrap').hidden = false;
+  } catch (_) {}
+  load();
+}
+init().catch(e => setStatus(e.message || 'login puudub', true));
 </script>
 </body>
 </html>"""

@@ -1474,5 +1474,19 @@ with A._db_connect(tudb) as conn:
 check("vigane rida (ilma hour_key'ta) jäetakse vahele",
       A._db_ingest_token_usage(tudb, tutok, [{"date": "2026-06-16", "hour": "10:00–11:00", "model": "x"}])["stored"] == 0)
 
+# --- perioodi report: koondamine + kogusummad + filter ---
+rep = A._db_token_usage_report(tudb, tutok, {"from": "2026-06-01", "to": "2026-06-30"})
+check("report annab 3 rida perioodis", rep["ok"] and len(rep["rows"]) == 3)
+check("report read järjestatud kokku-summa järgi kahanevalt",
+      rep["rows"][0]["total"] >= rep["rows"][-1]["total"])
+opus_row = [r for r in rep["rows"] if r["model"] == "claude-opus-4-8" and r["thinking"] == 1][0]
+check("report Kokku = input+output+cache (reasoning ei liideta topelt)",
+      opus_row["total"] == opus_row["input"] + opus_row["output"] + opus_row["cache_read"] + opus_row["cache_write"])
+check("report kogusummad liidetud", rep["totals"]["total"] == sum(r["total"] for r in rep["rows"]))
+check("report mudelifilter kitsendab",
+      len(A._db_token_usage_report(tudb, tutok, {"from": "2026-06-01", "to": "2026-06-30", "model": "sonnet"})["rows"]) == 1)
+check("report periood väljaspool andmeid → tühi",
+      A._db_token_usage_report(tudb, tutok, {"from": "2026-01-01", "to": "2026-01-31"})["rows"] == [])
+
 print(f"\n==== TULEMUS: {PASS} läbitud, {FAIL} ebaõnnestunud ====")
 sys.exit(1 if FAIL else 0)
