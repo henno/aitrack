@@ -592,13 +592,14 @@ check("copy payload on tbody tabel", html_payload.startswith("<table><tbody><tr>
 check("copy payload D–G = 4 td", html_payload.count("<td>") == 4)
 check("copy text fallback sisaldab tabe", text_payload.count("\t") == 3)
 
-# ============ TEST 40: start UI kustutuskinnitus + textarea autosize ============
-print("TEST 40: start UI sisaldab kustutuskinnitust ja automaatselt kasvavaid tekstikaste")
+# ============ TEST 40: start UI mitme-päeva ülevaade (Sheetsi-laadne) ============
+print("TEST 40: start UI on Sheetsi-laadne mitme-päeva ülevaade värvikoodiga")
 page = A._start_page_html()
-check("Kustuta kasutab deleteRow kinnitusega", "function deleteRow" in page and "confirm('Kas kustutan selle rea?" in page)
-check("textarea autosize olemas", "function autoResizeTextarea" in page and "scrollHeight" in page)
-check("textarea overflow hidden", "overflow:hidden" in page)
-check("lahtri klikk/fookus avab kogu tekstiala", "textarea.expanded" in page and "addEventListener('focus'" in page and "addEventListener('click'" in page)
+check("ülevaade laeb kõik päevad /api/diary kaudu", "/api/diary" in page and "function loadDiary" in page and "diaryBody" in page)
+check("üks rida = üks päev: kuupäev, tunnid, nädalapäev veergudena", "function diaryRow" in page and 'class="date"' in page and 'class="hours ' in page and 'class="wd"' in page)
+check("tundide lahter läheb roheliseks 8+ ja muidu oranžiks", "function hoursClass" in page and ">= 8 ? 'ok' : 'low'" in page and "td.hours.ok" in page and "td.hours.low" in page)
+check("spreadsheet-laadne ruudustik joonega lahtritega", "table.sheet" in page and "--grid" in page and "sheet-wrap" in page)
+check("iga päeva saab Sheetsi kopeerida", "function copyDay" in page and "/api/copy" in page and 'class="mini good"' in page)
 
 # ============ TEST 41: SQLite keskserveri helperid ============
 print("TEST 41: SQLite keskserver salvestab tunniread ja prompt-eventid tokeniga")
@@ -802,8 +803,8 @@ server_start_page = A._start_page_html(server_mode=True)
 check("serveri päevavaade kasutab cookie authi, mitte tokenivälja", "Server token" not in server_start_page and "credentials:'same-origin'" in server_start_page and "const SERVER_MODE = true" in server_start_page)
 check("serveri päevavaate Abi asemel on kasutaja nupp", "Kasutaja" in server_start_page and ">Abi<" not in server_start_page and "/account" in server_start_page)
 check("serveri päevavaates saab admin kasutajat valida", "userSelect" in server_start_page and "/api/activity/filters" in server_start_page and "selectedUserParam" in server_start_page)
-check("serveri päevavaates on tervikkokkuvõtte väli ja kopeeri nupp", "daySummaryPanel" in server_start_page and "/api/day-summary" in server_start_page and "copyDaySummary" in server_start_page)
-check("päevavaate tunni päises kuvatakse tänaste tundide arv", "hoursHeader" in server_start_page and "Tund (${rows.length} h)" in server_start_page)
+check("serveri ülevaade laeb päevad /api/diary kaudu", "/api/diary" in server_start_page and "diaryBody" in server_start_page)
+check("ülevaade näitab päevade ja tundide koondstatistikat", "renderStats" in server_start_page and "tundi kokku" in server_start_page and "≥8h" in server_start_page)
 account_page = A._account_page_html()
 check("kasutaja lehel saab parooli muuta", "/api/me/password" in account_page and "current-password" in account_page and "new-password" in account_page)
 check("kasutaja lehel on kolme OS-i installikäsk", "/api/install-code" in account_page and "install-client.sh" in account_page and "install-client.ps1" in account_page and "Linux" in account_page and "macOS" in account_page and "Windows" in account_page)
