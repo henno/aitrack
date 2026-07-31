@@ -99,7 +99,7 @@ DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
 CLIENT_VERSION = 9
 ALLOWLIST_SYNC_TTL_SECONDS = 10 * 60
-AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
+AITRACK_REPO_URL = "https://github.com/henno/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -9190,7 +9190,7 @@ def main():
     sv.set_defaults(fn=cmd_serve)
 
     cn = sub.add_parser("connect", help="ühenda see klient aitrack keskserveriga")
-    cn.add_argument("--url", required=True, help="serveri URL, nt https://aitrack.example.com")
+    cn.add_argument("--url", required=True, help="serveri URL, nt https://aitrack.diarainfra.com")
     cn.add_argument("--token", required=True, help="kasutaja token serverist")
     cn.set_defaults(fn=cmd_connect)
 

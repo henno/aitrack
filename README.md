@@ -72,7 +72,7 @@ See käsk kloonib GitHubi repo, ühendab kliendi serveriga ning paigaldab minute
 Käsitsi sama töövoog on:
 
 ```bash
-aitrack connect --url https://aitrack.example.com --token TOKEN
+aitrack connect --url https://aitrack.diarainfra.com --token TOKEN
 aitrack add /tee/projektini
 aitrack install --minute-tracking --pi-extension
 ```
@@ -165,7 +165,7 @@ päevavaade renderdatakse uuesti.
 **Mitme kasutaja server:** `aitrack serve --host 0.0.0.0 --port 8765 --db /data/server.db` käivitab
 SQLite-põhise keskserveri. Serveris loo administraator `aitrack user add admin --role admin --db /data/server.db` ja sea
 brauseri login'i parool `aitrack user password admin --db /data/server.db` (või turvalises skriptis
-`--password-stdin`). Kliendis seadista API jaoks `aitrack connect --url https://aitrack.example.com --token TOKEN`.
+`--password-stdin`). Kliendis seadista API jaoks `aitrack connect --url https://aitrack.diarainfra.com --token TOKEN`.
 Seejärel saadab kliendi `aitrack run` tunniread ja minuti täpsusega prompt-eventid serverisse. Dockeris kasuta
 repo juures `docker compose up -d --build` (vaikimisi seob `127.0.0.1:3103`).
 
@@ -193,13 +193,13 @@ aitrack tick
 aitrack work done --result kept "Claude lahendus sobis, testid läbivad"
 ```
 
-Serveri päevavaates (`https://aitrack.example.com/`) saab lisaks tunniridadele näha päeva tervikkokkuvõtet.
+Serveri päevavaates (`https://aitrack.diarainfra.com/`) saab lisaks tunniridadele näha päeva tervikkokkuvõtet.
 See tekst ei teki serveris ise: käivita oma ühendatud kliendis `aitrack day-summary YYYY-MM-DD` ning lokaalne
 AI-harness küsib serverist selle päeva read, kirjutab mitte-tehnilisele lugejale sobiva kokkuvõtte ja salvestab selle
 vastava päeva ridade kohale. Välja kõrval on `Kopeeri` nupp. Admin saab koostada teise kasutaja päeva kohta:
 `aitrack day-summary YYYY-MM-DD --user kasutajanimi`.
 
-Serveri tegevuste veebivaade on `https://aitrack.example.com/activity`. Brauser suunatakse vajadusel
+Serveri tegevuste veebivaade on `https://aitrack.diarainfra.com/activity`. Brauser suunatakse vajadusel
 `/login` lehele; pärast kasutajanime/parooliga sisselogimist hoiab server `HttpOnly` session-cookie't.
 Tavakasutaja näeb enda work session'eid, prompt-evente ja tegevuste ajalugu; admin näeb kõiki kasutajaid.
 Activity vaates saab filtreerida projekti, kasutaja, issue, tööriista, agent'i ja staatuse järgi ning
@@ -214,7 +214,7 @@ payloadist, et sama JSON ei oleks escaped stringina ja korduvate väljadena kaks
 `active` = hiljutise progressiga töö, `stale` = üle 10 minuti progressita töö, `stuck` = üle 10 minuti
 pooleliolev tool-call.
 
-Admini kasutajavaade on `https://aitrack.example.com/admin`: seal saab kasutajaid lisada, paroole seada,
+Admini kasutajavaade on `https://aitrack.diarainfra.com/admin`: seal saab kasutajaid lisada, paroole seada,
 web-sessioone tühistada ja turvaauditit vaadata. Loginid, ebaõnnestunud loginid, paroolimuudatused,
 admin-toimingud, rate-limit ban'id ja kahtlased probe'id lähevad `security_events` tabelisse.
 API/CLI jaoks jääb token-põhine autentimine alles. Server rakendab lihtsat mälupõhist rate limiterit;
@@ -242,7 +242,7 @@ päringu perioodipiiride järgi.
 Pi automaatjälgimiseks:
 
 ```bash
-aitrack connect --url https://aitrack.example.com --token TOKEN
+aitrack connect --url https://aitrack.diarainfra.com --token TOKEN
 aitrack add /tee/projektini
 aitrack install --minute-tracking --pi-extension
 # Pi sees: /reload või ava uus pi session
@@ -264,7 +264,7 @@ aitrack report month --period 2026-06 \
   --rate 82 --format json
 
 curl -H "User-Agent: aitrack/1.0" \
-  "https://aitrack.example.com/api/report/monthly?token=TOKEN&period=2026-06&project_key=github.com/puhastusproff/pp-finar&hourly_rate=82"
+  "https://aitrack.diarainfra.com/api/report/monthly?token=TOKEN&period=2026-06&project_key=github.com/puhastusproff/pp-finar&hourly_rate=82"
 ```
 
 Vana `/api/billing/invoice-lines` endpoint jääb ühilduvuseks alles, kuid vastuses on `deprecated: true`;
@@ -275,7 +275,7 @@ Praktikakokkuvõtte saab serverist:
 
 ```bash
 curl -H "X-Aitrack-Token: TOKEN" \
-  "https://aitrack.example.com/api/practice/summary?period=2026-06"
+  "https://aitrack.diarainfra.com/api/practice/summary?period=2026-06"
 ```
 
 **Tööpäeva algus:** seadistuse mõttes ei tee midagi; soovi korral `aitrack status` või `aitrack start`.
@@ -290,7 +290,7 @@ curl -H "X-Aitrack-Token: TOKEN" \
 
 ## Uue keskserveri kasutaja juhend
 
-1. **Logi veebis sisse.** Ava `https://aitrack.example.com/login`, sisesta kasutajanimi ja ajutine parool.
+1. **Logi veebis sisse.** Ava `https://aitrack.diarainfra.com/login`, sisesta kasutajanimi ja ajutine parool.
    Mine `Kasutaja` lehele ja vaheta ajutine parool kohe ära.
 2. **Installi klient ühe käsuga.** Ava `Kasutaja → Installi aitrack arvutisse`, vali oma OS ja kopeeri käsk terminali.
    Installikood on ühekordne ja aegub 15 minutiga. Skript kloonib repo, teeb `aitrack connect`, küsib projekti tee ning
@@ -306,7 +306,7 @@ curl -H "X-Aitrack-Token: TOKEN" \
 4. **Pi reload.** Pi sees tee `/reload` või ava uus Pi sessioon.
 5. **Issue sidumine.** Anna issue käsitsi `--issue 123` või kasuta branchi nime nagu
    `fix/123-luhikirjeldus`; aitrack seob töö selle issue'ga automaatselt.
-6. **Vaata tulemusi.** Ava `https://aitrack.example.com/activity`. Filtrid rakenduvad kohe; kuupäevaga saab valida
+6. **Vaata tulemusi.** Ava `https://aitrack.diarainfra.com/activity`. Filtrid rakenduvad kohe; kuupäevaga saab valida
    ühe päeva või vahemiku.
 
 Ära pane paroole ega API token'eid README-sse, issue'sse, chatti ega commit'i. Ajutine parool on ainult esimeseks loginiks.
