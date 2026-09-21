@@ -4,8 +4,8 @@ services:
     image: aitrack-server
     container_name: aitrack-server
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:3103:8765"
+    network_mode: host
+    command: ["python", "/app/aitrack.py", "serve", "--host", "127.0.0.1", "--port", "3103", "--db", "/data/server.db"]
     environment:
       AITRACK_CONFIG_DIR: /data
       PYTHONUNBUFFERED: "1"
