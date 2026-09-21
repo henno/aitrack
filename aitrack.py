@@ -53,6 +53,8 @@ from aitrack_core.templates import (
     _token_usage_page_html,
 )
 
+from aitrack_core.project_summaries import combine_summaries, summarize_projects
+
 from aitrack_core.security import (
     PASSWORD_HASH_ITERATIONS,
     _b64,
@@ -4762,6 +4764,12 @@ def _prompt_to_work_sentence(text: str) -> str:
     return "Tegelesin vastava tööteema uurimise ja lahendamisega."
 
 
+def _placeholder_day_row(row: list) -> bool:
+    # A failed summary for one project must not discard completed parallel work.
+    return any(all(_placeholder_day_text(part) for part in re.split(r"\n(?=• )", str(value)))
+               for value in row[2:4])
+
+
 def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date: str,
                               existing_rows: list[list], cfg: dict | None = None) -> list[list]:
     tz = _infer_fixed_tz_from_day_rows(existing_rows, cfg)
@@ -4775,7 +4783,8 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         WHERE pe.user_id = ? AND pe.started_at >= ? AND pe.started_at < ?
         ORDER BY pe.started_at
     """, (int(user["id"]), start_utc.isoformat(), end_utc.isoformat())).fetchall()
-    grouped: dict[str, dict] = {}
+    grouped: dict[tuple, dict] = {}
+    saved_hours = {r[1] for r in existing_rows if not _placeholder_day_row(r)}
     for r in rows:
         started = parse_iso(r["started_at"])
         if not started:
@@ -4784,9 +4793,13 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         if local.date() != target:
             continue
         hour = _hour_label_from_local(local)
-        g = grouped.setdefault(hour, {"date": date, "hour": hour, "projects": [], "activities": [],
-                                      "texts": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
+        # Metadata supplies time evidence, not a replacement for a saved summary.
+        if hour in saved_hours:
+            continue
         project = r["project_name"] or r["project_key"] or r["project"] or "AI-toega töö"
+        project_key = r["project_key"] or r["project"] or project
+        g = grouped.setdefault((hour, project_key), {"date": date, "hour": hour, "projects": [], "activities": [],
+                                                     "texts": [], "tools": [], "utc": local.astimezone(dt.timezone.utc)})
         if project and project not in g["projects"]:
             g["projects"].append(project)
         prompt_text = str(r["prompt_text"] or "")
@@ -4798,13 +4811,20 @@ def _db_prompt_event_day_rows(conn: sqlite3.Connection, user: sqlite3.Row, date:
         tool = str(r["tool"] or "").strip()
         if tool and tool not in g["tools"]:
             g["tools"].append(tool)
-    out = []
+    hours: dict[str, dict] = {}
     for g in grouped.values():
-        key = f"k:{g['utc'].isoformat()}|__prompt_event__"
         plain = _plain_day_summary_from_texts(g["texts"], g["projects"])
-        out.append([g["date"], g["hour"], plain["objekt"], plain["saavutus"],
-                    _infer_takistus_from_texts(g["texts"]), _infer_teadmine_from_texts(g["texts"]),
-                    ", ".join(g["tools"]), key])
+        plain.update(takistus=_infer_takistus_from_texts(g["texts"]),
+                     teadmine=_infer_teadmine_from_texts(g["texts"]))
+        h = hours.setdefault(g["hour"], {"utc": g["utc"], "summaries": [], "tools": []})
+        h["summaries"].append((g["projects"][0], plain))
+        h["tools"].extend(tool for tool in g["tools"] if tool not in h["tools"])
+    out = []
+    for hour, h in hours.items():
+        plain = combine_summaries(h["summaries"])
+        key = f"k:{h['utc'].isoformat()}|__prompt_event__"
+        out.append([date, hour, plain["objekt"], plain["saavutus"],
+                    plain["takistus"], plain["teadmine"], ", ".join(h["tools"]), key])
     return sorted(out, key=lambda r: (r[1], r[7]))
 
 
@@ -4817,21 +4837,15 @@ def _merge_day_rows_with_work_sessions(rows: list[list], derived: list[list]) ->
             by_hour[d[1]] = d
             continue
         # Säilita käsitsi parandatud read; asenda automaatse varukokkuvõtte placeholder.
-        placeholder = (_placeholder_day_text(existing[2]) or _placeholder_day_text(existing[3])
-                       or _rawish_day_text(existing[2]) or _rawish_day_text(existing[3]))
+        placeholder = _placeholder_day_row(existing)
         if placeholder:
             existing[2] = d[2] or existing[2]
             existing[3] = d[3] or existing[3]
             existing[4] = d[4] or existing[4]
             existing[5] = d[5] or existing[5]
             existing[6] = d[6] or existing[6]
-        else:
-            # Kui kasutaja on parandanud esimesed veerud, aga vanast automaatfallbackist jäid
-            # Takistus/Teadmine tühiväärtuseks, võib faktiline derivatsioon need täita.
-            if existing[4] == _NA and d[4] != _NA:
-                existing[4] = d[4]
-            if existing[5] == _NA and d[5] != _NA:
-                existing[5] = d[5]
+        # Substantive saved rows are authoritative, including explicit "Ei olnud"
+        # values. Do not infer blockers or learning from a different parallel project.
     return sorted(rows, key=lambda r: (r[1], r[7]))
 
 
@@ -6369,7 +6383,6 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
         if existing_keys is not None:
             log(f"backfill: {len(existing_keys)} võtit juba lehel — neid ei summeerita uuesti")
 
-    max_p = int(cfg.get("max_prompts_per_bucket", 40))
     notes_by_hour = load_notes()  # käsitsi lisatud tunnimärkmed → liidetakse kokkuvõttesse
     rows: list[list] = []
     keys: list[str] = []
@@ -6378,14 +6391,7 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
     for (hstart, proj_key) in bucket_keys:
         items = buckets.get((hstart, proj_key), [])
         transcript_items = transcript_by_bucket.get((hstart, proj_key), [])
-        recs = sorted((it[0] for it in items), key=lambda r: r.ts)
-        tools = sorted({r.tool for r in recs} | {it[0].tool for it in transcript_items})
-        prompts = [r.text for r in recs][:max_p]
-        transcript_inputs = _summary_inputs_from_transcript(transcript_items, limit=max_p * 2)
-        summary_inputs = transcript_inputs or prompts
-        # 'hour'-režiimis võib ämbris olla mitu kausta → Projekt-veergu loetelu (nt "api, web")
-        project_paths = [it[1] for it in items] + [it[1] for it in transcript_items]
-        proj_label = ", ".join(sorted({Path(p).name for p in project_paths}))
+        tools = sorted({r.tool for r, _ in items} | {it[0].tool for it in transcript_items})
         local = hstart.astimezone(tz)            # kuvamine kohalikus ajas
         local_end = (hstart + dt.timedelta(hours=1)).astimezone(tz)
         hour_label = f"{local.strftime('%H:%M')}–{local_end.strftime('%H:%M')}"
@@ -6394,8 +6400,11 @@ def _run_once_locked(cfg: dict, allow: list[str], backfill_hours: int | None,
         if existing_keys is not None and key in existing_keys:
             skipped += 1
             continue                             # juba lehel → ära kuluta LLM-kõnet
-        heartbeat_lock(lock)  # pikk run ei tohi teisele protsessile aegunud näida
-        item = summarize(summary_inputs, proj_label, hour_label, cfg)  # 4-väljaline dict
+        item = summarize_projects(
+            items, transcript_items, hour_label, cfg, summarize=summarize,
+            transcript_inputs=_summary_inputs_from_transcript,
+            before_summary=lambda: heartbeat_lock(lock),
+        )
         notes = notes_by_hour.get(_hour_iso(hstart), [])  # käsitsi-märkmed selle tunni kohta
         if notes:  # käsitsi-märge → "Uued teadmised" veergu (sinna kuuluvad õpitud asjad)
             note_txt = "Märge: " + " · ".join(notes)

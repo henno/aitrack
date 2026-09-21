@@ -149,6 +149,19 @@ cd ~ && claude                    # ✗ kodukaustast → ei eristu projektiks
 | 13:15 | `cd ~/parkproduction && claude` → müügipakkumine, PageSpeed | — |
 | 18:00 | Pakid asju | 🔔 **Päeva-digest:** *"AI-töö 1p: 4 aktiivset tundi, 47 prompti — kalaradar-mono 2h, parkproduction 2h"* |
 
+**Mitu projekti samal tunnil:** iga projekti vestlusest koostatakse eraldi kokkuvõte.
+Vaikimisi jääb päevikusse üks tunnipunkt, mille kõigis sisuveergudes on projektide
+nimedega alapunktid. Näiteks DiaraBooksi ja e-posti seadistamisega paralleelselt
+tegeletud tund annab ühe tunni, kuid mõlema projekti tulemused jäävad nähtavale.
+Iga projekti tekstimahtu piiratakse eraldi, et pikem vestlus teist projekti välja ei tõrjuks.
+`object_names` seadistusega saab kaustanime asemel valida projekti kuvatava nime.
+
+Server peab säilitama kliendi koostatud ja käsitsi parandatud kokkuvõtted. Ainult
+selgelt märgitud puuduva automaatkokkuvõtte võib asendada sündmustest tuletatud tekstiga.
+Selle käitumise jaoks tuleb uuendada ka serverit; ainult kliendi uuendamisest ei piisa.
+Üksikute projektide kaupa kokkuvõtmine tähendab üht mudelikutset iga aktiivse projekti
+ja tunni kohta. Regressioonitestid: `python3 -m unittest test_parallel_projects`.
+
 **Väljund on üks rida PÄEVA kohta** (praktikapäeviku vorm). Iga tund lisab sellesse päevaritta
 ühe **nummerdatud punkti** ja numbrid on kõigis neljas sisuveerus kohakuti. Päeviku sõnastus tehakse
 kliendi arvutis iga tunni AI-vestlusest: kasutaja küsimustest ja võimalusel AI vastustest. Serverisse
