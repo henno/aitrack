@@ -39,22 +39,22 @@ cmd_work / cmd_tick / cmd_serve / cmd_user / cmd_connect
 
 Uut API/DB tööd tehes lisa funktsioonid samasse serveri sektsiooni, lisa handlerisse endpoint ja lisa regressioonitest `aitrack_tests.py` lõppu uue TEST numbriga.
 
-Server on deploytud Hetznerisse:
+Server on deploytud diarainfra.com-i (ligipääs KAHE hüppega — diarainfra pole otse väljast SSH-itav):
 
 ```text
-ssh hetzner-kool
-/opt/aitrack
-https://aitrack.parkproduction.ee
+ssh root@test.diarainfra.com  ->  ssh root@diarainfra.com
+/opt/aitrack                       (lihtsalt failid, EI ole git-repo)
+https://aitrack.diarainfra.com
 container: aitrack-server
-server DB containeris: /data/server.db
-avalik route: Cloudflare -> http://127.0.0.1:3103
+server DB containeris: /data/server.db (püsib volume'is aitrack_aitrack-data)
+avalik route: nginx (/etc/nginx/sites-enabled/aitrack.diarainfra.com.conf) -> aitrack-server konteiner
 ```
 
 Brauseri login on juba olemas:
 
 ```text
-https://aitrack.parkproduction.ee/login
-https://aitrack.parkproduction.ee/activity
+https://aitrack.diarainfra.com/login
+https://aitrack.diarainfra.com/activity
 ```
 
 Praegu on serveri kasutaja:
@@ -63,12 +63,7 @@ Praegu on serveri kasutaja:
 admin
 ```
 
-Ära kirjuta paroole ega tokeneid reposse, plaani ega vestlusesse. Vajadusel on Hetzneris ainult rootile loetavad failid:
-
-```text
-/root/aitrack/admin-login.txt
-/root/aitrack/admin-token.txt
-```
+Ära kirjuta paroole ega tokeneid reposse, plaani ega vestlusesse. Serveri admin-login ja -token hoitakse ainult diarainfra serveris rootile loetavates failides — küsi vajadusel serveri haldajalt, ära pane neid reposse.
 
 CLI/API jaoks jääb token-auth alles. Brauseri jaoks kasutatakse `HttpOnly` session-cookie't. Serveris on juba lihtne rate limiter ja IP-ban tüüpiliste probe'ide ning korduvate vale-loginite jaoks.
 
@@ -111,7 +106,7 @@ aitrack start
 aitrack serve --host 0.0.0.0 --port 8765 --db /data/server.db
 aitrack user add admin --role admin --db /data/server.db
 aitrack user password admin --db /data/server.db
-aitrack connect --url https://aitrack.parkproduction.ee --token TOKEN
+aitrack connect --url https://aitrack.diarainfra.com --token TOKEN
 aitrack project-id --json
 aitrack work start --tool pi "short summary"
 aitrack tick
@@ -132,14 +127,21 @@ Praegune oodatud tulemus:
 128 läbitud, 0 ebaõnnestunud
 ```
 
-Deploy workflow:
+Deploy workflow (lähtekood henno repos, produktsioon diarainfra.com-is):
 
 ```bash
 git add ...
 git commit -m "..."
-git push origin main
-ssh hetzner-kool 'cd /opt/aitrack && git pull --ff-only && docker compose up -d --build'
+git push henno <branch>        # henno = git@github.com:henno/aitrack.git (source of truth), tee PR -> main
+
+# Deploy diarainfra serverisse. /opt/aitrack EI ole git-repo ja server ei pulli GitHubist —
+# kopeeri muudetud failid läbi hüppe (image sisaldab aitrack.py, README.md, aitrack_core/):
+cat aitrack.py                | ssh root@test.diarainfra.com "ssh root@diarainfra.com 'cat > /opt/aitrack/aitrack.py'"
+cat aitrack_core/templates.py | ssh root@test.diarainfra.com "ssh root@diarainfra.com 'cat > /opt/aitrack/aitrack_core/templates.py'"
+ssh root@test.diarainfra.com "ssh root@diarainfra.com 'cd /opt/aitrack && docker compose up -d --build'"
 ```
+
+Andmed püsivad volume'is (`aitrack_aitrack-data`), rebuild neid ei puuduta. Kontroll: `curl https://aitrack.diarainfra.com/login` (200) + mõni muudetud/uus endpoint.
 
 ### Mida mitte valesti mõista
 

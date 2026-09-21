@@ -26,11 +26,19 @@ def _start_page_html(*, server_mode: bool = False) -> str:
 </script>
 <title>aitrack</title>
 <style>
-:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
-@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; } }
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155;
+  --grid:#2b3648; --head-bg:#0d1526; --gutter-bg:#0d1526; --gutter-tx:#64748b; --cell-bg:#0b1220;
+  --green-bg:rgba(34,197,94,.20); --green-tx:#86efac; --amber-bg:rgba(249,115,22,.22); --amber-tx:#fdba74; }
+@media (prefers-color-scheme: light) { :root { --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1;
+  --grid:#d0d7de; --head-bg:#f8f9fa; --gutter-bg:#f8f9fa; --gutter-tx:#98a2b3; --cell-bg:#ffffff;
+  --green-bg:#d9ead3; --green-tx:#1e4620; --amber-bg:#fce5cd; --amber-tx:#7a4a17; } }
 
-:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155; }
-:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1; }
+:root[data-theme="dark"] { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#f97316; --line:#334155;
+  --grid:#2b3648; --head-bg:#0d1526; --gutter-bg:#0d1526; --gutter-tx:#64748b; --cell-bg:#0b1220;
+  --green-bg:rgba(34,197,94,.20); --green-tx:#86efac; --amber-bg:rgba(249,115,22,.22); --amber-tx:#fdba74; }
+:root[data-theme="light"] { color-scheme: light; --bg:#f8fafc; --panel:#ffffff; --muted:#64748b; --text:#0f172a; --accent:#0369a1; --ok:#15803d; --bad:#c2410c; --line:#cbd5e1;
+  --grid:#d0d7de; --head-bg:#f8f9fa; --gutter-bg:#f8f9fa; --gutter-tx:#98a2b3; --cell-bg:#ffffff;
+  --green-bg:#d9ead3; --green-tx:#1e4620; --amber-bg:#fce5cd; --amber-tx:#7a4a17; }
 * { box-sizing: border-box; }
 body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
 header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
@@ -38,73 +46,73 @@ h1 { margin:0; font-size:22px; }
 main { padding:18px 22px 40px; }
 .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:16px; box-shadow:0 8px 30px rgba(0,0,0,.12); }
 .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-button, input, select, textarea { font:inherit; }
+button, input, select { font:inherit; }
 button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:8px 11px; cursor:pointer; }
 button.primary { background:var(--accent); color:white; border-color:var(--accent); }
 button.good { background:var(--ok); color:white; border-color:var(--ok); }
-button.warn { border-color:var(--bad); color:var(--bad); }
 button:hover { filter:brightness(1.08); }
-input, select, textarea { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
-textarea { width:100%; min-height:92px; max-height:92px; resize:none; line-height:1.35; overflow:hidden; }
-textarea.expanded, textarea:focus { max-height:none; overflow:auto; }
+button.mini { padding:4px 9px; border-radius:8px; font-size:12px; }
+input, select { background:transparent; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px; }
 .small { color:var(--muted); font-size:13px; }
 .status { color:var(--muted); min-height:20px; }
-table { width:100%; border-collapse:collapse; }
-th, td { border-top:1px solid var(--line); padding:8px; vertical-align:top; }
-th { color:var(--muted); text-align:left; font-weight:600; font-size:13px; }
-.hour { width:120px; }
-.tool { width:110px; }
-.actions { width:74px; text-align:right; }
-.summary-row { display:flex; gap:10px; align-items:flex-start; }
-.summary-row textarea { flex:1; min-height:140px; max-height:none; resize:vertical; }
-.summary-row button { white-space:nowrap; }
+.sheet-wrap { overflow-x:auto; border:1px solid var(--grid); border-radius:10px; }
+table.sheet { border-collapse:collapse; width:100%; font-size:13px; line-height:1.45; background:var(--cell-bg); }
+table.sheet th, table.sheet td { border:1px solid var(--grid); padding:7px 9px; vertical-align:top; text-align:left; }
+table.sheet thead th { position:sticky; top:0; background:var(--head-bg); color:var(--muted); font-weight:600; font-size:12px; white-space:nowrap; z-index:1; }
+table.sheet td.cell { white-space:pre-wrap; min-width:230px; max-width:420px; }
+table.sheet th.gutter, table.sheet td.gutter { background:var(--gutter-bg); color:var(--gutter-tx); text-align:right; width:38px; font-variant-numeric:tabular-nums; user-select:none; }
+table.sheet td.date { white-space:nowrap; font-variant-numeric:tabular-nums; font-weight:600; }
+table.sheet td.wd { text-align:center; width:34px; color:var(--muted); }
+table.sheet td.hours { text-align:center; width:44px; font-weight:700; font-variant-numeric:tabular-nums; }
+table.sheet td.hours.ok { background:var(--green-bg); color:var(--green-tx); }
+table.sheet td.hours.low { background:var(--amber-bg); color:var(--amber-tx); }
+table.sheet td.act { width:78px; text-align:center; white-space:nowrap; }
+table.sheet tbody tr:hover td { background:rgba(120,140,170,.10); }
+table.sheet tbody tr:hover td.gutter { background:var(--gutter-bg); }
+table.sheet tbody tr:hover td.hours.ok { background:var(--green-bg); }
+table.sheet tbody tr:hover td.hours.low { background:var(--amber-bg); }
 .empty { text-align:center; color:var(--muted); padding:30px; }
-@media (max-width: 900px) { table, thead, tbody, tr, td, th { display:block; } thead { display:none; } tr { border:1px solid var(--line); border-radius:12px; margin:10px 0; padding:8px; } td { border:0; padding:6px; } td::before { content:attr(data-label); display:block; color:var(--muted); font-size:12px; margin-bottom:3px; } .hour, .tool { width:100%; } .summary-row { flex-direction:column; } .summary-row button { width:100%; } }
+@media (max-width: 720px) { header { padding:14px; } main { padding:12px; } }
 </style>
 </head>
 <body>
 <header>
-  <div><h1>aitrack</h1><div class="small">Tänased ja varasemad tööpäeviku read — muuda, lisa ja kopeeri Google Sheetsi.</div></div>
+  <div><h1>aitrack</h1><div class="small">Praktikapäevik — kõik päevad ülevaatena, nagu Google Sheetsis.</div></div>
   <div class="toolbar"><button id="themeToggle" onclick="toggleTheme()" title="Vaheta hele/tume režiim">Tume</button>__USER_BUTTON__<button onclick="location.href='/activity'">Server tegevused</button><button onclick="window.open('/tokens','_blank')" title="Mudelipõhine token-kulu eraldi aknas">Token-kulu</button>__SERVER_ACTIONS__</div>
 </header>
 <main>
   <section class="panel toolbar">
-    <label>Kuupäev <input type="date" id="dateInput"></label>
-    <select id="daySelect" title="Olemasolevad päevad"></select>
     <label id="userSelectLabel" hidden>Kasutaja <select id="userSelect"></select></label>
     __TOKEN_CONTROL__
-    <button onclick="loadDay()">Ava</button>
-    <button onclick="addRow()">+ Lisa rida</button>
-    <button class="primary" onclick="saveDay(true)">Salvesta</button>
-    <button class="good" onclick="copyDay(false)">Kopeeri D–G</button>
-    <button class="good" onclick="copyDay(true)">Kopeeri A–G</button>
+    <button onclick="loadDiary()">Värskenda</button>
+    <span class="small" id="stats"></span>
     <span class="status" id="status"></span>
   </section>
-  <section class="panel" id="daySummaryPanel" hidden>
-    <div class="toolbar" style="justify-content:space-between; align-items:flex-end; margin-bottom:8px">
-      <div><b>Päeva tervikkokkuvõte</b><div class="small">Lokaalne harness loob selle käsuga <code>aitrack day-summary</code> serveri päevavaate andmetest.</div></div>
-      <span class="small" id="daySummaryMeta"></span>
-    </div>
-    <div class="summary-row">
-      <textarea id="daySummaryText" readonly placeholder="Kokkuvõtet pole veel. Käivita oma arvutis: aitrack day-summary YYYY-MM-DD"></textarea>
-      <button class="good" id="copyDaySummaryBtn" onclick="copyDaySummary()">Kopeeri</button>
-    </div>
-    <div class="small" id="daySummaryEmpty"></div>
-  </section>
   <section class="panel">
-    <table id="rowsTable">
-      <thead><tr><th id="hoursHeader">Tund</th><th>Objekt ja ülesanne</th><th>Saavutused</th><th>Takistused</th><th>Uued teadmised</th><th>Tööriist</th><th></th></tr></thead>
-      <tbody id="rowsBody"><tr><td class="empty" colspan="7">Laen…</td></tr></tbody>
-    </table>
+    <div class="sheet-wrap">
+      <table class="sheet">
+        <thead><tr>
+          <th class="gutter"></th>
+          <th>Kuupäev</th>
+          <th title="Tunde sel päeval">h</th>
+          <th title="Nädalapäev">Np</th>
+          <th>Objekt ja ülesanne</th>
+          <th>Saavutused</th>
+          <th>Takistused</th>
+          <th>Uued teadmised</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="diaryBody"><tr><td class="empty" colspan="9">Laen…</td></tr></tbody>
+      </table>
+    </div>
   </section>
   <section class="panel small" id="help" hidden>
     <b>Kuidas kasutada?</b><br>
-    1. Vali kuupäev. 2. Muuda/lisa read. 3. Vajuta Salvesta. 4. Vajuta “Kopeeri D–G” ja kleebi Sheetsis D-lahtrisse.<br>
-    “Kopeeri A–G” kasuta siis, kui tahad ka kuupäeva/punktide/nädalapäeva veerud kaasa võtta ja kleebid A-lahtrisse.
+    Iga rida on üks päev. Roheline tundide lahter tähendab 8+ tundi, oranž vähem.<br>
+    Vajuta real “Kopeeri”, et võtta selle päeva D–G veerud, ja kleebi Google Sheetsi D-lahtrisse.
   </section>
 </main>
 <script>
-let currentDate = '';
 let days = [];
 let currentUserName = '';
 let selectedUserName = '';
@@ -136,153 +144,40 @@ async function api(path, opts={}) {
   return data;
 }
 function escapeHtml(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function rowTemplate(row={}) {
-  const key = escapeHtml(row.key || '');
-  return `<tr data-key="${key}">
-    <td data-label="Tund"><input class="hour" value="${escapeHtml(row.hour || '')}" placeholder="14:00–15:00"></td>
-    <td data-label="Objekt"><textarea class="objekt">${escapeHtml(row.objekt || '')}</textarea></td>
-    <td data-label="Saavutused"><textarea class="saavutus">${escapeHtml(row.saavutus || '')}</textarea></td>
-    <td data-label="Takistused"><textarea class="takistus">${escapeHtml(row.takistus || '')}</textarea></td>
-    <td data-label="Uued teadmised"><textarea class="teadmine">${escapeHtml(row.teadmine || '')}</textarea></td>
-    <td data-label="Tööriist"><input class="tool" value="${escapeHtml(row.tool || 'Käsitsi')}"></td>
-    <td class="actions"><button class="warn" onclick="deleteRow(this)">Kustuta</button></td>
+function nl2br(s) { return escapeHtml(s).replace(/\n/g, '<br>'); }
+function hoursClass(h) { return (Number(h) || 0) >= 8 ? 'ok' : 'low'; }
+function diaryRow(d, idx) {
+  return `<tr>
+    <td class="gutter">${idx}</td>
+    <td class="date">${escapeHtml(d.date || '')}</td>
+    <td class="hours ${hoursClass(d.hours)}">${escapeHtml(String(d.hours ?? 0))}</td>
+    <td class="wd">${escapeHtml(d.weekday || '')}</td>
+    <td class="cell">${nl2br(d.objekt || '')}</td>
+    <td class="cell">${nl2br(d.saavutus || '')}</td>
+    <td class="cell">${nl2br(d.takistus || '')}</td>
+    <td class="cell">${nl2br(d.teadmine || '')}</td>
+    <td class="act"><button class="mini good" onclick="copyDay('${escapeHtml(d.date || '')}')" title="Kopeeri selle päeva D–G Sheetsi jaoks">Kopeeri</button></td>
   </tr>`;
 }
-function autoResizeTextarea(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.max(92, el.scrollHeight + 2) + 'px';
+function renderStats(list) {
+  const total = list.length;
+  const hrs = list.reduce((a, d) => a + (Number(d.hours) || 0), 0);
+  const full = list.filter(d => (Number(d.hours) || 0) >= 8).length;
+  $('stats').textContent = total ? `${total} päeva · ${hrs} tundi kokku · ${full} päeva ≥8h` : '';
 }
-function autoResizeAll() {
-  document.querySelectorAll('textarea').forEach(autoResizeTextarea);
+function renderDiary(list) {
+  days = list;
+  renderStats(list);
+  $('diaryBody').innerHTML = list.length
+    ? list.map((d, i) => diaryRow(d, i + 1)).join('')
+    : '<tr><td class="empty" colspan="9">Päevi pole veel. Kui alustasid just, oota tunnitöötlust või töötle logid.</td></tr>';
 }
-function wireTextareas(scope=document) {
-  scope.querySelectorAll('textarea').forEach(el => {
-    autoResizeTextarea(el);
-    el.addEventListener('focus', () => { el.classList.add('expanded'); autoResizeTextarea(el); });
-    el.addEventListener('click', () => { el.classList.add('expanded'); autoResizeTextarea(el); });
-    el.addEventListener('input', () => autoResizeTextarea(el));
-  });
-  requestAnimationFrame(autoResizeAll);
-  setTimeout(autoResizeAll, 0);
-}
-function deleteRow(button) {
-  if (!confirm('Kas kustutan selle rea? Salvestamiseks vajuta pärast ka “Salvesta”.')) return;
-  button.closest('tr').remove();
-}
-function collectRows() {
-  return Array.from(document.querySelectorAll('#rowsBody tr[data-key]')).map(tr => ({
-    key: tr.dataset.key || '',
-    hour: tr.querySelector('.hour').value,
-    objekt: tr.querySelector('.objekt').value,
-    saavutus: tr.querySelector('.saavutus').value,
-    takistus: tr.querySelector('.takistus').value,
-    teadmine: tr.querySelector('.teadmine').value,
-    tool: tr.querySelector('.tool').value
-  }));
-}
-function renderRows(rows) {
-  if ($('hoursHeader')) $('hoursHeader').textContent = rows.length ? `Tund (${rows.length} h)` : 'Tund';
-  $('rowsBody').innerHTML = rows.length ? rows.map(rowTemplate).join('') : '<tr><td class="empty" colspan="7">Sellel päeval pole veel ridu. Vajuta “+ Lisa rida”.</td></tr>';
-  wireTextareas($('rowsBody'));
-}
-function renderDaySummary(summary={}) {
-  if (!$('daySummaryPanel')) return;
-  $('daySummaryPanel').hidden = !SERVER_MODE;
-  if (!SERVER_MODE) return;
-  const text = summary.summary || '';
-  $('daySummaryText').value = text;
-  $('copyDaySummaryBtn').disabled = !text;
-  $('daySummaryEmpty').textContent = text ? '' : `Kokkuvõtet pole veel. Loo see käsuga: aitrack day-summary ${currentDate}${selectedUserParam() ? ' --user ' + selectedUserParam() : ''}`;
-  $('daySummaryMeta').textContent = summary.updated_at ? 'Uuendatud ' + new Date(summary.updated_at).toLocaleString() : '';
-  autoResizeTextarea($('daySummaryText'));
-}
-async function loadDaySummary() {
-  if (!SERVER_MODE || !$('daySummaryPanel')) return;
-  const q = userQueryParams();
-  q.set('date', currentDate);
-  try {
-    const data = await api('/api/day-summary?' + q.toString());
-    renderDaySummary(data.summary || {});
-  } catch (e) {
-    renderDaySummary({summary: ''});
-    $('daySummaryEmpty').textContent = e.message || 'Kokkuvõtte laadimine ebaõnnestus';
-  }
-}
-async function copyDaySummary() {
-  const text = $('daySummaryText').value.trim();
-  if (!text) { setStatus('Päeva kokkuvõtet pole veel.', true); return; }
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (_) {
-    $('daySummaryText').focus(); $('daySummaryText').select(); document.execCommand('copy');
-  }
-  setStatus('Päeva kokkuvõte kopeeritud.');
-}
-async function init() {
-  currentDate = new Date().toISOString().slice(0, 10);
-  $('dateInput').value = currentDate;
-  if ($('tokenInput')) {
-    $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
-    $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
-  }
-  await initUserSelect();
-  await loadDays(false);
-  renderDaySelect();
-  await loadDay();
-}
-async function initUserSelect() {
-  if (!SERVER_MODE) return;
-  const me = await api('/api/me');
-  currentUserName = me.user ? me.user.name : '';
-  selectedUserName = currentUserName;
-  if (!me.user || me.user.role !== 'admin') return;
-  const data = await api('/api/activity/filters');
-  const users = data.users || [];
-  $('userSelect').innerHTML = users.map(u => `<option value="${escapeHtml(u.name || '')}">${escapeHtml(u.name || '')} (${escapeHtml(u.role || '')})</option>`).join('');
-  $('userSelect').value = currentUserName;
-  $('userSelectLabel').hidden = false;
-  $('userSelect').onchange = async () => { selectedUserName = $('userSelect').value; await loadDays(false); renderDaySelect(); await loadDay(); };
-}
-async function loadDays(resetToToday=false) {
-  const q = userQueryParams();
-  const data = await api('/api/days' + (q.toString() ? '?' + q.toString() : ''));
-  days = data.days || [];
-  if (resetToToday || !currentDate) currentDate = data.today;
-  $('dateInput').value = currentDate;
-}
-function renderDaySelect() {
-  $('daySelect').innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
-  if (!days.includes(currentDate)) $('daySelect').insertAdjacentHTML('afterbegin', `<option value="${currentDate}">${currentDate}</option>`);
-  $('daySelect').value = currentDate;
-  $('daySelect').onchange = () => { $('dateInput').value = $('daySelect').value; loadDay(); };
-  $('dateInput').onchange = () => { currentDate = $('dateInput').value; $('daySelect').value = currentDate; loadDay(); };
-}
-async function loadDay() {
-  currentDate = $('dateInput').value || currentDate;
+async function loadDiary() {
   setStatus('Laen…');
   const q = userQueryParams();
-  q.set('date', currentDate);
-  const data = await api('/api/day?' + q.toString());
-  renderRows(data.rows || []);
-  await loadDaySummary();
-  setStatus(`Avatud ${currentDate}${selectedUserParam() ? ' · ' + selectedUserParam() : ''}`);
-}
-function addRow() {
-  const body = $('rowsBody');
-  if (!body.querySelector('tr[data-key]')) body.innerHTML = '';
-  body.insertAdjacentHTML('beforeend', rowTemplate({hour:'', tool:'Käsitsi'}));
-  wireTextareas(body.lastElementChild);
-}
-async function saveDay(show=true) {
-  currentDate = $('dateInput').value || currentDate;
-  const rows = collectRows();
-  setStatus('Salvestan…');
-  const body = {date: currentDate, rows};
-  if (selectedUserParam()) body.user = selectedUserParam();
-  const data = await api('/api/day', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  renderRows(data.rows || []);
-  if (!days.includes(currentDate)) { days.push(currentDate); days.sort(); renderDaySelect(); }
-  if (show) setStatus('Salvestatud');
+  const data = await api('/api/diary' + (q.toString() ? '?' + q.toString() : ''));
+  renderDiary(data.days || []);
+  setStatus(selectedUserParam() ? 'Kasutaja: ' + selectedUserParam() : '');
 }
 async function copyRich(html, text) {
   if (navigator.clipboard && window.ClipboardItem) {
@@ -299,30 +194,52 @@ async function copyRich(html, text) {
   const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
   document.execCommand('copy'); sel.removeAllRanges(); div.remove();
 }
-async function copyDay(full) {
-  await saveDay(false);
-  const q = userQueryParams();
-  q.set('date', currentDate);
-  q.set('full', full ? '1' : '0');
-  const data = await api('/api/copy?' + q.toString());
-  await copyRich(data.html, data.text);
-  setStatus(full ? 'Kopeeritud A–G. Kleebi Sheetsis A-lahtrisse.' : 'Kopeeritud D–G. Kleebi Sheetsis D-lahtrisse.');
+async function copyDay(date) {
+  try {
+    const q = userQueryParams();
+    q.set('date', date);
+    q.set('full', '0');
+    const data = await api('/api/copy?' + q.toString());
+    await copyRich(data.html, data.text);
+    setStatus('Kopeeritud D–G: ' + date + '. Kleebi Sheetsis D-lahtrisse.');
+  } catch (e) { setStatus(e.message, true); }
+}
+async function initUserSelect() {
+  if (!SERVER_MODE) return;
+  const me = await api('/api/me');
+  currentUserName = me.user ? me.user.name : '';
+  selectedUserName = currentUserName;
+  if (!me.user || me.user.role !== 'admin') return;
+  const data = await api('/api/activity/filters');
+  const users = data.users || [];
+  $('userSelect').innerHTML = users.map(u => `<option value="${escapeHtml(u.name || '')}">${escapeHtml(u.name || '')} (${escapeHtml(u.role || '')})</option>`).join('');
+  $('userSelect').value = currentUserName;
+  $('userSelectLabel').hidden = false;
+  $('userSelect').onchange = () => { selectedUserName = $('userSelect').value; loadDiary(); };
 }
 async function refreshFromLogs() {
   if (!confirm('Käivitada aitrack run? See võib võtta aega.')) return;
   setStatus('Töötlen logisid…');
   await api('/api/run', {method:'POST'});
-  await init();
+  await loadDiary();
   setStatus('Logid töödeldud');
 }
 async function backfill() {
   if (!confirm('Töödelda viimased 12 tundi tagantjärele?')) return;
   setStatus('Backfill 12h…');
   await api('/api/backfill', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({hours:12})});
-  await init();
+  await loadDiary();
   setStatus('Backfill tehtud');
 }
 function showHelp() { $('help').hidden = !$('help').hidden; }
+async function init() {
+  if ($('tokenInput')) {
+    $('tokenInput').value = localStorage.getItem('aitrackToken') || '';
+    $('tokenInput').addEventListener('input', () => localStorage.setItem('aitrackToken', authToken()));
+  }
+  await initUserSelect();
+  await loadDiary();
+}
 init().catch(e => setStatus(e.message, true));
 </script>
 </body>

@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 
+# saladused — ära kunagi committi (CF_API_KEY jne)
+.env
+.env.*
+
 # aitracki lokaalsed artefaktid (elavad ~/.config/aitrack/-s, aga kindluse mõttes)
 config.json
 projects.json

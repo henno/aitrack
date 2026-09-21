@@ -99,7 +99,7 @@ DEFAULT_STUCK_MINUTES = 10
 INSTALL_CODE_TTL_MINUTES = 15
 CLIENT_VERSION = 9
 ALLOWLIST_SYNC_TTL_SECONDS = 10 * 60
-AITRACK_REPO_URL = "https://github.com/parkkarl/aitrack.git"
+AITRACK_REPO_URL = "https://github.com/henno/aitrack.git"
 DEFAULT_CSV_PATH = HOME / "aitrack-log.csv"  # lokaalse sink'i vaiketee (masinapõhine, ei lähe git'i)
 HOURS_CSV = CONFIG_DIR / "hours.csv"  # sisemine tunnipõhine algandmestik (dedup + 4 välja); päevavaade renderdatakse siit
 
@@ -2059,6 +2059,15 @@ def _day_row(date: str, hour_rows: list[list]) -> list:
     return [date, len(hour_rows), _weekday_letter(date),
             join(cols["objekt"]), join(cols["saavutus"]),
             join(cols["takistus"]), join(cols["teadmine"])]
+
+
+def _overview_day_dict(day_row: list) -> dict:
+    """Teisenda _day_row väljund veebi ülevaatevaate JSON-reaks (üks päev = üks rida)."""
+    return {
+        "date": day_row[0], "hours": day_row[1], "weekday": day_row[2],
+        "objekt": day_row[3], "saavutus": day_row[4],
+        "takistus": day_row[5], "teadmine": day_row[6],
+    }
 
 
 def _migrate_old_log(cfg: dict) -> None:
@@ -7550,6 +7559,20 @@ class _AitrackHandler(BaseHTTPRequestHandler):
                     rows = _ui_day_rows(date)
                 self._json({"ok": True, "date": date, "rows": rows})
                 return
+            if u.path == "/api/diary":
+                if self._server_mode():
+                    token = self._token(q)
+                    days_out = []
+                    for d in _db_days(self._db_path(), token, q):
+                        db_rows = _db_rows_for_day(self._db_path(), token, d, self.cfg, q)
+                        if db_rows:
+                            days_out.append(_overview_day_dict(_day_row(d, db_rows)))
+                else:
+                    raw = _read_raw_days()
+                    days_out = [_overview_day_dict(_day_row(d, raw[d])) for d in raw if raw[d]]
+                days_out.sort(key=lambda r: r["date"], reverse=True)
+                self._json({"ok": True, "days": days_out})
+                return
             if u.path == "/api/day-summary" and self._server_mode():
                 date = (q.get("date") or [_today_local_str(self.cfg)])[0]
                 self._json(_db_day_summary(self._db_path(), self._token(q), date, q))
@@ -9167,7 +9190,7 @@ def main():
     sv.set_defaults(fn=cmd_serve)
 
     cn = sub.add_parser("connect", help="ühenda see klient aitrack keskserveriga")
-    cn.add_argument("--url", required=True, help="serveri URL, nt https://aitrack.example.com")
+    cn.add_argument("--url", required=True, help="serveri URL, nt https://aitrack.diarainfra.com")
     cn.add_argument("--token", required=True, help="kasutaja token serverist")
     cn.set_defaults(fn=cmd_connect)
 
