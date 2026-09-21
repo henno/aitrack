@@ -18,6 +18,14 @@ oma Google Sheeti ja jälgitavad projektid ise.
 Logide asukohad on kõigil OS-idel samad (`~/.claude`, `~/.codex`, `~/.gemini`);
 Windowsis vastab `~` kaustale `C:\Users\<nimi>`.
 
+**Codexi töölauarakendus ja CLI:** aitrack loeb vestlusi kaustast `~/.codex/sessions`
+ja käsurea ajalugu failist `~/.codex/history.jsonl`. Töölauarakenduse jälgimiseks pole
+ajaloofaili vaja. Kokkuvõttes kasutatakse kasutaja sõnumeid ja assistendi vastuseid;
+tööriistade väljund, arutluskäik, süsteemikontekst ja sisemised kinnituskontrollid jäetakse välja.
+Sama sõnumi kordused eri logivormingutes ühendatakse. Jälgitakse ainult `aitrack add`
+kaustu ja nende alamkaustu. Lõpetatud tunni kokkuvõte lisatakse järgmise tunni 5. minutil.
+Eesti aja kuvamiseks määra `config.json` failis `"timezone": "Europe/Tallinn"`.
+
 ## Kuidas see töötab
 
 ```
@@ -35,7 +43,8 @@ OS-i tunniajasti (iga tund):  Linux→systemd · macOS→launchd · Windows→Ta
    └─ renderdab päevavaate (üks rida päevas, punktid nummerdatult) → ~/aitrack-log.csv
 ```
 
-Töökindlus (kontrollitud automaattestidega — `python3 aitrack_tests.py`):
+Töökindlus (kontrollitud automaattestidega — `python3 aitrack_tests.py` ja
+`python3 -m unittest test_codex_desktop`):
 - **Iga tund täpselt korra** — pool-avatud vahemik `[viimane, praegune)`, ei vahesid ega duplikaate.
 - **Idempotentne** — iga real on UTC-tunnist tuletatud deterministlik võti; katkestus/kordussaatmine ega ajavööndi-muutus ei dubleeri ridu.
 - **Järelejõudmine** — kui arvuti oli kinni, töödeldakse vahepealsed tunnid järele (max 48h/käivitus, ülejäänu järgmisel korral).

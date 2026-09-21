@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from aitrack_core.codex import read_messages as _read_codex_messages
+
 from aitrack_core.templates import (
     _account_page_html,
     _activity_page_html,
@@ -1336,79 +1338,15 @@ def claude_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
     return out
 
 
-def _codex_cwd_map(needed_ids: set[str]) -> dict[str, str]:
-    """session_id -> cwd, AINULT vajalike sessioonide rollout-failidest.
-
-    Rollout-faili nimi sisaldab session-id'd, seega avame vaid need failid, mille
-    id esineb hiljutises history-aknas — bounded kulu (mitte O(kogu ajalugu)) ja
-    samas ei lähe ükski hiljutine kirje projektita kaduma."""
-    mapping: dict[str, str] = {}
-    if not needed_ids or not CODEX_SESSIONS.is_dir():
-        return mapping
-    for roll in CODEX_SESSIONS.rglob("rollout-*.jsonl"):
-        name = roll.name
-        if not any(sid in name for sid in needed_ids):
-            continue
-        try:
-            with roll.open(encoding="utf-8", errors="replace") as f:
-                for _ in range(3):  # session_meta on faili esimestel ridadel
-                    line = f.readline()
-                    if not line:
-                        break
-                    if '"session_meta"' not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except json.JSONDecodeError:
-                        break
-                    if d.get("type") == "session_meta":
-                        p = d.get("payload") or {}
-                        sid, cwd = p.get("id"), p.get("cwd")
-                        if sid and cwd:
-                            mapping[sid] = cwd
-                        break
-        except OSError:
-            continue
-    return mapping
-
-
 def codex_records(since: dt.datetime) -> list[Record]:
-    if not CODEX_HISTORY.exists():
-        return []
-    # 1. samm: loe history-aknas olevad promptid + vajalikud session-id'd
-    window: list[tuple] = []  # (session_id, ts, text)
-    try:
-        with CODEX_HISTORY.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts_raw = d.get("ts")
-                if ts_raw is None:
-                    continue
-                ts = from_epoch(ts_raw, "s")
-                if ts <= since:
-                    continue
-                text = d.get("text", "")
-                if not is_user_prompt(text):
-                    continue
-                window.append((d.get("session_id", ""), ts, text.strip()))
-    except OSError:
-        return []
-    if not window:
-        return []
-    # 2. samm: lahenda cwd ainult vajalikele sessioonidele
-    cwd_map = _codex_cwd_map({sid for sid, _, _ in window if sid})
-    out = [Record("Codex", cwd_map[sid], ts, text)
-           for sid, ts, text in window if sid in cwd_map]
-    dropped = len(window) - len(out)
-    if dropped:
-        log(f"codex: {dropped}/{len(window)} prompti jäi cwd-ta (rollout puudub?) — neid ei kaasata")
-    return out
+    return [Record("Codex", m.project, m.ts, m.text)
+            for m in _read_codex_messages(CODEX_SESSIONS, CODEX_HISTORY, since, is_user_prompt)
+            if m.role == "user"]
+
+
+def codex_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
+    return [TranscriptRecord("Codex", m.project, m.ts, m.role, m.text)
+            for m in _read_codex_messages(CODEX_SESSIONS, CODEX_HISTORY, since, is_user_prompt)]
 
 
 def antigravity_records(since: dt.datetime) -> list[Record]:
@@ -1655,9 +1593,9 @@ def collect_transcript_records(since: dt.datetime) -> list[TranscriptRecord]:
     kasutaja prompti tekst.
     """
     recs = (claude_transcript_records(since) + pi_transcript_records(since) +
-            opencode_transcript_records(since))
+            opencode_transcript_records(since) + codex_transcript_records(since))
     recs.extend(TranscriptRecord(r.tool, r.project, r.ts, "user", r.text)
-                for r in (codex_records(since) + antigravity_records(since)))
+                for r in antigravity_records(since))
     recs.sort(key=lambda r: r.ts)
     return recs
 
@@ -9039,7 +8977,7 @@ def cmd_status(args, cfg):
     else:
         print(f"Viimati töödeldud: {raw.get('last_processed_hour', '(pole veel)')}")
     print("Tuvastatud logiallikad:")
-    for name, p in [("Claude", CLAUDE_PROJECTS), ("Codex", CODEX_HISTORY),
+    for name, p in [("Claude", CLAUDE_PROJECTS), ("Codex CLI", CODEX_HISTORY), ("Codex app", CODEX_SESSIONS),
                     ("Antigravity", ANTIGRAVITY_HISTORY), ("Pi", PI_SESSIONS),
                     ("OpenCode", OPENCODE_DB)]:
         print(f"  {name:12} {'✓' if p.exists() else '–'}  {p}")
