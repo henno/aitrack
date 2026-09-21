@@ -42,8 +42,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aitrack_core.project_summaries import combine_summaries, summarize_projects
-
 from aitrack_core.templates import (
     _account_page_html,
     _activity_page_html,
@@ -52,6 +50,8 @@ from aitrack_core.templates import (
     _start_page_html,
     _token_usage_page_html,
 )
+
+from aitrack_core.project_summaries import combine_summaries, summarize_projects
 
 from aitrack_core.security import (
     PASSWORD_HASH_ITERATIONS,
